@@ -9,9 +9,19 @@ module HTTP2
   # padding length and padding bytes in Data frames, so consult the implementation and the
   # reference specification for more information.
   abstract struct Frame
-    getter stream_id : UInt32
-    getter flags : UInt8 = Bytes.new(1, 0)
-    getter payload : Bytes
+    getter stream_id : UInt32 = 0x00000000
+    @flags : UInt8 = 0x00_u8
+    getter payload : Bytes = Bytes.empty
+
+    def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+      check_payload_size
+    end
+
+    private def check_payload_size
+      if payload.size >= (1 << 24)
+        raise ArgumentError.new("Cannot have a #{self.class} with a size of #{payload.size} (max #{1 << 24})")
+      end
+    end
 
     # Each subclass defines its own unique TypeCode. This will define a method
     # `type_code` that returns the TypeCode on each subclass inheriting from Frame.
@@ -19,8 +29,12 @@ module HTTP2
       def type_code
         TypeCode
       end
-    end
 
+      def flags
+        Flags.new(@flags)
+      end
+
+    end
   end
 
   def self.from_io(io : IO) : Frame
@@ -35,12 +49,6 @@ module HTTP2
     io.read_fully payload
 
     type(type).new(flags, stream_id, payload)
-  end
-
-  def initialize(@flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
-    if payload.size >= (1 << 24)
-      raise ArgumentError.new("Cannot have a #{self.class} with a size of #{payload.size} (max #{1 << 24})")
-    end
   end
 
   # This will output the frame in a wire compatible format. All frames are formatted
@@ -66,6 +74,11 @@ module HTTP2
     io.write @payload
   end
 
+  # This method may be overridden to do error checking on the frame, to determine if it might be invalid in some way.
+  def error?
+    false
+  end
+
   # Length is a 24-bit number, so we need to effectively mask off the top 8 bits and
   # output just three bytes.
   @[AlwaysInline]
@@ -86,3 +99,5 @@ module HTTP2
 
   # The flags are also a single byte.
 end
+
+require "./frame/*"

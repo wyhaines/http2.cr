@@ -13,3 +13,6 @@ development_dependencies:
     github: crystal-ameba/ameba
     version: ~> 0.14
 
+dependencies:
+  hpack:
+    github: wyhaines/hpack.cr
