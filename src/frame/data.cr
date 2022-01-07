@@ -47,9 +47,9 @@ module HTTP2
       # is potentially quite a bit of byte scanning; is there really any good operational
       # reason to do this?
       if stream_id == 0x00
-        return HTTP2::ProtocolError.new("DATA frame must have non-zero stream ID")
+        HTTP2::ProtocolError.new("DATA frame must have non-zero stream ID")
       elsif padded? && pad_length >= (payload.size - data_offset - pad_length)
-        return HTTP2::ProtocolError.new("PADDED flag is set, but pad length is greater than payload size")
+        HTTP2::ProtocolError.new("PADDED flag is set, but pad length is greater than payload size")
       end
     end
   end

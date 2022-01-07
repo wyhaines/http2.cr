@@ -15,9 +15,20 @@ module HTTP2
 
     getter headers : HTTP::Headers = HTTP::Headers.new
 
+    def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+      @flags = 0x00_u8
+      initialize(flags.to_u8, @stream_id, @payload)
+    end
+
     def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
       super
       decode
+    end
+
+    def initialize(flags : Flags, @stream_id : UInt32, payload : String)
+      @flags = 0x00_u8
+      @payload = Bytes.empty
+      initialize(flags.to_u8, @stream_id, payload.to_slice)
     end
 
     def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
@@ -25,7 +36,11 @@ module HTTP2
       initialize(@flags, @stream_id, payload.to_slice)
     end
 
-    # Build a frame with the given set of headers. It will structure 
+    def initialize(flags : Flags, @stream_id : UInt32, @headers : HTTP::Headers)
+      @flags = 0x00_u8
+      initialize(flags.to_u8, @stream_id, @headers.to_slice)
+    end
+
     def initialize(@flags : UInt8, @stream_id : UInt32, @headers : HTTP::Headers)
       @payload = headers.serialize(IO::Memory.new).to_slice
       check_payload_size
@@ -36,23 +51,23 @@ module HTTP2
     end
 
     def decode_using(decoder : HPack::Decoder)
-      @headers.merge! decoder.decode(payload)
+      @headers.merge! decoder.decode(data)
     end
 
     def end_stream?
-      flags.include?(Flags::END_STREAM)
+      flags.includes?(Flags::END_STREAM)
     end
 
     def end_headers?
-      flags.include?(Flags::END_HEADERS)
+      flags.includes?(Flags::END_HEADERS)
     end
 
     def padded?
-      flags.include?(Flags::PADDED)
+      flags.includes?(Flags::PADDED)
     end
 
     def priority?
-      flags.include?(Flags::PRIORITY)
+      flags.includes?(Flags::PRIORITY)
     end
 
     # If the frame has padding enabled, this byte will contain the length of the padding
@@ -82,7 +97,7 @@ module HTTP2
 
     private def data_offset
       if priority?
-        padding_offset +5
+        padding_offset + 5
       else
         padding_offset
       end
@@ -125,9 +140,9 @@ module HTTP2
       # is potentially quite a bit of byte scanning; is there really any good operational
       # reason to do this?
       if stream_id == 0x00
-        return HTTP2::ProtocolError.new("DATA frame must have non-zero stream ID")
+        HTTP2::ProtocolError.new("DATA frame must have non-zero stream ID")
       elsif padded? && pad_length >= (payload.size - data_offset - pad_length)
-        return HTTP2::ProtocolError.new("PADDED flag is set, but pad length is greater than payload size")
+        HTTP2::ProtocolError.new("PADDED flag is set, but pad length is greater than payload size")
       end
     end
   end
