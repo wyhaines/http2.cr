@@ -39,7 +39,7 @@ module HTTP2
     # )
     # ```
 
-    def self.from_parameters(stream_id : UInt32, parameters : ParameterHash)
+    def initialize(stream_id : UInt32, parameters : ParameterHash)
       buffer = Slice(UInt8).new(parameters.size * 6)
       pos = 0
       parameters.each do |identifier, value|
@@ -47,7 +47,15 @@ module HTTP2
         IO::ByteFormat::BigEndian.encode(value.to_u32, buffer[pos + 2, 4])
         pos += 6
       end
-      new(0x00_u8, stream_id, buffer)
+      initialize(0x00_u8, stream_id, buffer)
+    end
+
+    def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+      initialize(flags.to_u8, @stream_id, @payload)
+    end
+
+    def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes)
+      super
     end
 
     def setup

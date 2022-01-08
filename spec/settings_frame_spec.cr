@@ -14,6 +14,7 @@ describe HTTP2::Frame::Settings do
     frame = HTTP2::Frame::Settings.new(0x00_u8, 0x12345678, buffer.to_slice)
     frame.stream.should eq 0x12345678
     frame.payload.should eq buffer.to_slice
+    frame.ack?.should be_false
     frame.parameters.should eq phash
   end
 
@@ -22,8 +23,21 @@ describe HTTP2::Frame::Settings do
       HTTP2::Frame::Settings::Parameters::HEADER_TABLE_SIZE => 0x00008000,
       HTTP2::Frame::Settings::Parameters::ENABLE_PUSH       => 0x00000001,
     }
-    frame = HTTP2::Frame::Settings.from_parameters(0x12345678, phash)
+    frame = HTTP2::Frame::Settings.new(0x12345678, phash)
     frame.stream.should eq 0x12345678
     frame.parameters.should eq phash
+  end
+
+  it "can generate a correct Settings:ACK frame from a parameterized Settings frame" do
+    frame = HTTP2::Frame::Settings.new(
+      stream_id: 0x12345678,
+      parameters: HTTP2::Frame::Settings::ParameterHash{
+        HTTP2::Frame::Settings::Parameters::HEADER_TABLE_SIZE => 0x00008000,
+        HTTP2::Frame::Settings::Parameters::ENABLE_PUSH       => 0x00000001,
+      })
+    frame.ack?.should be_false
+    ack = frame.ack
+    ack.ack?.should be_true
+    ack.stream.should eq frame.stream
   end
 end
