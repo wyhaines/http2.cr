@@ -1,9 +1,11 @@
+require "../protocol_error"
+
 module HTTP2
-  struct Frame::ResetStream
+  struct Frame::ResetStream < Frame
     TypeCode = 0x03_u8
 
     def error_code
-      IO::ByteFormat::BigEndian(UInt32, payload)
+      IO::ByteFormat::BigEndian.decode(UInt32, payload)
     end
 
     def error?

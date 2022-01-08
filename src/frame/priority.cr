@@ -1,3 +1,5 @@
+require "../protocol_error"
+
 module HTTP2
   struct Frame::Priority < Frame
     TypeCode = 0x02_u8
