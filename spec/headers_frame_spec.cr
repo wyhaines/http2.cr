@@ -22,6 +22,7 @@ describe HTTP2::Frame::Headers do
       "set-cookie"       => "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1",
     }
     frame = HTTP2::Frame::Headers.new(0x00_u8, 0x12345678, headers)
+    frame.type_code.should eq 0x01
     frame.should be_a(HTTP2::Frame::Headers)
     frame.stream_id.should eq 0x12345678
     frame.flags.should eq HTTP2::Frame::Headers::Flags::None

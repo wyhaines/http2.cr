@@ -1,5 +1,5 @@
 module HTTP2
-  struct Frame::Priority
+  struct Frame::Priority < Frame
     TypeCode = 0x02_u8
 
     def exclusive?
