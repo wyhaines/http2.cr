@@ -50,14 +50,6 @@ module HTTP2
       initialize(0x00_u8, stream_id, buffer)
     end
 
-    def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
-      initialize(flags.to_u8, @stream_id, @payload)
-    end
-
-    def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes)
-      super
-    end
-
     def setup
       @parameters = if error?
                       ParameterHash.new

@@ -1,7 +1,9 @@
 require "../protocol_error"
+require "./padding_helper"
 
 module HTTP2
   struct Frame::Data < Frame
+    include PaddingHelper
     TypeCode = 0x0_u8
 
     @[Flags]
@@ -10,36 +12,16 @@ module HTTP2
       PADDED     = 0x8_u8
     end
 
-    def pad_length : UInt8
-      if padded?
-        payload[0].to_u8
-      else
-        0_u8
-      end
+    def data_offset
+      padding_offset
     end
 
-    private def data_offset
-      if padded?
-        1
-      else
-        0
-      end
+    def data
+      payload[padding_offset..(-1 * (pad_length + 1))]
     end
 
     def data
       payload[data_offset..(-1 * (pad_length + 1))]
-    end
-
-    def padding
-      if padded?
-        (-1 * (pad_length + 1)) == -1 ? "" : payload[(-1 * (pad_length))..(-1)]
-      else
-        nil
-      end
-    end
-
-    def padded?
-      flags.includes?(Flags::PADDED)
     end
 
     def error?

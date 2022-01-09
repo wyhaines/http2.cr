@@ -13,11 +13,6 @@ module HTTP2
     @flags : UInt8 = 0x00_u8
     getter payload : Bytes = Bytes.empty
 
-    def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
-      setup
-      check_payload_size
-    end
-
     private def check_payload_size
       if payload.size >= (1 << 24)
         raise ArgumentError.new("Cannot have a #{self.class} with a size of #{payload.size} (max #{1 << 24})")
@@ -27,6 +22,23 @@ module HTTP2
     # Each subclass defines its own unique TypeCode. This will define a method
     # `type_code` that returns the TypeCode on each subclass inheriting from Frame.
     macro inherited
+      def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+        setup
+        check_payload_size
+      end
+
+      def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+        initialize(flags.to_u8, @stream_id, @payload)
+      end
+
+      def initialize(flags : Flags, @stream_id : UInt32, payload : String)
+        initialize(flags.to_u8, @stream_id, payload.to_slice)
+      end
+
+      def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
+        initialize(@flags, @stream_id, payload.to_slice)
+      end
+
       def type_code
         TypeCode
       end
@@ -52,6 +64,10 @@ module HTTP2
 
     def stream
       stream_id
+    end
+
+    def data
+      payload
     end
 
     # This will output the frame in a wire compatible format. All frames are formatted

@@ -1,6 +1,11 @@
 require "./spec_helper"
 
 describe HTTP2::Frame::Settings do
+  it "has all expected flags defined" do
+    HTTP2::Frame::Settings::Flags.values.includes?(HTTP2::Frame::Settings::Flags::ACK).should be_true
+    HTTP2::Frame::Settings::Flags.new(0x01_u8).should eq HTTP2::Frame::Settings::Flags::ACK
+  end
+
   it "can build a Settings frame with the basic constructor" do
     buffer = IO::Memory.new
     phash = HTTP2::Frame::Settings::ParameterHash{
