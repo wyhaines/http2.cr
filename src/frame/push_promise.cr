@@ -22,14 +22,14 @@ module HTTP2
       encoder : HPack::Encoder = HPack::Encoder.new,
       pad_length : UInt8 = rand(256).to_u8)
       buffer = IO::Memory.new
-      if Flags.from_value(@flags).includes?(Flags::PADDED)
+      if self.flags.includes?(Flags::PADDED)
         buffer.write_byte pad_length
       end
       raw_promised_stream_id = Bytes.new(4)
       IO::ByteFormat::BigEndian.encode(promised_stream_id, raw_promised_stream_id)
       buffer.write raw_promised_stream_id
       buffer.write encoder.encode(@headers)
-      if Flags.from_value(@flags).includes?(Flags::PADDED)
+      if self.flags.includes?(Flags::PADDED)
         buffer.write ("\0" * pad_length).to_slice
       end
       initialize(@flags, @stream_id, buffer.to_slice)
