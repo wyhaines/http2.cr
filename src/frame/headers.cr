@@ -1,6 +1,7 @@
 require "../protocol_error"
 require "./padding_helper"
 require "./headers_helper"
+require "hpack"
 
 module HTTP2
   struct Frame::Headers < Frame
@@ -17,13 +18,20 @@ module HTTP2
       PRIORITY    = 0x20_u8
     end
 
-    def initialize(flags : Flags, @stream_id : UInt32, @headers : HTTP::Headers)
-      @flags = 0x00_u8
-      initialize(flags.to_u8, @stream_id, @headers.to_slice)
+    def initialize(
+      flags : Flags,
+      @stream_id : UInt32,
+      @headers : HTTP::Headers,
+      encoder : HPack::Encoder = HPack::Encoder.new)
+      initialize(flags.to_u8, @stream_id, headers, encoder)
     end
 
-    def initialize(@flags : UInt8, @stream_id : UInt32, @headers : HTTP::Headers)
-      @payload = headers.serialize(IO::Memory.new).to_slice
+    def initialize(
+      @flags : UInt8,
+      @stream_id : UInt32,
+      @headers : HTTP::Headers,
+      encoder : HPack::Encoder = HPack::Encoder.new)
+      @payload = encoder.encode(headers)
       check_payload_size
     end
 

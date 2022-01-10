@@ -7,7 +7,7 @@ module HTTP2
         def decode
           decode_using(HPack::Decoder.new)
         end
-    
+
         def decode_using(decoder : HPack::Decoder)
           @headers.merge! decoder.decode(data)
         end

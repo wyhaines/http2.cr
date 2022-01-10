@@ -29,9 +29,9 @@ module HTTP2
 
         def padding
           if padded?
-            (-1 * (pad_length + 1)) == -1 ? "" : payload[(-1 * (pad_length))..(-1)]
+            (-1 * (pad_length + 1)) == -1 ? Bytes.empty : payload[(-1 * (pad_length))..(-1)]
           else
-            nil
+            Bytes.empty
           end
         end
 

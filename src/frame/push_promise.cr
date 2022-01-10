@@ -4,6 +4,7 @@ require "./headers_helper"
 
 module HTTP2
   struct Frame::PushPromise < Frame
+    include PaddingHelper
     include HeadersHelper
     TypeCode = 0x05_u8
 
@@ -13,26 +14,36 @@ module HTTP2
       PADDED      = 0x08
     end
 
-    # def initialize(flags : Flags, @stream_id : UInt32, payload : String)
-    #   @flags = 0x00_u8
-    #   @payload = Bytes.empty
-    #   initialize(flags.to_u8, @stream_id, payload.to_slice)
-    # end
+    def initialize(
+      @flags : UInt8,
+      @stream_id : UInt32,
+      promised_stream_id : UInt32,
+      @headers : HTTP::Headers = HTTP::Headers.new,
+      encoder : HPack::Encoder = HPack::Encoder.new,
+      pad_length : UInt8 = rand(256).to_u8)
+      buffer = IO::Memory.new
+      if Flags.from_value(@flags).includes?(Flags::PADDED)
+        buffer.write_byte pad_length
+      end
+      raw_promised_stream_id = Bytes.new(4)
+      IO::ByteFormat::BigEndian.encode(promised_stream_id, raw_promised_stream_id)
+      buffer.write raw_promised_stream_id
+      buffer.write encoder.encode(@headers)
+      if Flags.from_value(@flags).includes?(Flags::PADDED)
+        buffer.write ("\0" * pad_length).to_slice
+      end
+      initialize(@flags, @stream_id, buffer.to_slice)
+    end
 
-    # def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
-    #   @payload = Bytes.empty
-    #   initialize(@flags, @stream_id, payload.to_slice)
-    # end
-
-    # def initialize(flags : Flags, @stream_id : UInt32, @headers : HTTP::Headers)
-    #   @flags = 0x00_u8
-    #   initialize(flags.to_u8, @stream_id, @headers.to_slice)
-    # end
-
-    # def initialize(@flags : UInt8, @stream_id : UInt32, @headers : HTTP::Headers)
-    #   @payload = headers.serialize(IO::Memory.new).to_slice
-    #   check_payload_size
-    # end
+    def initialize(
+      flags : Flags,
+      @stream_id : UInt32,
+      promised_stream_id : UInt32,
+      @headers : HTTP::Headers = HTTP::Headers.new,
+      encoder : HPack::Encoder = HPack::Encoder.new,
+      pad_length : UInt8 = rand(256).to_u8)
+      initialize(flags.to_u8, @stream_id, promised_stream_id, @headers, encoder, pad_length)
+    end
 
     def r?
       payload[padding_offset].bits_set?(0b10000000)
@@ -40,6 +51,10 @@ module HTTP2
 
     def promised_stream_id
       IO::ByteFormat::BigEndian.decode(UInt32, payload[padding_offset, 4]) & 0b01111111111111111111111111111111
+    end
+
+    def data_offset
+      padding_offset + 4
     end
 
     def error?

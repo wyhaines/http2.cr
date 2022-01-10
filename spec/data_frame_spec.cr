@@ -47,7 +47,7 @@ describe HTTP2::Frame::Data do
     frame.stream_id.should eq 0x12345678
     frame.data.should eq "This is a test".to_slice
     frame.pad_length.should eq 0
-    frame.padding.should be_nil
+    frame.padding.should eq Bytes.empty
   end
 
   it "can get all parts of a padded data frame with no padding" do
@@ -55,7 +55,7 @@ describe HTTP2::Frame::Data do
     frame.stream_id.should eq 0x12345678
     frame.data.should eq "This is a test".to_slice
     frame.pad_length.should eq 0
-    frame.padding.should eq ""
+    frame.padding.should eq Bytes.empty
   end
 
   it "can get all parts of a padded data frame with padding" do
