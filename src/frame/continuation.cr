@@ -33,7 +33,7 @@ module HTTP2
       if @stream_id == 0x00_u32
         ProtocolError.new("Continuation frame must have non-zero stream ID")
       else
-        be_false
+        false
       end
     end
   end
