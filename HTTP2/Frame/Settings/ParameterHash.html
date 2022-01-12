@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="generator" content="Crystal Docs 1.2.2">
+<meta name="crystal_docs.project_version" content="main">
+<meta name="crystal_docs.project_name" content="http2">
+
+
+
+<link href="../../../css/style.css" rel="stylesheet" type="text/css" />
+<script type="text/javascript" src="../../../js/doc.js"></script>
+
+  <meta name="repository-name" content="http2">
+  <title>HTTP2::Frame::Settings::ParameterHash - http2 main</title>
+  <script type="text/javascript">
+    CrystalDocs.base_path = "../../../";
+  </script>
+</head>
+<body>
+
+<svg class="hidden">
+  <symbol id="octicon-link" viewBox="0 0 16 16">
+    <path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path>
+  </symbol>
+</svg>
+<div class="sidebar">
+  <div class="sidebar-header">
+    <div class="search-box">
+      <input type="search" class="search-input" placeholder="Search..." spellcheck="false" aria-label="Search">
+    </div>
+
+    <div class="project-summary">
+      <h1 class="project-name">
+        <a href="../../../index.html">
+          http2
+        </a>
+      </h1>
+
+      <span class="project-version">
+        main
+      </span>
+    </div>
+  </div>
+
+  <div class="search-results hidden">
+    <ul class="search-list"></ul>
+  </div>
+
+  <div class="types-list">
+    <ul>
+  
+  <li class=" " data-id="http2/toplevel" data-name="top level namespace">
+      <a href="../../../toplevel.html">Top Level Namespace</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP" data-name="http">
+      <a href="../../../HTTP.html">HTTP</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP/Headers" data-name="http::headers">
+      <a href="../../../HTTP/Headers.html">Headers</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class="parent open current" data-id="http2/HTTP2" data-name="http2">
+      <a href="../../../HTTP2.html">HTTP2</a>
+      
+        <ul>
+  
+  <li class="parent open current" data-id="http2/HTTP2/Frame" data-name="http2::frame">
+      <a href="../../../HTTP2/Frame.html">Frame</a>
+      
+        <ul>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Continuation" data-name="http2::frame::continuation">
+      <a href="../../../HTTP2/Frame/Continuation.html">Continuation</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Continuation/Flags" data-name="http2::frame::continuation::flags">
+      <a href="../../../HTTP2/Frame/Continuation/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Data" data-name="http2::frame::data">
+      <a href="../../../HTTP2/Frame/Data.html">Data</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Data/Flags" data-name="http2::frame::data::flags">
+      <a href="../../../HTTP2/Frame/Data/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Flags" data-name="http2::frame::flags">
+      <a href="../../../HTTP2/Frame/Flags.html">Flags</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/GoAway" data-name="http2::frame::goaway">
+      <a href="../../../HTTP2/Frame/GoAway.html">GoAway</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Headers" data-name="http2::frame::headers">
+      <a href="../../../HTTP2/Frame/Headers.html">Headers</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Headers/Flags" data-name="http2::frame::headers::flags">
+      <a href="../../../HTTP2/Frame/Headers/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/HeadersHelper" data-name="http2::frame::headershelper">
+      <a href="../../../HTTP2/Frame/HeadersHelper.html">HeadersHelper</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/PaddingHelper" data-name="http2::frame::paddinghelper">
+      <a href="../../../HTTP2/Frame/PaddingHelper.html">PaddingHelper</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Ping" data-name="http2::frame::ping">
+      <a href="../../../HTTP2/Frame/Ping.html">Ping</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Ping/Flags" data-name="http2::frame::ping::flags">
+      <a href="../../../HTTP2/Frame/Ping/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Priority" data-name="http2::frame::priority">
+      <a href="../../../HTTP2/Frame/Priority.html">Priority</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/PushPromise" data-name="http2::frame::pushpromise">
+      <a href="../../../HTTP2/Frame/PushPromise.html">PushPromise</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/PushPromise/Flags" data-name="http2::frame::pushpromise::flags">
+      <a href="../../../HTTP2/Frame/PushPromise/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/ResetStream" data-name="http2::frame::resetstream">
+      <a href="../../../HTTP2/Frame/ResetStream.html">ResetStream</a>
+      
+    </li>
+  
+  <li class="parent open current" data-id="http2/HTTP2/Frame/Settings" data-name="http2::frame::settings">
+      <a href="../../../HTTP2/Frame/Settings.html">Settings</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Settings/Flags" data-name="http2::frame::settings::flags">
+      <a href="../../../HTTP2/Frame/Settings/Flags.html">Flags</a>
+      
+    </li>
+  
+  <li class=" current" data-id="http2/HTTP2/Frame/Settings/ParameterHash" data-name="http2::frame::settings::parameterhash">
+      <a href="../../../HTTP2/Frame/Settings/ParameterHash.html">ParameterHash</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Settings/Parameters" data-name="http2::frame::settings::parameters">
+      <a href="../../../HTTP2/Frame/Settings/Parameters.html">Parameters</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/WindowUpdate" data-name="http2::frame::windowupdate">
+      <a href="../../../HTTP2/Frame/WindowUpdate.html">WindowUpdate</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/FrameSizeError" data-name="http2::framesizeerror">
+      <a href="../../../HTTP2/FrameSizeError.html">FrameSizeError</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/ProtocolError" data-name="http2::protocolerror">
+      <a href="../../../HTTP2/ProtocolError.html">ProtocolError</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/Http2" data-name="http2">
+      <a href="../../../Http2.html">Http2</a>
+      
+    </li>
+  
+</ul>
+
+  </div>
+</div>
+
+
+<div class="main-content">
+<h1 class="type-name">
+
+  <span class="kind">class</span> HTTP2::Frame::Settings::ParameterHash
+
+</h1>
+
+
+  <ul class="superclass-hierarchy"><li class="superclass"><a href="../../../HTTP2/Frame/Settings/ParameterHash.html">HTTP2::Frame::Settings::ParameterHash</a></li><li class="superclass">Hash(<a href="../../../HTTP2/Frame/Settings/Parameters.html">HTTP2::Frame::Settings::Parameters</a>, UInt32)</li><li class="superclass">Reference</li><li class="superclass">Object</li></ul>
+
+
+
+
+  <h2>
+    <a id="overview" class="anchor" href="#overview">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Overview
+  </h2>
+
+  <p>This holds the parameters that are parsed from a Settings frame payload,
+and can also be used to provide parameters to a new Settings frame.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  <h2>
+    <a id="defined-in" class="anchor" href="#defined-in">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Defined in:
+  </h2>
+  
+    
+      <a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/settings.cr#L26" target="_blank">
+        frame/settings.cr
+      </a>
+    
+    <br/>
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="methods-inherited">
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+</div>
+
+
+
+
+
+
+
+
+
+</div>
+
+</body>
+</html>

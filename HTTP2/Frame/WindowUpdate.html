@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="generator" content="Crystal Docs 1.2.2">
+<meta name="crystal_docs.project_version" content="main">
+<meta name="crystal_docs.project_name" content="http2">
+
+
+
+<link href="../../css/style.css" rel="stylesheet" type="text/css" />
+<script type="text/javascript" src="../../js/doc.js"></script>
+
+  <meta name="repository-name" content="http2">
+  <title>HTTP2::Frame::WindowUpdate - http2 main</title>
+  <script type="text/javascript">
+    CrystalDocs.base_path = "../../";
+  </script>
+</head>
+<body>
+
+<svg class="hidden">
+  <symbol id="octicon-link" viewBox="0 0 16 16">
+    <path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path>
+  </symbol>
+</svg>
+<div class="sidebar">
+  <div class="sidebar-header">
+    <div class="search-box">
+      <input type="search" class="search-input" placeholder="Search..." spellcheck="false" aria-label="Search">
+    </div>
+
+    <div class="project-summary">
+      <h1 class="project-name">
+        <a href="../../index.html">
+          http2
+        </a>
+      </h1>
+
+      <span class="project-version">
+        main
+      </span>
+    </div>
+  </div>
+
+  <div class="search-results hidden">
+    <ul class="search-list"></ul>
+  </div>
+
+  <div class="types-list">
+    <ul>
+  
+  <li class=" " data-id="http2/toplevel" data-name="top level namespace">
+      <a href="../../toplevel.html">Top Level Namespace</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP" data-name="http">
+      <a href="../../HTTP.html">HTTP</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP/Headers" data-name="http::headers">
+      <a href="../../HTTP/Headers.html">Headers</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class="parent open current" data-id="http2/HTTP2" data-name="http2">
+      <a href="../../HTTP2.html">HTTP2</a>
+      
+        <ul>
+  
+  <li class="parent open current" data-id="http2/HTTP2/Frame" data-name="http2::frame">
+      <a href="../../HTTP2/Frame.html">Frame</a>
+      
+        <ul>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Continuation" data-name="http2::frame::continuation">
+      <a href="../../HTTP2/Frame/Continuation.html">Continuation</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Continuation/Flags" data-name="http2::frame::continuation::flags">
+      <a href="../../HTTP2/Frame/Continuation/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Data" data-name="http2::frame::data">
+      <a href="../../HTTP2/Frame/Data.html">Data</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Data/Flags" data-name="http2::frame::data::flags">
+      <a href="../../HTTP2/Frame/Data/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Flags" data-name="http2::frame::flags">
+      <a href="../../HTTP2/Frame/Flags.html">Flags</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/GoAway" data-name="http2::frame::goaway">
+      <a href="../../HTTP2/Frame/GoAway.html">GoAway</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Headers" data-name="http2::frame::headers">
+      <a href="../../HTTP2/Frame/Headers.html">Headers</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Headers/Flags" data-name="http2::frame::headers::flags">
+      <a href="../../HTTP2/Frame/Headers/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/HeadersHelper" data-name="http2::frame::headershelper">
+      <a href="../../HTTP2/Frame/HeadersHelper.html">HeadersHelper</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/PaddingHelper" data-name="http2::frame::paddinghelper">
+      <a href="../../HTTP2/Frame/PaddingHelper.html">PaddingHelper</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Ping" data-name="http2::frame::ping">
+      <a href="../../HTTP2/Frame/Ping.html">Ping</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Ping/Flags" data-name="http2::frame::ping::flags">
+      <a href="../../HTTP2/Frame/Ping/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Priority" data-name="http2::frame::priority">
+      <a href="../../HTTP2/Frame/Priority.html">Priority</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/PushPromise" data-name="http2::frame::pushpromise">
+      <a href="../../HTTP2/Frame/PushPromise.html">PushPromise</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/PushPromise/Flags" data-name="http2::frame::pushpromise::flags">
+      <a href="../../HTTP2/Frame/PushPromise/Flags.html">Flags</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/ResetStream" data-name="http2::frame::resetstream">
+      <a href="../../HTTP2/Frame/ResetStream.html">ResetStream</a>
+      
+    </li>
+  
+  <li class="parent " data-id="http2/HTTP2/Frame/Settings" data-name="http2::frame::settings">
+      <a href="../../HTTP2/Frame/Settings.html">Settings</a>
+      
+        <ul>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Settings/Flags" data-name="http2::frame::settings::flags">
+      <a href="../../HTTP2/Frame/Settings/Flags.html">Flags</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Settings/ParameterHash" data-name="http2::frame::settings::parameterhash">
+      <a href="../../HTTP2/Frame/Settings/ParameterHash.html">ParameterHash</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/Frame/Settings/Parameters" data-name="http2::frame::settings::parameters">
+      <a href="../../HTTP2/Frame/Settings/Parameters.html">Parameters</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" current" data-id="http2/HTTP2/Frame/WindowUpdate" data-name="http2::frame::windowupdate">
+      <a href="../../HTTP2/Frame/WindowUpdate.html">WindowUpdate</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/FrameSizeError" data-name="http2::framesizeerror">
+      <a href="../../HTTP2/FrameSizeError.html">FrameSizeError</a>
+      
+    </li>
+  
+  <li class=" " data-id="http2/HTTP2/ProtocolError" data-name="http2::protocolerror">
+      <a href="../../HTTP2/ProtocolError.html">ProtocolError</a>
+      
+    </li>
+  
+</ul>
+
+      
+    </li>
+  
+  <li class=" " data-id="http2/Http2" data-name="http2">
+      <a href="../../Http2.html">Http2</a>
+      
+    </li>
+  
+</ul>
+
+  </div>
+</div>
+
+
+<div class="main-content">
+<h1 class="type-name">
+
+  <span class="kind">struct</span> HTTP2::Frame::WindowUpdate
+
+</h1>
+
+
+  <ul class="superclass-hierarchy"><li class="superclass"><a href="../../HTTP2/Frame/WindowUpdate.html">HTTP2::Frame::WindowUpdate</a></li><li class="superclass"><a href="../../HTTP2/Frame.html">HTTP2::Frame</a></li><li class="superclass">Struct</li><li class="superclass">Value</li><li class="superclass">Object</li></ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  <h2>
+    <a id="defined-in" class="anchor" href="#defined-in">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Defined in:
+  </h2>
+  
+    
+      <a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">
+        frame/window_update.cr
+      </a>
+    
+    <br/>
+  
+
+
+
+  
+    <h2>
+      <a id="constant-summary" class="anchor" href="#constant-summary">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+      Constant Summary
+    </h2>
+  
+  <dl>
+    
+      <dt class="entry-const" id="TypeCode">
+        <strong>TypeCode</strong> = <code><span class="n">8_u8</span></code>
+      </dt>
+      
+    
+  </dl>
+
+
+
+  <h2>
+    <a id="constructors" class="anchor" href="#constructors">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Constructors
+  </h2>
+  <ul class="list-summary">
+    
+      <li class="entry-summary">
+        <a href="#new%28flags%3AUInt8%2Cstream_id%3AUInt32%2Cpayload%3ABytes%3DBytes.empty%29-class-method" class="signature"><strong>.new</strong>(flags : UInt8, stream_id : UInt32, payload : Bytes = <span class="t">Bytes</span>.empty)</a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#new%28flags%3AFlags%2Cstream_id%3AUInt32%2Cpayload%3ABytes%3DBytes.empty%29-class-method" class="signature"><strong>.new</strong>(flags : Flags, stream_id : UInt32, payload : Bytes = <span class="t">Bytes</span>.empty)</a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#new%28flags%3AFlags%2Cstream_id%3AUInt32%2Cpayload%3AString%29-class-method" class="signature"><strong>.new</strong>(flags : Flags, stream_id : UInt32, payload : String)</a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#new%28flags%3AUInt8%2Cstream_id%3AUInt32%2Cpayload%3AString%29-class-method" class="signature"><strong>.new</strong>(flags : UInt8, stream_id : UInt32, payload : String)</a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#new%28stream_id%3AUInt32%2Cwindow_size_increment%3AUInt32%3D0%29-class-method" class="signature"><strong>.new</strong>(stream_id : UInt32, window_size_increment : UInt32 = <span class="n">0</span>)</a>
+        
+      </li>
+    
+  </ul>
+
+
+
+
+
+  <h2>
+    <a id="instance-method-summary" class="anchor" href="#instance-method-summary">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Instance Method Summary
+  </h2>
+  <ul class="list-summary">
+    
+      <li class="entry-summary">
+        <a href="#error%3F-instance-method" class="signature"><strong>#error?</strong></a>
+        
+          <div class="summary"><p>This method may be overridden to do error checking on the frame, to determine if it might be invalid in some way.</p></div>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#flags-instance-method" class="signature"><strong>#flags</strong></a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#r%3F-instance-method" class="signature"><strong>#r?</strong></a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#type_code-instance-method" class="signature"><strong>#type_code</strong></a>
+        
+      </li>
+    
+      <li class="entry-summary">
+        <a href="#window_size_increment-instance-method" class="signature"><strong>#window_size_increment</strong></a>
+        
+      </li>
+    
+  </ul>
+
+
+
+
+
+<div class="methods-inherited">
+  
+    
+
+  <h3>Instance methods inherited from struct <code><a href="../../HTTP2/Frame.html">HTTP2::Frame</a></code></h3>
+  
+  
+    <a href="../../HTTP2/Frame.html#data-instance-method" class="tooltip">
+      <span>data</span>
+    data</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#error%3F-instance-method" class="tooltip">
+      <span>error?</span>
+    error?</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#initialize-instance-method" class="tooltip">
+      <span>initialize</span>
+    initialize</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#payload%3ABytes-instance-method" class="tooltip">
+      <span>payload : Bytes</span>
+    payload</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#stream-instance-method" class="tooltip">
+      <span>stream</span>
+    stream</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#stream_id%3AUInt32-instance-method" class="tooltip">
+      <span>stream_id : UInt32</span>
+    stream_id</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#to_s%28io%29-instance-method" class="tooltip">
+      <span>to_s(io)</span>
+    to_s</a>
+    
+  
+
+
+    
+
+  <h3>Constructor methods inherited from struct <code><a href="../../HTTP2/Frame.html">HTTP2::Frame</a></code></h3>
+  
+  
+    <a href="../../HTTP2/Frame.html#from_io%28io%3AIO%29%3AFrame-class-method" class="tooltip">
+      <span>from_io(io : IO) : Frame</span>
+    from_io</a>, 
+    
+  
+    <a href="../../HTTP2/Frame.html#new-class-method" class="tooltip">
+      <span>new</span>
+    new</a>
+    
+  
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+    
+
+
+    
+
+
+    
+
+
+  
+</div>
+
+
+  <h2>
+    <a id="constructor-detail" class="anchor" href="#constructor-detail">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Constructor Detail
+  </h2>
+  
+    <div class="entry-detail" id="new(flags:UInt8,stream_id:UInt32,payload:Bytes=Bytes.empty)-class-method">
+      <div class="signature">
+        
+        def self.<strong>new</strong>(flags : UInt8, stream_id : UInt32, payload : Bytes = <span class="t">Bytes</span>.empty)
+
+        <a class="method-permalink" href="#new%28flags%3AUInt8%2Cstream_id%3AUInt32%2Cpayload%3ABytes%3DBytes.empty%29-class-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="new(flags:Flags,stream_id:UInt32,payload:Bytes=Bytes.empty)-class-method">
+      <div class="signature">
+        
+        def self.<strong>new</strong>(flags : <a href="../../HTTP2/Frame/Flags.html">Flags</a>, stream_id : UInt32, payload : Bytes = <span class="t">Bytes</span>.empty)
+
+        <a class="method-permalink" href="#new%28flags%3AFlags%2Cstream_id%3AUInt32%2Cpayload%3ABytes%3DBytes.empty%29-class-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="new(flags:Flags,stream_id:UInt32,payload:String)-class-method">
+      <div class="signature">
+        
+        def self.<strong>new</strong>(flags : <a href="../../HTTP2/Frame/Flags.html">Flags</a>, stream_id : UInt32, payload : String)
+
+        <a class="method-permalink" href="#new%28flags%3AFlags%2Cstream_id%3AUInt32%2Cpayload%3AString%29-class-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="new(flags:UInt8,stream_id:UInt32,payload:String)-class-method">
+      <div class="signature">
+        
+        def self.<strong>new</strong>(flags : UInt8, stream_id : UInt32, payload : String)
+
+        <a class="method-permalink" href="#new%28flags%3AUInt8%2Cstream_id%3AUInt32%2Cpayload%3AString%29-class-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="new(stream_id:UInt32,window_size_increment:UInt32=0)-class-method">
+      <div class="signature">
+        
+        def self.<strong>new</strong>(stream_id : UInt32, window_size_increment : UInt32 = <span class="n">0</span>)
+
+        <a class="method-permalink" href="#new%28stream_id%3AUInt32%2Cwindow_size_increment%3AUInt32%3D0%29-class-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L5" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+
+
+
+
+
+  <h2>
+    <a id="instance-method-detail" class="anchor" href="#instance-method-detail">
+  <svg class="octicon-link" aria-hidden="true">
+    <use href="#octicon-link"/>
+  </svg>
+</a>
+    Instance Method Detail
+  </h2>
+  
+    <div class="entry-detail" id="error?-instance-method">
+      <div class="signature">
+        
+        def <strong>error?</strong>
+
+        <a class="method-permalink" href="#error%3F-instance-method">#</a>
+      </div>
+      
+        <div class="doc">
+          
+            <div class="doc-inherited">
+              Description copied from struct <a href="../../HTTP2/Frame.html">HTTP2::Frame</a>
+            </div>
+          
+          <p>This method may be overridden to do error checking on the frame, to determine if it might be invalid in some way.</p>
+        </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L19" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="flags-instance-method">
+      <div class="signature">
+        
+        def <strong>flags</strong>
+
+        <a class="method-permalink" href="#flags-instance-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="r?-instance-method">
+      <div class="signature">
+        
+        def <strong>r?</strong>
+
+        <a class="method-permalink" href="#r%3F-instance-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L11" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="type_code-instance-method">
+      <div class="signature">
+        
+        def <strong>type_code</strong>
+
+        <a class="method-permalink" href="#type_code-instance-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L2" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+    <div class="entry-detail" id="window_size_increment-instance-method">
+      <div class="signature">
+        
+        def <strong>window_size_increment</strong>
+
+        <a class="method-permalink" href="#window_size_increment-instance-method">#</a>
+      </div>
+      
+      <br/>
+      <div>
+        
+          [<a href="https://github.com/wyhaines/http2.cr/blob/cf8fa5a2b9675bb7c4955bab9ce2870e329480e3/src/frame/window_update.cr#L15" target="_blank">View source</a>]
+        
+      </div>
+    </div>
+  
+
+
+
+
+</div>
+
+</body>
+</html>
