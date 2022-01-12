@@ -20,7 +20,8 @@ module HTTP2
       promised_stream_id : UInt32,
       @headers : HTTP::Headers = HTTP::Headers.new,
       encoder : HPack::Encoder = HPack::Encoder.new,
-      pad_length : UInt8 = rand(256).to_u8)
+      pad_length : UInt8 = rand(256).to_u8
+    )
       buffer = IO::Memory.new
       if self.flags.includes?(Flags::PADDED)
         buffer.write_byte pad_length
@@ -41,7 +42,8 @@ module HTTP2
       promised_stream_id : UInt32,
       @headers : HTTP::Headers = HTTP::Headers.new,
       encoder : HPack::Encoder = HPack::Encoder.new,
-      pad_length : UInt8 = rand(256).to_u8)
+      pad_length : UInt8 = rand(256).to_u8
+    )
       initialize(flags.to_u8, @stream_id, promised_stream_id, @headers, encoder, pad_length)
     end
 

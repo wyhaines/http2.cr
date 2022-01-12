@@ -3,11 +3,10 @@ module HTTP2
     TypeCode = 0x07_u8
 
     def initialize(
-      stream_id : UInt32,
       last_stream_id : UInt32 = 0x00_u32,
       error_code : UInt32 = 0x00_u32,
-      optional_debug_data : Bytes = Bytes.empty)
-
+      optional_debug_data : Bytes = Bytes.empty
+    )
       buffer = IO::Memory.new
       raw_last_stream_id = Bytes.new(4)
       IO::ByteFormat::BigEndian.encode(last_stream_id, raw_last_stream_id)
@@ -17,17 +16,15 @@ module HTTP2
       buffer.write(raw_error_code)
       buffer.write(optional_debug_data)
 
-      initialize(0x00_u8, stream_id, buffer.to_slice)
+      initialize(0x00_u8, 0x00000000_u32, buffer.to_slice)
     end
 
     def initialize(
-      stream_id : UInt32,
       last_stream_id : UInt32,
       error_code : UInt32,
-      optional_debug_data : String)
-
+      optional_debug_data : String
+    )
       initialize(
-        stream_id,
         last_stream_id,
         error_code,
         optional_debug_data.to_slice)

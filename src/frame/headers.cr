@@ -18,11 +18,14 @@ module HTTP2
       PRIORITY    = 0x20_u8
     end
 
+    # TODO: This needs some other constructors specific to the field for a Headers frame.
+
     def initialize(
       flags : Flags,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new)
+      encoder : HPack::Encoder = HPack::Encoder.new
+    )
       initialize(flags.to_u8, @stream_id, headers, encoder)
     end
 
@@ -30,7 +33,8 @@ module HTTP2
       @flags : UInt8,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new)
+      encoder : HPack::Encoder = HPack::Encoder.new
+    )
       @payload = encoder.encode(headers)
       check_payload_size
     end

@@ -13,6 +13,11 @@ module HTTP2
     @flags : UInt8 = 0x00_u8
     getter payload : Bytes = Bytes.empty
 
+    @[Flags]
+    enum Flags : UInt8
+      NONE_DEFINED = 0xff_u8
+    end
+
     private def check_payload_size
       if payload.size >= (1 << 24)
         raise ArgumentError.new("Cannot have a #{self.class} with a size of #{payload.size} (max #{1 << 24})")

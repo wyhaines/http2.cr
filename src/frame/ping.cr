@@ -8,7 +8,7 @@ module HTTP2
     end
 
     def setup
-      @payload = Bytes.new(8,0) if @payload == Bytes.empty
+      @payload = Bytes.new(8, 0) if @payload == Bytes.empty
     end
 
     def ack?
