@@ -1,3 +1,7 @@
+![Send.cr CI](https://img.shields.io/github/workflow/status/wyhaines/http2.cr/HTTP2%20CI?style=for-the-badge&logo=GitHub)
+[![GitHub release](https://img.shields.io/github/release/wyhaines/http2.cr.svg?style=for-the-badge)](https://github.com/wyhaines/http2.cr/releases)
+![GitHub commits since latest release (by SemVer)](https://img.shields.io/github/commits-since/wyhaines/http2.cr/latest?style=for-the-badge)
+
 # http2
 
 WIP. This will be a pure HTTP/2 protocol implementation. It is the building blocks of HTTP/2 itself,
@@ -39,4 +43,7 @@ TODO: Write development instructions here
 
 ## Contributors
 
-- [Kirk Haines](https://github.com/your-github-user) - creator and maintainer
+- [Kirk Haines](https://github.com/wyhaines) - creator and maintainer
+
+![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/wyhaines/http2.cr?style=for-the-badge)
+![GitHub issues](https://img.shields.io/github/issues/wyhaines/http2.cr?style=for-the-badge)
