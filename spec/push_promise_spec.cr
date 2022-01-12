@@ -9,9 +9,6 @@ describe HTTP2::Frame::PushPromise do
   end
 
   it "can create a push-promise frame with no extra headaers" do
-    headers = HTTP::Headers{
-      "x-extra-header" => "extra-value",
-    }
     frame = HTTP2::Frame::PushPromise.new(
       flags: HTTP2::Frame::PushPromise::Flags::END_HEADERS,
       stream_id: 0x12345678_u32,
