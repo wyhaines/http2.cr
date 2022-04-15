@@ -16,8 +16,8 @@ describe HTTP2::Frame::Settings do
       buffer.write_bytes key.to_u16, IO::ByteFormat::BigEndian
       buffer.write_bytes value.to_u32, IO::ByteFormat::BigEndian
     end
-    frame = HTTP2::Frame::Settings.new(0x00_u8, 0x12345678, buffer.to_slice)
-    frame.stream.should eq 0x12345678
+    frame = HTTP2::Frame::Settings.new(0x00_u8, 0x00_u32, buffer.to_slice)
+    frame.stream.should eq 0x00_u32
     frame.payload.should eq buffer.to_slice
     frame.ack?.should be_false
     frame.parameters.should eq phash
@@ -28,14 +28,14 @@ describe HTTP2::Frame::Settings do
       HTTP2::Frame::Settings::Parameters::HEADER_TABLE_SIZE => 0x00008000,
       HTTP2::Frame::Settings::Parameters::ENABLE_PUSH       => 0x00000001,
     }
-    frame = HTTP2::Frame::Settings.new(0x12345678, phash)
-    frame.stream.should eq 0x12345678
+    frame = HTTP2::Frame::Settings.new(0x00_u32, phash)
+    frame.stream.should eq 0x00_u32
     frame.parameters.should eq phash
   end
 
   it "can generate a correct Settings:ACK frame from a parameterized Settings frame" do
     frame = HTTP2::Frame::Settings.new(
-      stream_id: 0x12345678,
+      stream_id: 0x00_u32,
       parameters: HTTP2::Frame::Settings::ParameterHash{
         HTTP2::Frame::Settings::Parameters::HEADER_TABLE_SIZE => 0x00008000,
         HTTP2::Frame::Settings::Parameters::ENABLE_PUSH       => 0x00000001,

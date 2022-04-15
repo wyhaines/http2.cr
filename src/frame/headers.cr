@@ -39,6 +39,10 @@ module HTTP2
       check_payload_size
     end
 
+    def decode_with(decoder : HPack::Decoder)
+      @headers.merge! decoder.decode(@payload)
+    end
+
     def end_stream?
       flags.includes?(Flags::END_STREAM)
     end

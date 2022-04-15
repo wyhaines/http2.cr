@@ -16,7 +16,7 @@ module HTTP2
     end
 
     def ack
-      new(
+      self.class.new(
         flags: Flags::ACK,
         stream_id: stream_id,
         payload: payload

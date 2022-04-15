@@ -12,6 +12,9 @@ module HTTP2
       PADDED     = 0x8_u8
     end
 
+    def initialize(flags : UInt8, stream_id : UInt32, payload : IO)
+    end
+
     def data_offset
       padding_offset
     end

@@ -53,18 +53,63 @@ module HTTP2
       end
     end
 
-    def self.from_io(io : IO) : Frame
-      length = (io.read_bytes(UInt8).to_u32 << 16) | io.read_bytes(UInt16, IO::ByteFormat::NetworkEndian)
-      type = io.read_bytes(UInt8)
+    macro finished
+      {% registry = {} of UInt8 => Nil %}
+      {% for subclass in @type.all_subclasses %}
+      {%
+        type_code = subclass.constant(:TypeCode)
+        if subclass.has_constant?(:TypeCode)
+          registry[type_code] = subclass
+        end
+      %}
+      {% end %}
+      alias ::HTTP2::Frames = {{ registry.values.join(" | ").id }}
+      def self.from_type_code(type_code)
+        case type_code
+        {% for type_code in registry.keys.sort %}
+        {% klass = registry[type_code] %}
+        when {{ type_code }}
+          {{ klass.id }}
+        {% end %}
+        else
+          nil
+        end
+      end
+      TYPES = [
+        {% for type_code in registry.keys.sort %}
+        {{ registry[type_code].id }},
+        {% end %}
+      ]
+      def self.type(type_code)
+        TYPES.fetch(type_code) do
+          raise "Gosh, that one isn't defined."
+        end
+      end
+      {% debug %}
+    end
+
+    def self.from_io(io : IO)
+      type_code, flags, stream_id, payload = parse_from_io io
+      if klass = from_type_code(type_code)
+        klass.new(flags.value, stream_id, payload)
+      else
+        raise "Unknown frame type code: #{type_code}"
+      end
+      # type(type_code).new(flags, stream_id, payload)
+    end
+
+    def self.parse_from_io(io : IO)
+      length_and_type = io.read_bytes UInt32, IO::ByteFormat::BigEndian
+      length, type_code = Tuple.new (length_and_type >> 8_i32).to_i, length_and_type & 0xff_i32
       flags = Flags.new(io.read_bytes(UInt8))
 
-      # Stream id is a 31-bit number (lol)
+      # Stream id is a 31-bit number, so we need to mask off the top bit.
       stream_id = io.read_bytes(UInt32, IO::ByteFormat::NetworkEndian) & 0b0111_1111_1111_1111_1111_1111_1111_1111
 
       payload = Bytes.new(length)
       io.read_fully payload
 
-      type(type).new(flags, stream_id, payload)
+      {type_code, flags, stream_id, payload}
     end
 
     def stream
@@ -91,7 +136,7 @@ module HTTP2
     # ----------------------
     def to_s(io)
       to_s_length_bytes io
-      to_s_type_byte io
+      to_s_type_code io
       to_s_flags io
       to_s_stream_id io
       to_s_payload io
@@ -116,8 +161,8 @@ module HTTP2
 
     # The type byte is a single byte, so we can just output it.
     @[AlwaysInline]
-    private def to_s_type_byte(io)
-      io.write_byte type_byte
+    private def to_s_type_code(io)
+      io.write_byte type_code
     end
 
     # The flags are also a single byte.

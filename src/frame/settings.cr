@@ -11,14 +11,23 @@ module HTTP2
       ACK = 0x01
     end
 
-    @[Flags]
     enum Parameters : UInt16
-      HEADER_TABLE_SIZE      = 0x01
-      ENABLE_PUSH            = 0x02
-      MAX_CONCURRENT_STREAMS = 0x03
-      INITIAL_WINDOW_SIZE    = 0x04
-      MAX_FRAME_SIZE         = 0x05
-      MAX_HEADER_LIST_SIZE   = 0x06
+      HEADER_TABLE_SIZE                = 0x01
+      ENABLE_PUSH                      = 0x02
+      MAX_CONCURRENT_STREAMS           = 0x03
+      INITIAL_WINDOW_SIZE              = 0x04
+      MAX_FRAME_SIZE                   = 0x05
+      MAX_HEADER_LIST_SIZE             = 0x06
+      Unassigned_0x07                  = 0x07
+      SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x08
+      SETTINGS_NO_RFC7540_PRIORITIES   = 0x09
+      Unassigned_0x0a                  = 0x0a
+      Unassigned_0x0b                  = 0x0b
+      Unassigned_0x0c                  = 0x0c
+      Unassigned_0x0d                  = 0x0d
+      Unassigned_0x0e                  = 0x0e
+      Unassigned_0x0f                  = 0x0f
+      TLS_RENEG_PERMITTED              = 0x10
     end
 
     # This holds the parameters that are parsed from a Settings frame payload,
@@ -39,7 +48,7 @@ module HTTP2
     # )
     # ```
 
-    def initialize(stream_id : UInt32, parameters : ParameterHash)
+    def initialize(stream_id : UInt32, parameters : ParameterHash, flags : Flags = Flags::None)
       buffer = Slice(UInt8).new(parameters.size * 6)
       pos = 0
       parameters.each do |identifier, value|
@@ -61,6 +70,8 @@ module HTTP2
                         position += 2
                         value = IO::ByteFormat::BigEndian.decode(UInt32, payload[position, 4])
                         position += 4
+                        pp param
+                        pp value
                         params[Parameters.from_value param] = value
                       end
 
@@ -82,10 +93,10 @@ module HTTP2
 
     # TODO: These checks are probably incomplete.
     def error?
-      if stream_id == 0x00
-        HTTP2::ProtocolError.new("SETTINGS frame must have non-zero stream ID")
+      if stream_id != 0x00
+        HTTP2::ProtocolError.new("Settings has a stream identifier of #{stream_id}. Settings frames always apply to a connection and must have a stream identifier of zero.")
       elsif payload.size % 6 != 0
-        HTTP2::FrameSizeError.new("SETTINGS frame payload must be a multiple of 6 octets in length")
+        HTTP2::FrameSizeError.new("Settings frame payload must be a multiple of 6 octets in length")
       end
     end
   end
