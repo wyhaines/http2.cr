@@ -24,8 +24,8 @@ module HTTP2
     # @param args [Array] arguments to be passed to the callbacks
     # @param block [Proc] callback function
     def emit(event, *args, &block)
-      listeners(event).delete_if do |cb|
-        cb.call(*args, &block) == :delete
+      listeners(event).delete_if do |listener|
+        listener.call(*args, &block) == :delete
       end
     end
 

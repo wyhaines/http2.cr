@@ -28,7 +28,12 @@ describe HTTP2::Request do
     req.scheme.should eq "https"
     req.authority.should eq "www.example.com"
     req.path.should eq "/index.html"
-    req.body.not_nil!.rewind.gets_to_end.should eq body
+    if request_body = req.body
+      request_body.rewind
+      request_body.gets_to_end.should eq body
+    else
+      fail "expected a request body"
+    end
     req.headers["content-length"].should eq body.bytesize.to_s
   end
 end

@@ -17,7 +17,7 @@ module HTTP2
     @cookies : Cookies?
     @query_params : URI::Params?
     @uri : URI?
-    alias RequestBody = String | Bytes | IO | Nil
+    alias RequestBody = (String | Bytes | IO)?
 
     def self.new(headers : Headers = HTTP::Headers.new, body : RequestBody = nil, trailers : HTTP::Headers? = nil)
       new(headers.try(&.dup), body, trailers, internal: nil)

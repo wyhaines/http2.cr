@@ -5,7 +5,7 @@ module HTTP2
     def initialize(
       last_stream_id : UInt32 = 0x00_u32,
       error_code : UInt32 = 0x00_u32,
-      optional_debug_data : Bytes = Bytes.empty
+      optional_debug_data : Bytes = Bytes.empty,
     )
       buffer = IO::Memory.new
       raw_last_stream_id = Bytes.new(4)
@@ -22,7 +22,7 @@ module HTTP2
     def initialize(
       last_stream_id : UInt32,
       error_code : UInt32,
-      optional_debug_data : String
+      optional_debug_data : String,
     )
       initialize(
         last_stream_id,

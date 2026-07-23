@@ -4,15 +4,20 @@ version: 0.1.0
 authors:
   - Kirk Haines <wyhaines@gmail.com>
 
-crystal: ">=1.2.0"
+crystal: ">= 1.20.0"
 
-license: "Apache 2.0" 
+license: "Apache 2.0"
+
+targets:
+  ameba:
+    main: lib/ameba/bin/ameba.cr
 
 development_dependencies:
   ameba:
     github: crystal-ameba/ameba
-    version: ~> 1.0.0
+    commit: 34a3de4598aa009c878a1812bb018f0deaf15126
 
 dependencies:
   hpack:
     github: wyhaines/hpack.cr
+    commit: a909c58ab40bf03d321777820ff64543d345768d

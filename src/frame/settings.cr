@@ -70,8 +70,6 @@ module HTTP2
                         position += 2
                         value = IO::ByteFormat::BigEndian.decode(UInt32, payload[position, 4])
                         position += 4
-                        pp param
-                        pp value
                         params[Parameters.from_value param] = value
                       end
 
@@ -91,7 +89,6 @@ module HTTP2
       self.class.new(Flags::ACK, @stream_id)
     end
 
-    # TODO: These checks are probably incomplete.
     def error?
       if stream_id != 0x00
         HTTP2::ProtocolError.new("Settings has a stream identifier of #{stream_id}. Settings frames always apply to a connection and must have a stream identifier of zero.")

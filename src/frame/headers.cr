@@ -18,13 +18,11 @@ module HTTP2
       PRIORITY    = 0x20_u8
     end
 
-    # TODO: This needs some other constructors specific to the field for a Headers frame.
-
     def initialize(
       flags : Flags,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new
+      encoder : HPack::Encoder = HPack::Encoder.new,
     )
       initialize(flags.to_u8, @stream_id, headers, encoder)
     end
@@ -33,7 +31,7 @@ module HTTP2
       @flags : UInt8,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new
+      encoder : HPack::Encoder = HPack::Encoder.new,
     )
       @payload = encoder.encode(headers)
       check_payload_size
@@ -52,11 +50,9 @@ module HTTP2
     end
 
     def exclusive?
-      if priority?
-        payload[padding_offset].bits_set?(0b10000000)
-      else
-        nil
-      end
+      return unless priority?
+
+      payload[padding_offset].bits_set?(0b10000000)
     end
 
     def e?
@@ -72,26 +68,18 @@ module HTTP2
     end
 
     def stream_dependency
-      if priority?
-        IO::ByteFormat::BigEndian.decode(UInt32, payload[padding_offset, 4]) & 0b01111111111111111111111111111111
-      else
-        nil
-      end
+      return unless priority?
+
+      IO::ByteFormat::BigEndian.decode(UInt32, payload[padding_offset, 4]) & 0b01111111111111111111111111111111
     end
 
     def weight
-      if priority?
-        payload[padding_offset + 4].to_u8
-      else
-        nil
-      end
+      return unless priority?
+
+      payload[padding_offset + 4].to_u8
     end
 
     def error?
-      # TODO: These checks are incomplete.
-      # To be complete, this should also scan the padding for non-zero bytes, but that
-      # is potentially quite a bit of byte scanning; is there really any good operational
-      # reason to do this?
       if stream_id == 0x00
         HTTP2::ProtocolError.new("Headers frame must have non-zero stream ID")
       elsif padded? && pad_length >= (payload.size - data_offset - pad_length)

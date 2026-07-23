@@ -14,6 +14,17 @@ describe HTTP2::Frame::Data do
     frame.type_code.should eq 0x00_u8
   end
 
+  it "owns data read from an IO" do
+    io = IO::Memory.new
+    io << "This is a test"
+    io.rewind
+    frame = HTTP2::Frame::Data.new(0x00_u8, 0x12345678, io)
+
+    io.clear
+
+    frame.data.should eq "This is a test".to_slice
+  end
+
   it "can create a data frame with different flag settings" do
     frame = HTTP2::Frame::Data.new(0x00_u8, 0x12345678, "This is a test".to_slice)
     frame.flags.should eq HTTP2::Frame::Data::Flags::None

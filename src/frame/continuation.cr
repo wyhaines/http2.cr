@@ -14,7 +14,7 @@ module HTTP2
       flags : Flags,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new
+      encoder : HPack::Encoder = HPack::Encoder.new,
     )
       initialize(flags.to_u8, @stream_id, headers, encoder)
     end
@@ -23,7 +23,7 @@ module HTTP2
       @flags : UInt8,
       @stream_id : UInt32,
       @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new
+      encoder : HPack::Encoder = HPack::Encoder.new,
     )
       @payload = encoder.encode(headers)
       check_payload_size

@@ -1,1 +1,3 @@
-VERSION = "0.1.0"
+module HTTP2
+  VERSION = "0.1.0"
+end

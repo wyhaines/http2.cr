@@ -1,22 +1,18 @@
 require "./spec_helper"
 
-describe HTTP2::Connection do
-  it "Can create a connection to an HTTP2 server" do
-    conn = HTTP2::Connection.new("www.nghttp2.org", "80")
-    conn.should be_a HTTP2::Connection
-  end
-
-  it "can create a spec-client (which enables many of the other specs)" do
-    client = HTTP2::Client.new(TCPSocket.new("www.nghttp2.org", 80)) do |connection, stream, frame|
-      if frame.is_a?(HTTP2::Frame::Settings)
-        pp frame.parameters
-      end
-    end
-    client.should be_a HTTP2::Client
-    pp client.get("/httpbin/")
-    sleep 1
+describe HTTP2 do
+  it "exposes the shard version in its namespace" do
+    HTTP2::VERSION.should eq "0.1.0"
   end
 end
 
-describe HTTP2::Stream do
+describe HTTP2::Connection do
+  it "writes the client preface to a supplied IO" do
+    io = IO::Memory.new
+    connection = HTTP2::Connection.new(io)
+
+    connection.send_preface
+
+    io.to_slice.should eq HTTP2::Connection::Preface
+  end
 end

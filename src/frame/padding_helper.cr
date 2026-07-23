@@ -38,7 +38,6 @@ module HTTP2
         def data
           payload[data_offset..(-1 * (pad_length + 1))]
         end
-
       end
     end
   end

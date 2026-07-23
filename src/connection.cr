@@ -43,7 +43,7 @@ module HTTP2
     def initialize(
       @socket,
       @initial_window_size = Atomic(UInt32).new(local_window),
-      @window_size = Atomic(UInt32).new(local_window)
+      @window_size = Atomic(UInt32).new(local_window),
     )
     end
 
@@ -51,7 +51,7 @@ module HTTP2
       host : String,
       port : String | Int = 80,
       @initial_window_size = Atomic(UInt32).new(local_window),
-      @window_size = Atomic(UInt32).new(local_window)
+      @window_size = Atomic(UInt32).new(local_window),
     )
       if host =~ /:/
         host, port = host.split(":")
@@ -69,8 +69,8 @@ module HTTP2
     end
 
     def stream(id)
-      @streams.fetch(id) do |id|
-        @streams[id] = Stream.new(self, id)
+      @streams.fetch(id) do |stream_id|
+        @streams[stream_id] = Stream.new(self, stream_id)
       end
     end
 

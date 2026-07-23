@@ -13,18 +13,7 @@ module HTTP2
     end
 
     def initialize(flags : UInt8, stream_id : UInt32, payload : IO)
-    end
-
-    def data_offset
-      padding_offset
-    end
-
-    def data
-      payload[padding_offset..(-1 * (pad_length + 1))]
-    end
-
-    def data
-      payload[data_offset..(-1 * (pad_length + 1))]
+      initialize(flags, stream_id, payload.gets_to_end.to_slice.dup)
     end
 
     def error?

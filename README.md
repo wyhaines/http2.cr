@@ -1,49 +1,69 @@
-![Send.cr CI](https://img.shields.io/github/workflow/status/wyhaines/http2.cr/HTTP2%20CI?style=for-the-badge&logo=GitHub)
-[![GitHub release](https://img.shields.io/github/release/wyhaines/http2.cr.svg?style=for-the-badge)](https://github.com/wyhaines/http2.cr/releases)
-![GitHub commits since latest release (by SemVer)](https://img.shields.io/github/commits-since/wyhaines/http2.cr/latest?style=for-the-badge)
+[![CI](https://github.com/wyhaines/http2.cr/actions/workflows/ci.yml/badge.svg)](https://github.com/wyhaines/http2.cr/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/release/wyhaines/http2.cr.svg)](https://github.com/wyhaines/http2.cr/releases)
 
-# http2
+# http2.cr
 
-WIP. This will be a pure HTTP/2 protocol implementation. It is the building blocks of HTTP/2 itself,
-and lacks either a client or a server implementation in this shard.
+`http2.cr` is a pure Crystal implementation of HTTP/2. The project is being
+rebuilt from an earlier frame-codec spike into a production-quality client with
+a reusable protocol core.
 
-Client and server implementations will be in separate shards that make use of this common shard.
+## Status
+
+The current code is not ready for production use. It exposes early frame,
+connection, stream, and request types, but does not yet provide a complete
+client handshake, stream engine, flow control implementation, or HTTP message
+API.
+
+Development is organized in ordered phases:
+
+- [Implementation roadmap](design/http2-implementation-roadmap.md)
+- [Architecture decisions](design/architecture.md)
+- [Current implementation status](design/implementation-status.md)
 
 ## Installation
 
-1. Add the dependency to your `shard.yml`:
+Add the shard to your application's `shard.yml`:
 
-   ```yaml
-   dependencies:
-     http2:
-       github: your-github-user/http2
-   ```
+```yaml
+dependencies:
+  http2:
+    github: wyhaines/http2.cr
+```
 
-2. Run `shards install`
+Then run `shards install`.
 
 ## Usage
+
+The public client API is intentionally deferred until the protocol engine is
+correct. Requiring the shard currently exposes experimental protocol
+primitives:
 
 ```crystal
 require "http2"
 ```
 
-TODO: Write usage instructions here
+These types can change before `1.0`.
 
 ## Development
 
-TODO: Write development instructions here
+Install dependencies and build Ameba:
 
-## Contributing
+```sh
+shards install
+shards build ameba -Dpreview_mt
+```
 
-1. Fork it (<https://github.com/your-github-user/http2/fork>)
-2. Create your feature branch (`git checkout -b my-new-feature`)
-3. Commit your changes (`git commit -am 'Add some feature'`)
-4. Push to the branch (`git push origin my-new-feature`)
-5. Create a new Pull Request
+Run the verification suite:
 
-## Contributors
+```sh
+crystal tool format --check
+bin/ameba
+crystal spec -t -s
+crystal spec -Dpreview_mt -t -s
+crystal build src/http2.cr
+```
 
-- [Kirk Haines](https://github.com/wyhaines) - creator and maintainer
+Tests must be hermetic. Do not add public-network dependencies to the default
+spec suite; use supplied `IO` objects, scripted peers, or local TLS fixtures.
 
-![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/wyhaines/http2.cr?style=for-the-badge)
-![GitHub issues](https://img.shields.io/github/issues/wyhaines/http2.cr?style=for-the-badge)
+See [AGENTS.md](AGENTS.md) for contributor conventions.

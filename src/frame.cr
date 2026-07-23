@@ -85,7 +85,6 @@ module HTTP2
           raise "Gosh, that one isn't defined."
         end
       end
-      {% debug %}
     end
 
     def self.from_io(io : IO)

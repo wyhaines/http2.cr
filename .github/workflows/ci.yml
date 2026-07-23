@@ -1,32 +1,45 @@
 name: HTTP2 CI
 
 on:
-  schedule:
-    - cron:  '0 3 * * *'
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  test:
+    name: Crystal ${{ matrix.crystal }}
     runs-on: ubuntu-latest
-
-    container:
-      image: crystallang/crystal
+    strategy:
+      fail-fast: false
+      matrix:
+        crystal:
+          - 1.20.0
+          - 1.21.0
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Install dependencies
-      run: shards install
-    - name: Run tests
-      run: crystal spec -t -s
-    - name: Run Ameba
-      run: bin/ameba
-    - name: Build docs
-      run: crystal docs
-    - name: Deploy
-      uses: peaceiris/actions-gh-pages@v3
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./docs
+      - uses: actions/checkout@v4
+      - uses: crystallang/install-crystal@v1
+        with:
+          crystal: ${{ matrix.crystal }}
+
+      - name: Install dependencies
+        run: shards install
+      - name: Build Ameba
+        run: shards build ameba -Dpreview_mt
+      - name: Check formatting
+        run: crystal tool format --check
+      - name: Run Ameba
+        run: bin/ameba
+      - name: Run specs
+        run: crystal spec -t -s
+      - name: Run preview_mt specs
+        run: crystal spec -Dpreview_mt -t -s
+      - name: Build shard
+        run: crystal build src/http2.cr
+      - name: Build documentation
+        if: matrix.crystal == '1.21.0'
+        run: crystal docs
