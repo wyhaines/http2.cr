@@ -1,14 +1,19 @@
 module HTTP2
   struct Frame::Ping < Frame
-    TypeCode = 0x06_u8
+    TypeCode     = 0x06_u8
+    AllowedFlags = 0x01_u8
 
     @[Flags]
     enum Flags : UInt8
       ACK = 0x01_u8
     end
 
-    def setup
-      @payload = Bytes.new(8, 0) if @payload == Bytes.empty
+    def initialize(flags : UInt8, stream_id : UInt32)
+      initialize(flags, stream_id, Bytes.new(8, 0_u8))
+    end
+
+    def initialize(flags : Flags, stream_id : UInt32)
+      initialize(flags.to_u8, stream_id)
     end
 
     def ack?
@@ -16,19 +21,14 @@ module HTTP2
     end
 
     def ack
-      self.class.new(
-        flags: Flags::ACK,
-        stream_id: stream_id,
-        payload: payload
-      )
+      self.class.new(Flags::ACK, 0_u32, payload)
     end
 
-    def error?
-      if stream_id != 0x00000000_u32
-        HTTP2::ProtocolError.new("PING frame with non-zero stream ID")
-      elsif data.size != 8
-        HTTP2::FrameSizeError.new("PING frame with data size(#{data.size}) != 8")
-      end
+    protected def validate!
+      require_connection_stream!("PING")
+      return if payload.size == 8
+
+      frame_size_error!("PING frame payload must be exactly 8 octets")
     end
   end
 end

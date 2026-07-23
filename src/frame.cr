@@ -1,51 +1,37 @@
+require "./frame_header"
+require "./frame_size_error"
+
 module HTTP2
-  # This is an abstract superclass for all HTTP/2 Frames. The reference specification
-  # can be found at [https://datatracker.ietf.org/doc/html/rfc7540#section-6](https://datatracker.ietf.org/doc/html/rfc7540#section-6).
-  #
-  # A frame is a basic unit of data transmission in HTTP/2. Every frame has a type,
-  # specified by an 8-bit type code, a stream identifier which indicates which stream the frame
-  # belongs to, and a payload. Most Frame types also define a set of flags that differ based
-  # on the type of the Frame. Specific Frame types may have other considerations, such as
-  # padding length and padding bytes in Data frames, so consult the implementation and the
-  # reference specification for more information.
+  # A passive HTTP/2 wire frame. Protocol and HPACK state belong to the
+  # connection layer, not frame values.
   abstract struct Frame
-    getter stream_id : UInt32 = 0x00000000
-    @flags : UInt8 = 0x00_u8
+    getter type_code : UInt8 = 0_u8
+    getter stream_id : UInt32 = 0_u32
     getter payload : Bytes = Bytes.empty
+    @flags : UInt8 = 0_u8
 
     @[Flags]
     enum Flags : UInt8
       NONE_DEFINED = 0xff_u8
     end
 
-    private def check_payload_size
-      if payload.size >= (1 << 24)
-        raise ArgumentError.new("Cannot have a #{self.class} with a size of #{payload.size} (max #{1 << 24})")
-      end
-    end
-
-    # Each subclass defines its own unique TypeCode. This will define a method
-    # `type_code` that returns the TypeCode on each subclass inheriting from Frame.
     macro inherited
-      def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
-        setup
-        check_payload_size
+      def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes)
+        @type_code = TypeCode
+        @flags &= AllowedFlags
+        finish_initialize
       end
 
-      def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes = Bytes.empty)
+      def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes)
         initialize(flags.to_u8, @stream_id, @payload)
       end
 
       def initialize(flags : Flags, @stream_id : UInt32, payload : String)
-        initialize(flags.to_u8, @stream_id, payload.to_slice)
+        initialize(flags.to_u8, @stream_id, payload.to_slice.dup)
       end
 
       def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
-        initialize(@flags, @stream_id, payload.to_slice)
-      end
-
-      def type_code
-        TypeCode
+        initialize(@flags, @stream_id, payload.to_slice.dup)
       end
 
       def flags
@@ -53,62 +39,34 @@ module HTTP2
       end
     end
 
-    macro finished
-      {% registry = {} of UInt8 => Nil %}
-      {% for subclass in @type.all_subclasses %}
-      {%
-        type_code = subclass.constant(:TypeCode)
-        if subclass.has_constant?(:TypeCode)
-          registry[type_code] = subclass
-        end
-      %}
-      {% end %}
-      alias ::HTTP2::Frames = {{ registry.values.join(" | ").id }}
-      def self.from_type_code(type_code)
-        case type_code
-        {% for type_code in registry.keys.sort %}
-        {% klass = registry[type_code] %}
-        when {{ type_code }}
-          {{ klass.id }}
-        {% end %}
-        else
-          nil
-        end
+    def self.read(
+      io : IO,
+      max_frame_size : Int = FrameHeader::DEFAULT_MAX_PAYLOAD,
+    ) : Frames
+      unless FrameHeader::DEFAULT_MAX_PAYLOAD <= max_frame_size <= FrameHeader::MAX_PAYLOAD
+        raise ArgumentError.new(
+          "maximum frame size must be between " \
+          "#{FrameHeader::DEFAULT_MAX_PAYLOAD} and #{FrameHeader::MAX_PAYLOAD}"
+        )
       end
-      TYPES = [
-        {% for type_code in registry.keys.sort %}
-        {{ registry[type_code].id }},
-        {% end %}
-      ]
-      def self.type(type_code)
-        TYPES.fetch(type_code) do
-          raise "Gosh, that one isn't defined."
-        end
+
+      header = FrameHeader.read(io)
+      if header.length > max_frame_size
+        raise FrameSizeError.new(
+          "frame payload length #{header.length} exceeds the inbound limit #{max_frame_size}"
+        )
       end
+
+      payload = Bytes.new(header.length)
+      io.read_fully(payload)
+      build(header, payload)
     end
 
-    def self.from_io(io : IO)
-      type_code, flags, stream_id, payload = parse_from_io io
-      if klass = from_type_code(type_code)
-        klass.new(flags.value, stream_id, payload)
-      else
-        raise "Unknown frame type code: #{type_code}"
-      end
-      # type(type_code).new(flags, stream_id, payload)
-    end
-
-    def self.parse_from_io(io : IO)
-      length_and_type = io.read_bytes UInt32, IO::ByteFormat::BigEndian
-      length, type_code = Tuple.new (length_and_type >> 8_i32).to_i, length_and_type & 0xff_i32
-      flags = Flags.new(io.read_bytes(UInt8))
-
-      # Stream id is a 31-bit number, so we need to mask off the top bit.
-      stream_id = io.read_bytes(UInt32, IO::ByteFormat::NetworkEndian) & 0b0111_1111_1111_1111_1111_1111_1111_1111
-
-      payload = Bytes.new(length)
-      io.read_fully payload
-
-      {type_code, flags, stream_id, payload}
+    def self.from_io(
+      io : IO,
+      max_frame_size : Int = FrameHeader::DEFAULT_MAX_PAYLOAD,
+    ) : Frames
+      read(io, max_frame_size)
     end
 
     def stream
@@ -119,74 +77,176 @@ module HTTP2
       payload
     end
 
-    # This will output the frame in a wire compatible format. All frames are formatted
-    # identically.
-    #
-    # ----------------------
-    # |    Length (24)     |
-    # ----------------------
-    # |      Type (8)      |
-    # ----------------------
-    # |     Flags (8)      |
-    # ----------------------
-    # |   Stream ID (31)   |
-    # ----------------------
-    # | Payload (variable) |
-    # ----------------------
-    def to_s(io)
-      to_s_length_bytes io
-      to_s_type_code io
-      to_s_flags io
-      to_s_stream_id io
-      to_s_payload io
+    protected def raw_flags
+      @flags
     end
 
-    # This method may be overridden to do error checking on the frame, to determine if it might be invalid in some way.
-    def error?
-      false
+    def header
+      FrameHeader.new(payload.size.to_i32, type_code, @flags, stream_id)
     end
 
-    # Length is a 24-bit number, so we need to effectively mask off the top 8 bits and
-    # output just three bytes.
-    @[AlwaysInline]
-    private def to_s_length_bytes(io)
-      # Shift off the bottom 16 bits, and then output the remainder as an 8 bit value,
-      # which chops off the top 8 bits.
-      io.write_byte (@payload.bytesize >> 16).to_u8
-
-      # Convert the 32 bit value to a 16 bit value, which chops off the top 16 bits.
-      io.write_bytes @payload.bytesize.to_u16, IO::ByteFormat::BigEndian
+    # Writes the frame in its wire representation.
+    def write(io : IO) : Nil
+      header.write(io)
+      io.write(payload)
     end
 
-    # The type byte is a single byte, so we can just output it.
-    @[AlwaysInline]
-    private def to_s_type_code(io)
-      io.write_byte type_code
+    def to_slice : Bytes
+      io = IO::Memory.new(FrameHeader::SIZE + payload.size)
+      write(io)
+      io.to_slice
     end
 
-    # The flags are also a single byte.
-    @[AlwaysInline]
-    private def to_s_flags(io)
-      io.write_byte @flags.to_u8
+    protected def finish_initialize
+      if stream_id > FrameHeader::MAX_STREAM_ID
+        raise ArgumentError.new("stream ID must be a 31-bit unsigned integer")
+      end
+
+      if payload.size > FrameHeader::MAX_PAYLOAD
+        raise ArgumentError.new(
+          "frame payload length #{payload.size} exceeds #{FrameHeader::MAX_PAYLOAD}"
+        )
+      end
+
+      validate!
     end
 
-    # The stream ID is 31 bits, so the top bit has to be masked off.
-    @[AlwaysInline]
-    private def to_s_stream_id(io)
-      io.write_bytes @stream_id & 0b0111_1111_1111_1111_1111_1111_1111_1111, IO::ByteFormat::NetworkEndian
+    protected def validate!
     end
 
-    # The payload is a slice, so it is written as is.
-    @[AlwaysInline]
-    private def to_s_payload(io)
-      io.write @payload
+    protected def require_stream_id!(frame_name : String)
+      return unless stream_id.zero?
+
+      raise ProtocolError.new("#{frame_name} frame must use a nonzero stream ID")
     end
 
-    # This can be overridden in subclasses to do custom setup tasks without requiring overriding of
-    # the default initialization methods.
-    private def setup
+    protected def require_connection_stream!(frame_name : String)
+      return if stream_id.zero?
+
+      raise ProtocolError.new("#{frame_name} frame must use stream ID 0")
+    end
+
+    protected def frame_size_error!(
+      message : String,
+      scope : ErrorScope = ErrorScope::Connection,
+    )
+      scoped_stream_id = scope.stream? ? stream_id : nil
+      raise FrameSizeError.new(message, scope, scoped_stream_id)
+    end
+
+    protected def stream_protocol_error!(message : String)
+      raise ProtocolError.new(
+        message,
+        ErrorCode::PROTOCOL_ERROR,
+        ErrorScope::Stream,
+        stream_id
+      )
+    end
+
+    private def self.build(header : FrameHeader, payload : Bytes) : Frames
+      case header.type_code
+      when Frame::Data::TypeCode
+        Frame::Data.new(header.flags, header.stream_id, payload)
+      when Frame::Headers::TypeCode
+        Frame::Headers.new(header.flags, header.stream_id, payload)
+      when Frame::Priority::TypeCode
+        Frame::Priority.new(header.flags, header.stream_id, payload)
+      when Frame::ResetStream::TypeCode
+        Frame::ResetStream.new(header.flags, header.stream_id, payload)
+      when Frame::Settings::TypeCode
+        Frame::Settings.new(header.flags, header.stream_id, payload)
+      when Frame::PushPromise::TypeCode
+        Frame::PushPromise.new(header.flags, header.stream_id, payload)
+      when Frame::Ping::TypeCode
+        Frame::Ping.new(header.flags, header.stream_id, payload)
+      when Frame::GoAway::TypeCode
+        Frame::GoAway.new(header.flags, header.stream_id, payload)
+      when Frame::WindowUpdate::TypeCode
+        Frame::WindowUpdate.new(header.flags, header.stream_id, payload)
+      when Frame::Continuation::TypeCode
+        Frame::Continuation.new(header.flags, header.stream_id, payload)
+      else
+        Frame::Unknown.new(
+          header.type_code,
+          header.flags,
+          header.stream_id,
+          payload
+        )
+      end
+    end
+  end
+
+  # An extension frame unknown to this implementation. The connection layer
+  # must ignore it while still consuming its complete payload.
+  struct Frame::Unknown
+    getter type_code : UInt8
+    getter flags : UInt8
+    getter stream_id : UInt32
+    getter payload : Bytes
+
+    def initialize(
+      @type_code : UInt8,
+      @flags : UInt8,
+      @stream_id : UInt32,
+      @payload : Bytes = Bytes.empty,
+    )
+      if stream_id > FrameHeader::MAX_STREAM_ID
+        raise ArgumentError.new("stream ID must be a 31-bit unsigned integer")
+      end
+
+      if payload.size > FrameHeader::MAX_PAYLOAD
+        raise ArgumentError.new(
+          "frame payload length #{payload.size} exceeds #{FrameHeader::MAX_PAYLOAD}"
+        )
+      end
+    end
+
+    def stream
+      stream_id
+    end
+
+    def data
+      payload
+    end
+
+    def header
+      FrameHeader.new(payload.size.to_i32, type_code, flags, stream_id)
+    end
+
+    def write(io : IO) : Nil
+      header.write(io)
+      io.write(payload)
+    end
+
+    def to_slice : Bytes
+      io = IO::Memory.new(FrameHeader::SIZE + payload.size)
+      write(io)
+      io.to_slice
     end
   end
 end
 
-require "./frame/*"
+require "./frame/data"
+require "./frame/headers"
+require "./frame/priority"
+require "./frame/reset_stream"
+require "./frame/settings"
+require "./frame/push_promise"
+require "./frame/ping"
+require "./frame/go_away"
+require "./frame/window_update"
+require "./frame/continuation"
+
+module HTTP2
+  alias Frames = Frame::Data |
+                 Frame::Headers |
+                 Frame::Priority |
+                 Frame::ResetStream |
+                 Frame::Settings |
+                 Frame::PushPromise |
+                 Frame::Ping |
+                 Frame::GoAway |
+                 Frame::WindowUpdate |
+                 Frame::Continuation |
+                 Frame::Unknown
+end

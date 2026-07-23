@@ -9,10 +9,10 @@ a reusable protocol core.
 
 ## Status
 
-The current code is not ready for production use. It exposes early frame,
-connection, stream, and request types, but does not yet provide a complete
-client handshake, stream engine, flow control implementation, or HTTP message
-API.
+The current code is not ready for production use. Its bounded, passive frame
+codec is complete, but the exposed connection, stream, and request types do not
+yet provide a complete client handshake, stream engine, flow control
+implementation, or HTTP message API.
 
 Development is organized in ordered phases:
 

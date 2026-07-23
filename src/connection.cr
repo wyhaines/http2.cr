@@ -23,8 +23,8 @@ module HTTP2
     # Stream IDs are per-connection, are monotonically increasing, and start at 1.
     @next_stream_id = Atomic(UInt32).new(1)
     @state : State = State::New
-    @receive_buffer = Channel(Frame).new(32)
-    @send_buffer = Channel(Frame).new(32)
+    @receive_buffer = Channel(Frames).new(32)
+    @send_buffer = Channel(Frames).new(32)
     @socket : IO
     @streams : Hash(UInt32, Stream) = Hash(UInt32, Stream).new
     @encoder : HPack::Encoder = HPack::Encoder.new(huffman: true)
@@ -92,7 +92,7 @@ module HTTP2
 
     def write_frame(frame : Frames)
       @write_mutex.synchronize do
-        return frame.to_s @socket
+        frame.write(@socket)
       end
     end
 
@@ -113,15 +113,7 @@ module HTTP2
 
       if @window_size.get < @initial_window_size.get // 2
         bytes_to_add = @initial_window_size.get - @window_size.get
-        payload = IO::Memory.new(4)
-          .tap { |io| io.write_bytes bytes_to_add, IO::ByteFormat::NetworkEndian }
-          .to_slice
-
-        write_frame Frame::WindowUpdate.new(
-          flags: Frame::Flags::None,
-          stream_id: 0,
-          payload: payload,
-        )
+        write_frame Frame::WindowUpdate.new(0_u32, bytes_to_add)
         @window_size = @initial_window_size
       end
     end

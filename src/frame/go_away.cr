@@ -1,49 +1,62 @@
 module HTTP2
   struct Frame::GoAway < Frame
-    TypeCode = 0x07_u8
+    TypeCode     = 0x07_u8
+    AllowedFlags = 0x00_u8
 
     def initialize(
-      last_stream_id : UInt32 = 0x00_u32,
-      error_code : UInt32 = 0x00_u32,
-      optional_debug_data : Bytes = Bytes.empty,
+      last_stream_id : UInt32 = 0_u32,
+      error_code : UInt32 = ErrorCode::NO_ERROR.to_u32,
+      debug_data : Bytes = Bytes.empty,
     )
-      buffer = IO::Memory.new
-      raw_last_stream_id = Bytes.new(4)
-      IO::ByteFormat::BigEndian.encode(last_stream_id, raw_last_stream_id)
-      buffer.write(raw_last_stream_id)
-      raw_error_code = Bytes.new(4)
-      IO::ByteFormat::BigEndian.encode(error_code, raw_error_code)
-      buffer.write(raw_error_code)
-      buffer.write(optional_debug_data)
+      if last_stream_id > FrameHeader::MAX_STREAM_ID
+        raise ArgumentError.new("last stream ID must be a 31-bit unsigned integer")
+      end
 
-      initialize(0x00_u8, 0x00000000_u32, buffer.to_slice)
+      payload = Bytes.new(8 + debug_data.size)
+      IO::ByteFormat::BigEndian.encode(last_stream_id, payload[0, 4])
+      IO::ByteFormat::BigEndian.encode(error_code, payload[4, 4])
+      payload[8, debug_data.size].copy_from(debug_data)
+      initialize(0x00_u8, 0_u32, payload)
+    end
+
+    def initialize(
+      last_stream_id : UInt32,
+      error_code : ErrorCode,
+      debug_data : Bytes = Bytes.empty,
+    )
+      initialize(last_stream_id, error_code.to_u32, debug_data)
     end
 
     def initialize(
       last_stream_id : UInt32,
       error_code : UInt32,
-      optional_debug_data : String,
+      debug_data : String,
     )
-      initialize(
-        last_stream_id,
-        error_code,
-        optional_debug_data.to_slice)
-    end
-
-    def r?
-      payload[0].bits_set?(0b10000000)
+      initialize(last_stream_id, error_code, debug_data.to_slice.dup)
     end
 
     def last_stream_id
-      IO::ByteFormat::BigEndian.decode(UInt32, payload[0, 4]) & 0b01111111111111111111111111111111
+      IO::ByteFormat::BigEndian.decode(UInt32, payload[0, 4]) &
+        FrameHeader::RESERVED_STREAM_MASK
     end
 
     def error_code
       IO::ByteFormat::BigEndian.decode(UInt32, payload[4, 4])
     end
 
+    def debug_data
+      payload[8, payload.size - 8]
+    end
+
     def data
-      payload[8..-1]
+      debug_data
+    end
+
+    protected def validate!
+      require_connection_stream!("GOAWAY")
+      return if payload.size >= 8
+
+      frame_size_error!("GOAWAY frame payload must contain at least 8 octets")
     end
   end
 end

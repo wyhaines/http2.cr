@@ -1,31 +1,38 @@
 require "./spec_helper"
 
 describe HTTP2::Frame::Ping do
-  it "has all expected flags defined" do
-    HTTP2::Frame::Ping::Flags.values.includes?(HTTP2::Frame::Ping::Flags::ACK).should be_true
-    HTTP2::Frame::Ping::Flags.new(0x01_u8).should eq HTTP2::Frame::Ping::Flags::ACK
+  it "carries exactly eight opaque octets" do
+    payload = "12345678".to_slice
+    frame = HTTP2::Frame::Ping.new(0_u8, 0_u32, payload)
+    frame.payload.should eq(payload)
+    frame.ack?.should be_false
+
+    ack = frame.ack
+    ack.ack?.should be_true
+    ack.payload.should eq(payload)
   end
 
-  it "can create a Ping frame" do
-    frame = HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32, Bytes.new(8, 0))
-    frame.type_code.should eq 0x06_u8
-    frame.flags.should eq HTTP2::Frame::Ping::Flags::None
-    frame.stream_id.should eq 0x00_u32
-    frame.payload.should eq Bytes.new(8, 0)
-    frame.data.should eq Bytes.new(8, 0) # data and payload are the same in this frame.
+  it "offers a valid zero-filled convenience constructor" do
+    HTTP2::Frame::Ping.new(0_u8, 0_u32).payload.should eq(Bytes.new(8))
   end
 
-  it "can carry arbitrary 8 byte data" do
-    frame = HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32, "\xaa\xbb\xcc\xdd\xee\xff\x01\x23".to_slice)
-    frame.data.should eq "\xaa\xbb\xcc\xdd\xee\xff\x01\x23".to_slice
-    frame.payload.should eq "\xaa\xbb\xcc\xdd\xee\xff\x01\x23".to_slice
+  it "rejects nonzero stream IDs" do
+    expect_violation(
+      HTTP2::ErrorCode::PROTOCOL_ERROR,
+      HTTP2::ErrorScope::Connection
+    ) do
+      HTTP2::Frame::Ping.new(0_u8, 1_u32, Bytes.new(8))
+    end
   end
 
-  it "errors appropriately" do
-    HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32, Bytes.new(7, 0)).error?.should be_a HTTP2::FrameSizeError
-    HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32, Bytes.new(9, 0)).error?.should be_a HTTP2::FrameSizeError
-    HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32, "\xaa\xbb\xcc\xdd\xee\xff\x01\x23".to_slice).error?.should be_falsey
-    HTTP2::Frame::Ping.new(0x00_u8, 0x00_u32).error?.should be_falsey
-    HTTP2::Frame::Ping.new(0x00_u8, 0x12345678_u32).error?.should be_a HTTP2::ProtocolError
+  it "requires exactly eight payload octets" do
+    [0, 1, 7, 9].each do |length|
+      expect_violation(
+        HTTP2::ErrorCode::FRAME_SIZE_ERROR,
+        HTTP2::ErrorScope::Connection
+      ) do
+        HTTP2::Frame::Ping.new(0_u8, 0_u32, Bytes.new(length))
+      end
+    end
   end
 end

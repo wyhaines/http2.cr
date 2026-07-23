@@ -1,48 +1,26 @@
-require "../protocol_error"
 require "./padding_helper"
-require "./headers_helper"
-require "hpack"
 
 module HTTP2
   struct Frame::Headers < Frame
     include PaddingHelper
-    include HeadersHelper
 
-    TypeCode = 0x01_u8
+    TypeCode     = 0x01_u8
+    AllowedFlags = 0x2d_u8
 
     @[Flags]
     enum Flags : UInt8
-      END_STREAM  =  0x1_u8
-      END_HEADERS =  0x4_u8
-      PADDED      =  0x8_u8
+      END_STREAM  = 0x01_u8
+      END_HEADERS = 0x04_u8
+      PADDED      = 0x08_u8
       PRIORITY    = 0x20_u8
-    end
-
-    def initialize(
-      flags : Flags,
-      @stream_id : UInt32,
-      @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new,
-    )
-      initialize(flags.to_u8, @stream_id, headers, encoder)
-    end
-
-    def initialize(
-      @flags : UInt8,
-      @stream_id : UInt32,
-      @headers : HTTP::Headers,
-      encoder : HPack::Encoder = HPack::Encoder.new,
-    )
-      @payload = encoder.encode(headers)
-      check_payload_size
-    end
-
-    def decode_with(decoder : HPack::Decoder)
-      @headers.merge! decoder.decode(@payload)
     end
 
     def end_stream?
       flags.includes?(Flags::END_STREAM)
+    end
+
+    def end_headers?
+      flags.includes?(Flags::END_HEADERS)
     end
 
     def priority?
@@ -52,39 +30,33 @@ module HTTP2
     def exclusive?
       return unless priority?
 
-      payload[padding_offset].bits_set?(0b10000000)
-    end
-
-    def e?
-      exclusive?
-    end
-
-    private def data_offset
-      if priority?
-        padding_offset + 5
-      else
-        padding_offset
-      end
+      payload[padding_offset].bits_set?(0x80)
     end
 
     def stream_dependency
       return unless priority?
 
-      IO::ByteFormat::BigEndian.decode(UInt32, payload[padding_offset, 4]) & 0b01111111111111111111111111111111
+      IO::ByteFormat::BigEndian.decode(UInt32, payload[padding_offset, 4]) &
+        FrameHeader::RESERVED_STREAM_MASK
     end
 
     def weight
       return unless priority?
 
-      payload[padding_offset + 4].to_u8
+      payload[padding_offset + 4]
     end
 
-    def error?
-      if stream_id == 0x00
-        HTTP2::ProtocolError.new("Headers frame must have non-zero stream ID")
-      elsif padded? && pad_length >= (payload.size - data_offset - pad_length)
-        HTTP2::ProtocolError.new("PADDED flag is set, but pad length is greater than payload size")
-      end
+    def header_block_fragment
+      data
+    end
+
+    def data_offset
+      padding_offset + (priority? ? 5 : 0)
+    end
+
+    protected def validate!
+      require_stream_id!("HEADERS")
+      validate_padding!(priority? ? 5 : 0)
     end
   end
 end

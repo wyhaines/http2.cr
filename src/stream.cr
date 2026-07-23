@@ -140,7 +140,7 @@ module HTTP2
     end
 
     def receive(headers : Frame::Headers, decoder : HPack::Decoder = HPack::Decoder.new)
-      @headers.merge! headers.decode_with(decoder)
+      @headers.merge! decoder.decode(headers.header_block_fragment)
 
       if state.idle?
         @state = State::Open
@@ -183,20 +183,16 @@ module HTTP2
     end
 
     def receive(settings : Frame::Settings, **_kwargs)
-      params = settings.parameters
-
-      if params.has_key? Frame::Settings::Parameters::ENABLE_PUSH
-        @push_enabled = params[Frame::Settings::Parameters::ENABLE_PUSH] != 0
-      end
-
-      if params.has_key?(Frame::Settings::Parameters::INITIAL_WINDOW_SIZE)
-        @window_size = params[Frame::Settings::Parameters::INITIAL_WINDOW_SIZE]
+      settings.entries.each do |setting|
+        case setting.known_identifier
+        when Frame::Settings::Identifier::ENABLE_PUSH
+          @push_enabled = !setting.value.zero?
+        when Frame::Settings::Identifier::INITIAL_WINDOW_SIZE
+          @window_size = setting.value
+        end
       end
 
       send settings.ack unless settings.ack?
-    end
-
-    def receive(altsvc : Frame::AltSvc, **_kwargs)
     end
 
     def update_window_for(frame)
@@ -204,15 +200,7 @@ module HTTP2
 
       if @window_size < @initial_window_size // 2
         bytes_to_add = @initial_window_size - @window_size
-        payload = IO::Memory.new(4)
-          .tap { |io| io.write_bytes bytes_to_add, IO::ByteFormat::NetworkEndian }
-          .to_slice
-
-        send Frame::WindowUpdate.new(
-          flags: Frame::Flags::None,
-          stream_id: id,
-          payload: payload,
-        )
+        send Frame::WindowUpdate.new(id, bytes_to_add)
         @window_size = @initial_window_size
       end
     end

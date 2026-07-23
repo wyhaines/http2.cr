@@ -7,8 +7,8 @@ Last updated: 2026-07-23
 | Phase | Status | Gate |
 | --- | --- | --- |
 | 0 — Baseline and architecture | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 1 — Frame codec and errors | Ready | — |
-| 2 — Connection and handshake | Not started | — |
+| 1 — Frame codec and errors | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
+| 2 — Connection and handshake | Ready | — |
 | 3 — SETTINGS, HPACK, field blocks | Blocked on HPACK additions | — |
 | 4–8 | Not started | — |
 
@@ -34,6 +34,24 @@ Phase 0 has:
 - removed compile-time/runtime debug output and restored formatting/lint;
 - fixed DATA construction from an `IO` to retain owned payload bytes.
 
+## Phase 1 Frame Codec
+
+The frame layer now:
+
+- parses and writes the separate nine-octet `FrameHeader`;
+- checks the connection-supplied inbound frame-size limit before allocating a
+  payload;
+- preserves unknown frame types while ignoring reserved bits and unused flags;
+- validates every RFC 9113 frame's stream ID, fixed fields, and padding shape;
+- raises typed violations with an RFC error code and connection or stream
+  scope instead of returning an ignorable `error?` value;
+- preserves ordered, duplicate, and unknown SETTINGS entries;
+- treats HEADERS, PUSH_PROMISE, and CONTINUATION payloads as opaque field-block
+  fragments without invoking HPACK.
+
+ALTSVC is deliberately handled as an unknown extension frame until extension
+support is added.
+
 ## Current Verification
 
 Run from the repository root:
@@ -46,21 +64,16 @@ crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
 ```
 
-All commands pass with 41 deterministic examples on official Crystal 1.20.0
+All commands pass with 62 deterministic examples on official Crystal 1.20.0
 and 1.21.0 containers. They also pass against the local Crystal 1.21 source
 checkout. The `preview_mt` flag emits its expected deprecation warning on
 Crystal 1.21.
 
 ## Next Work
 
-Phase 1 should proceed in this order:
-
-1. introduce the raw frame header, error-code enum, violation scope, and
-   unknown-frame representation;
-2. build bounded parse/write entry points around those types;
-3. migrate each standard frame to structural validation;
-4. replace `error?` and `to_s(IO)` with explicit result/exception and
-   `write(IO)` APIs;
-5. complete malformed, truncated, unknown, and round-trip specs.
-
-Do not add connection state or HPACK decoding to frame types during this phase.
+Phase 2 should first replace the spike's connection and stream coordination
+with an explicit supplied-IO runtime. Establish the client preface and initial
+SETTINGS handshake, single reader and ordered writer, odd stream-ID allocation,
+connection-level control-frame dispatch, bounded queues, and terminal failure
+fan-out. Test it against deterministic scripted peers before adding TLS
+connectors. HPACK integration remains deferred to Phase 3.

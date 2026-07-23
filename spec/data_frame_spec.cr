@@ -1,79 +1,77 @@
 require "./spec_helper"
 
 describe HTTP2::Frame::Data do
-  it "has all expected flags defined" do
-    HTTP2::Frame::Data::Flags.values.includes?(HTTP2::Frame::Data::Flags::PADDED).should be_true
-    HTTP2::Frame::Data::Flags.values.includes?(HTTP2::Frame::Data::Flags::END_STREAM).should be_true
-    HTTP2::Frame::Data::Flags.new(0x01_u8).should eq HTTP2::Frame::Data::Flags::END_STREAM
-    HTTP2::Frame::Data::Flags.new(0x08_u8).should eq HTTP2::Frame::Data::Flags::PADDED
+  it "exposes unpadded and padded payload components" do
+    plain = HTTP2::Frame::Data.new(0_u8, 1_u32, "body")
+    plain.data.should eq("body".to_slice)
+    plain.padding.should be_empty
+    plain.pad_length.should eq(0_u8)
+
+    padded = HTTP2::Frame::Data.new(
+      HTTP2::Frame::Data::Flags::PADDED |
+      HTTP2::Frame::Data::Flags::END_STREAM,
+      1_u32,
+      Bytes[3, 0x62, 0x6f, 0x64, 0x79, 0, 0, 0]
+    )
+    padded.data.should eq("body".to_slice)
+    padded.padding.should eq(Bytes[0, 0, 0])
+    padded.pad_length.should eq(3_u8)
   end
 
-  it "can create a basic data frame" do
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "This is a test".to_slice)
-    frame.should be_a(HTTP2::Frame::Data)
-    frame.type_code.should eq 0x00_u8
+  it "permits empty DATA, including zero-length declared padding" do
+    HTTP2::Frame::Data.new(0_u8, 1_u32, Bytes.empty).data.should be_empty
+    frame = HTTP2::Frame::Data.new(
+      HTTP2::Frame::Data::Flags::PADDED,
+      1_u32,
+      Bytes[0]
+    )
+    frame.data.should be_empty
   end
 
-  it "owns data read from an IO" do
+  it "owns bytes consumed from an IO" do
     io = IO::Memory.new
-    io << "This is a test"
+    io << "body"
     io.rewind
-    frame = HTTP2::Frame::Data.new(0x00_u8, 0x12345678, io)
-
+    frame = HTTP2::Frame::Data.new(0_u8, 1_u32, io)
     io.clear
-
-    frame.data.should eq "This is a test".to_slice
+    frame.data.should eq("body".to_slice)
   end
 
-  it "can create a data frame with different flag settings" do
-    frame = HTTP2::Frame::Data.new(0x00_u8, 0x12345678, "This is a test".to_slice)
-    frame.flags.should eq HTTP2::Frame::Data::Flags::None
-
-    frame = HTTP2::Frame::Data.new(0x01_u8, 0x12345678, "This is a test".to_slice)
-    frame.flags.should eq HTTP2::Frame::Data::Flags::END_STREAM
-
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "\x00This is a test".to_slice)
-    frame.flags.should eq HTTP2::Frame::Data::Flags::PADDED
-
-    frame = HTTP2::Frame::Data.new(0x09_u8, 0x12345678, "\x00This is a test".to_slice)
-    frame.flags.should eq HTTP2::Frame::Data::Flags::PADDED | HTTP2::Frame::Data::Flags::END_STREAM
+  it "rejects stream 0 as a connection protocol error" do
+    expect_violation(
+      HTTP2::ErrorCode::PROTOCOL_ERROR,
+      HTTP2::ErrorScope::Connection
+    ) do
+      HTTP2::Frame::Data.new(0_u8, 0_u32, Bytes.empty)
+    end
   end
 
-  it "pad_length can return the expected padding lengths" do
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "\x01This is a test".to_slice)
-    frame.pad_length.should eq 1
-
-    frame = HTTP2::Frame::Data.new(0x09_u8, 0x12345678, "\x0aThis is a test".to_slice)
-    frame.pad_length.should eq 10
-
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "\x10This is a test".to_slice)
-    frame.pad_length.should eq 16
-
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "\x22This is a test".to_slice)
-    frame.pad_length.should eq 34
+  it "rejects a missing Pad Length as a stream frame-size error" do
+    expect_violation(
+      HTTP2::ErrorCode::FRAME_SIZE_ERROR,
+      HTTP2::ErrorScope::Stream,
+      1_u32
+    ) do
+      HTTP2::Frame::Data.new(
+        HTTP2::Frame::Data::Flags::PADDED,
+        1_u32,
+        Bytes.empty
+      )
+    end
   end
 
-  it "can get all parts of an unpadded data frame" do
-    frame = HTTP2::Frame::Data.new(0x00_u8, 0x12345678, "This is a test".to_slice)
-    frame.stream_id.should eq 0x12345678
-    frame.data.should eq "This is a test".to_slice
-    frame.pad_length.should eq 0
-    frame.padding.should eq Bytes.empty
-  end
-
-  it "can get all parts of a padded data frame with no padding" do
-    frame = HTTP2::Frame::Data.new(0x08_u8, 0x12345678, "\x00This is a test".to_slice)
-    frame.stream_id.should eq 0x12345678
-    frame.data.should eq "This is a test".to_slice
-    frame.pad_length.should eq 0
-    frame.padding.should eq Bytes.empty
-  end
-
-  it "can get all parts of a padded data frame with padding" do
-    frame = HTTP2::Frame::Data.new(0x09_u8, 0x12345678, "\x03This is a test\x00\x00\x00".to_slice)
-    frame.stream_id.should eq 0x12345678
-    frame.pad_length.should eq 3
-    frame.data.should eq "This is a test".to_slice
-    frame.padding.should eq "\x00\x00\x00".to_slice
+  it "rejects padding as large as the payload as a connection error" do
+    [Bytes[1], Bytes[2, 0]].each do |payload|
+      expect_violation(
+        HTTP2::ErrorCode::PROTOCOL_ERROR,
+        HTTP2::ErrorScope::Connection
+      ) do
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::PADDED,
+          1_u32,
+          payload
+        )
+      end
+    end
   end
 end
