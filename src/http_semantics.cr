@@ -251,14 +251,24 @@ module HTTP2
 
   # Stateful validation for one response message.
   class ResponseValidator < Stream::InboundValidator
+    # RFC 9113 places no bound on informational responses; without one a
+    # hostile peer can stream 1xx sections indefinitely. 16 comfortably
+    # exceeds legitimate 100/102/103 usage.
+    DEFAULT_MAX_INFORMATIONAL_RESPONSES = 16
+
     getter final_status : Int32?
     getter received_content_bytes : Int64 = 0_i64
 
     @expected_content_length : Int64?
     @no_content = false
     @tunnel = false
+    @informational_count = 0
 
-    def initialize(@stream_id : UInt32, @request_method : String)
+    def initialize(
+      @stream_id : UInt32,
+      @request_method : String,
+      @max_informational_responses : Int32 = DEFAULT_MAX_INFORMATIONAL_RESPONSES,
+    )
     end
 
     def validate(section : Connection::FieldSection) : Nil
@@ -301,6 +311,13 @@ module HTTP2
       section : Connection::FieldSection,
       parsed : HTTPSemantics::ResponseSection,
     ) : Nil
+      @informational_count += 1
+      if @informational_count > @max_informational_responses
+        malformed!(
+          "more than #{@max_informational_responses} informational " \
+          "responses on one stream"
+        )
+      end
       if parsed.status == 101
         malformed!("HTTP/2 does not support status 101")
       end
