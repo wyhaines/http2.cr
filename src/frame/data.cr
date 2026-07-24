@@ -17,6 +17,10 @@ module HTTP2
       initialize(flags, stream_id, payload.gets_to_end.to_slice.dup)
     end
 
+    def end_stream?
+      flags.includes?(Flags::END_STREAM)
+    end
+
     protected def validate!
       require_stream_id!("DATA")
       validate_padding!(frame_size_scope: ErrorScope::Stream)

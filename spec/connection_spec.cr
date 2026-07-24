@@ -124,6 +124,35 @@ describe HTTP2::Connection::Configuration do
     max_header_list_size.try(&.value).should eq(1_024_u32)
     configuration.max_decoded_string_size.should eq(1_024)
   end
+
+  it "advertises push disabled and rejects enabling unsupported push" do
+    configuration = HTTP2::Connection::Configuration.new
+    push = configuration.initial_settings.find do |setting|
+      setting.known_identifier.try(&.enable_push?)
+    end
+    push.try(&.value).should eq(0_u32)
+
+    expect_raises(ArgumentError, /server push is not supported/) do
+      HTTP2::Connection::Configuration.new(
+        initial_settings: [
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::ENABLE_PUSH,
+            1_u32
+          ),
+        ]
+      )
+    end
+  end
+
+  it "validates the retained closed-stream bound" do
+    [-1, 0].each do |limit|
+      expect_raises(ArgumentError, /closed-stream/) do
+        HTTP2::Connection::Configuration.new(
+          max_retained_closed_streams: limit
+        )
+      end
+    end
+  end
 end
 
 describe HTTP2::Connection::StreamIDAllocator do
@@ -287,6 +316,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         HTTP2::Frame::Data.new(0_u8, id, "body").write(io)
       end
 
@@ -296,6 +326,7 @@ describe HTTP2::Connection do
         stream = connection.new_stream
         stream.id.should eq(1_u32)
         connection.stream?(0_u32).should be_nil
+        open_client_stream(stream)
         stream_id.send(stream.id)
 
         frame = stream.receive(1.second).as(HTTP2::Frame::Data)
@@ -307,12 +338,16 @@ describe HTTP2::Connection do
     end
   end
 
-  it "ignores frames for a stream removed by the application" do
+  it "ignores late frames after local cancellation" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(id)
+        reset.error_code.should eq(HTTP2::ErrorCode::CANCEL.to_u32)
         HTTP2::Frame::Data.new(0_u8, id, "late").write(io)
 
         ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "12345678")
@@ -324,8 +359,9 @@ describe HTTP2::Connection do
       begin
         connection.wait_until_active(1.second)
         stream = connection.new_stream
-        stream.close
+        open_client_stream(stream, end_stream: false)
         stream_id.send(stream.id)
+        stream.close
 
         expect_raises(HTTP2::Connection::ClosedError) do
           stream.send(HTTP2::Frame::Data.new(0_u8, stream.id, "late"))
@@ -344,6 +380,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         io.write(wire_frame(0x02_u8, 0_u8, id, Bytes.new(4)))
 
         reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
@@ -360,6 +397,7 @@ describe HTTP2::Connection do
       begin
         connection.wait_until_active(1.second)
         stream = connection.new_stream
+        open_client_stream(stream)
         stream_id.send(stream.id)
 
         error = expect_raises(HTTP2::FrameSizeError) do
@@ -381,6 +419,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         HTTP2::Frame::Data.new(0_u8, id, "first").write(io)
         HTTP2::Frame::Data.new(0_u8, id, "second").write(io)
       end
@@ -391,6 +430,7 @@ describe HTTP2::Connection do
       connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
       stream = connection.new_stream
+      open_client_stream(stream)
       stream_id.send(stream.id)
 
       connection.wait_closed(1.second)
@@ -528,6 +568,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         ready.receive
+        read_client_headers(io, 1_u32)
         HTTP2::Frame::GoAway.new(1_u32, HTTP2::ErrorCode::NO_ERROR).write(io)
       end
 
@@ -536,6 +577,7 @@ describe HTTP2::Connection do
         connection.wait_until_active(1.second)
         first = connection.new_stream
         second = connection.new_stream
+        open_client_stream(first)
         ready.send(nil)
 
         expect_raises(HTTP2::Connection::ClosedError) do

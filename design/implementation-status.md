@@ -10,7 +10,8 @@ Last updated: 2026-07-23
 | 1 — Frame codec and errors | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 2 — Connection and handshake | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 3 — SETTINGS, HPACK, field blocks | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 4–8 | Not started | — |
+| 4 — Stream state and control frames | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
+| 5–8 | Not started | — |
 
 ## Phase 0 Baseline
 
@@ -103,6 +104,27 @@ Phase 3 now:
   limits to stream `ENHANCE_YOUR_CALM`, and hard decoder resource limits to
   connection shutdown.
 
+## Phase 4 Stream State and Control Frames
+
+Phase 4 now:
+
+- defines an exhaustive transition table for every stream-associated frame in
+  idle, reserved, open, half-closed, and closed states;
+- validates inbound and writer-ordered outbound transitions atomically,
+  preserving the correct stream or connection error scope;
+- tracks stream-ID ordering, active streams, and bounded recently closed
+  metadata, including legal late-frame handling;
+- enforces peer `MAX_CONCURRENT_STREAMS` while leaving rejected idle streams
+  available for a later attempt;
+- implements terminal peer resets, local cancellation, PING acknowledgements
+  and timeouts, and reset/cancellation race handling;
+- validates sent and received GOAWAY sequences, enters draining state, and
+  distinguishes unprocessed streams from other terminal failures;
+- advertises push disabled, rejects push after acknowledgement, and cancels
+  legal promises received before acknowledgement;
+- accepts deprecated PRIORITY frames without creating streams or depending on
+  a priority tree.
+
 ## Current Verification
 
 Run from the repository root:
@@ -116,14 +138,14 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 3 gate passes formatting, Ameba, compilation, documentation, and 114
+The Phase 4 gate passes formatting, Ameba, compilation, documentation, and 136
 deterministic examples in normal and `preview_mt` modes in the official Crystal
 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
 deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Begin Phase 4 by implementing the explicit stream transition table, enforcing
-frame legality against stream state, and applying peer
-`MAX_CONCURRENT_STREAMS`. Then complete reset, cancellation, GOAWAY, and
-push-disabled behavior before beginning flow control.
+Begin Phase 5 by implementing independent connection and stream flow-control
+windows. Add fair outbound DATA scheduling and bounded streaming body delivery,
+then cover tiny windows, slow consumers, concurrent bodies, and cancellation
+while blocked.

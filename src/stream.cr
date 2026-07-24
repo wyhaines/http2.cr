@@ -1,5 +1,5 @@
 module HTTP2
-  # A registered stream mailbox. The full RFC state machine is added in Phase 4.
+  # A registered HTTP/2 stream and its bounded inbound event mailbox.
   class Stream
     enum State
       Idle
@@ -9,6 +9,42 @@ module HTTP2
       HalfClosedLocal
       HalfClosedRemote
       Closed
+
+      def active?
+        open? || half_closed_local? || half_closed_remote?
+      end
+    end
+
+    # The state-changing logical events defined by RFC 9113. CONTINUATION is
+    # part of the HEADERS or PUSH_PROMISE event that opened its field block.
+    enum Event
+      SendHeaders
+      SendHeadersEndStream
+      ReceiveHeaders
+      ReceiveHeadersEndStream
+      SendData
+      SendDataEndStream
+      ReceiveData
+      ReceiveDataEndStream
+      SendReset
+      ReceiveReset
+      SendPriority
+      ReceivePriority
+      SendWindowUpdate
+      ReceiveWindowUpdate
+      SendPushPromise
+      ReceivePushPromise
+
+      def inbound?
+        receive_headers? ||
+          receive_headers_end_stream? ||
+          receive_data? ||
+          receive_data_end_stream? ||
+          receive_reset? ||
+          receive_priority? ||
+          receive_window_update? ||
+          receive_push_promise?
+      end
     end
 
     getter id : UInt32
@@ -34,6 +70,123 @@ module HTTP2
         raise ArgumentError.new("stream event capacity must be positive")
       end
       @events = Channel(StreamEvent).new(event_capacity)
+    end
+
+    # An exhaustive transition table for standard stream-associated frames.
+    # Connection frames and unknown extension frames do not alter stream state.
+    module StateMachine
+      enum Action
+        Allow
+        Ignore
+        LocalError
+        StreamError
+        ConnectionError
+      end
+
+      record Transition,
+        action : Action,
+        next_state : State? = nil,
+        error_code : ErrorCode? = nil
+
+      private A_IDLE    = Transition.new(Action::Allow, State::Idle)
+      private A_RLOCAL  = Transition.new(Action::Allow, State::ReservedLocal)
+      private A_RREMOTE = Transition.new(
+        Action::Allow,
+        State::ReservedRemote
+      )
+      private A_OPEN   = Transition.new(Action::Allow, State::Open)
+      private A_HLOCAL = Transition.new(
+        Action::Allow,
+        State::HalfClosedLocal
+      )
+      private A_HREMOTE = Transition.new(
+        Action::Allow,
+        State::HalfClosedRemote
+      )
+      private A_CLOSED = Transition.new(Action::Allow, State::Closed)
+      private IGNORE   = Transition.new(Action::Ignore)
+      private LOCAL    = Transition.new(Action::LocalError)
+      private CONN     = Transition.new(
+        Action::ConnectionError,
+        error_code: ErrorCode::PROTOCOL_ERROR
+      )
+      private CONN_CLOSED = Transition.new(
+        Action::ConnectionError,
+        error_code: ErrorCode::STREAM_CLOSED
+      )
+      private STREAM_CLOSED = Transition.new(
+        Action::StreamError,
+        error_code: ErrorCode::STREAM_CLOSED
+      )
+
+      # Entries in every row follow Event declaration order.
+      private TABLE = [
+        # idle
+        [
+          A_OPEN, A_HLOCAL, A_OPEN, A_HREMOTE,
+          LOCAL, LOCAL, CONN, CONN,
+          LOCAL, CONN, A_IDLE, A_IDLE,
+          LOCAL, CONN, LOCAL, CONN,
+        ] of Transition,
+        # reserved (local)
+        [
+          A_HREMOTE, A_CLOSED, CONN, CONN,
+          LOCAL, LOCAL, CONN, CONN,
+          A_CLOSED, A_CLOSED, A_RLOCAL, A_RLOCAL,
+          LOCAL, A_RLOCAL, LOCAL, CONN,
+        ] of Transition,
+        # reserved (remote)
+        [
+          LOCAL, LOCAL, A_HLOCAL, A_CLOSED,
+          LOCAL, LOCAL, CONN, CONN,
+          A_CLOSED, A_CLOSED, A_RREMOTE, A_RREMOTE,
+          A_RREMOTE, CONN, LOCAL, CONN,
+        ] of Transition,
+        # open
+        [
+          A_OPEN, A_HLOCAL, A_OPEN, A_HREMOTE,
+          A_OPEN, A_HLOCAL, A_OPEN, A_HREMOTE,
+          A_CLOSED, A_CLOSED, A_OPEN, A_OPEN,
+          A_OPEN, A_OPEN, A_OPEN, A_OPEN,
+        ] of Transition,
+        # half-closed (local)
+        [
+          LOCAL, LOCAL, A_HLOCAL, A_CLOSED,
+          LOCAL, LOCAL, A_HLOCAL, A_CLOSED,
+          A_CLOSED, A_CLOSED, A_HLOCAL, A_HLOCAL,
+          A_HLOCAL, A_HLOCAL, LOCAL, A_HLOCAL,
+        ] of Transition,
+        # half-closed (remote)
+        [
+          A_HREMOTE, A_CLOSED, STREAM_CLOSED, STREAM_CLOSED,
+          A_HREMOTE, A_CLOSED, STREAM_CLOSED, STREAM_CLOSED,
+          A_CLOSED, A_CLOSED, A_HREMOTE, A_HREMOTE,
+          A_HREMOTE, A_HREMOTE, A_HREMOTE, CONN,
+        ] of Transition,
+        # closed
+        [
+          LOCAL, LOCAL, CONN_CLOSED, CONN_CLOSED,
+          LOCAL, LOCAL, CONN_CLOSED, CONN_CLOSED,
+          LOCAL, IGNORE, A_CLOSED, IGNORE,
+          LOCAL, IGNORE, LOCAL, CONN,
+        ] of Transition,
+      ] of Array(Transition)
+
+      def self.transition(state : State, event : Event) : Transition
+        TABLE[state.value][event.value]
+      end
+
+      def self.reserve_local(state : State) : Transition
+        return A_RLOCAL if state.idle?
+
+        LOCAL
+      end
+
+      def self.reserve_remote(state : State) : Transition
+        return A_RREMOTE if state.idle?
+
+        CONN
+      end
     end
 
     # Sends a frame that belongs to this stream through the ordered writer.
@@ -99,13 +252,27 @@ module HTTP2
       @mutex.synchronize { @state }
     end
 
+    def closed?
+      state.closed?
+    end
+
     def terminal_error : Exception?
       @mutex.synchronize { @terminal_error }
     end
 
+    # Cancels an active stream with RST_STREAM(CANCEL). An idle stream has not
+    # appeared on the wire and is closed locally without sending a reset.
+    def cancel(error_code : ErrorCode = ErrorCode::CANCEL) : Nil
+      @connection.cancel_stream(self, error_code)
+    end
+
     def close : Nil
-      @connection.remove_stream(self)
-      terminate(Connection::ClosedError.new("HTTP/2 stream #{id} closed"))
+      cancel
+    end
+
+    # :nodoc:
+    def transition_to(next_state : State) : Nil
+      @mutex.synchronize { @state = next_state }
     end
 
     # :nodoc:

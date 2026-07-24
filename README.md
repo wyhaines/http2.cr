@@ -11,8 +11,10 @@ a reusable protocol core.
 
 The current code is not ready for production use. Its frame codec, transport
 runtime, SETTINGS state, persistent inbound and outbound HPACK contexts, and
-bounded field-block processing are covered. The stream state machine, flow
-control, and HTTP client API remain unfinished.
+bounded field-block processing are covered. Stream state, concurrency limits,
+reset and cancellation behavior, GOAWAY, PING, and push-disabled operation are
+also implemented. Flow control, streaming DATA, and the HTTP client API remain
+unfinished.
 
 Development is organized in ordered phases:
 

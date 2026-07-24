@@ -20,6 +20,8 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         first_id, second_id = stream_ids.receive
+        read_client_headers(io, first_id)
+        read_client_headers(io, second_id)
 
         write_inbound_field_block(
           io,
@@ -38,6 +40,8 @@ describe HTTP2::Connection do
         connection.wait_until_active(1.second)
         first_stream = connection.new_stream
         second_stream = connection.new_stream
+        open_client_stream(first_stream)
+        open_client_stream(second_stream)
         stream_ids.send({first_stream.id, second_stream.id})
 
         first = first_stream.receive(1.second)
@@ -82,6 +86,8 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         first_id, second_id = stream_ids.receive
+        read_client_headers(io, first_id)
+        read_client_headers(io, second_id)
 
         write_inbound_field_block(
           io,
@@ -105,6 +111,8 @@ describe HTTP2::Connection do
         connection.wait_until_active(1.second)
         first_stream = connection.new_stream
         second_stream = connection.new_stream
+        open_client_stream(first_stream)
+        open_client_stream(second_stream)
         stream_ids.send({first_stream.id, second_stream.id})
 
         error = expect_raises(HTTP2::ProtocolError) do
@@ -135,6 +143,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         write_inbound_field_block(
           io,
           id,
@@ -150,6 +159,7 @@ describe HTTP2::Connection do
       connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
       stream = connection.new_stream
+      open_client_stream(stream)
       stream_id.send(stream.id)
       connection.wait_closed(1.second)
 
@@ -170,6 +180,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         write_inbound_field_block(
           io,
           id,
@@ -188,6 +199,7 @@ describe HTTP2::Connection do
       connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
       stream = connection.new_stream
+      open_client_stream(stream)
       stream_id.send(stream.id)
       connection.wait_closed(1.second)
 
@@ -213,6 +225,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         write_inbound_field_block(io, id, Bytes[0x3f, 0x01, 0x82])
       end
 
@@ -220,6 +233,7 @@ describe HTTP2::Connection do
       begin
         connection.wait_until_active(1.second)
         stream = connection.new_stream
+        open_client_stream(stream)
         stream_id.send(stream.id)
 
         section = stream.receive(1.second)

@@ -26,6 +26,10 @@ module HTTP2
     @effective_local_settings_state = SettingsState.client_defaults
     @peer_settings_state = SettingsState.server_defaults
     @last_goaway : Frame::GoAway?
+    @last_sent_goaway : Frame::GoAway?
+    @highest_local_opened_stream_id = 0_u32
+    @highest_peer_stream_id = 0_u32
+    @last_processed_peer_stream_id = 0_u32
     @mutex = Mutex.new
     @submission_mutex = Mutex.new
     @write_queue : Channel(WriteCommand)
@@ -42,8 +46,11 @@ module HTTP2
     @transport_closer_started = false
     @settings_timer_started = false
     @streams = {} of UInt32 => Stream
+    @closed_streams = {} of UInt32 => ClosedStream
+    @closed_stream_order = [] of UInt32
     @stream_ids = StreamIDAllocator.new
     @pending_settings = [] of SettingsAcknowledgement
+    @pending_pings = {} of String => Array(PingWaiter)
     @field_blocks : FieldBlockAssembler
     @encoder : HPack::Encoder
     @decoder : HPack::Decoder
@@ -239,8 +246,18 @@ module HTTP2
       @mutex.synchronize { @last_goaway }
     end
 
+    def last_sent_goaway : Frame::GoAway?
+      @mutex.synchronize { @last_sent_goaway }
+    end
+
     def active_stream_count : Int32
-      @mutex.synchronize { @streams.size }
+      @mutex.synchronize do
+        @streams.count { |_, stream| stream.state.active? }
+      end
+    end
+
+    def retained_closed_stream_count : Int32
+      @mutex.synchronize { @closed_streams.size }
     end
 
     def stream?(id : UInt32) : Stream?
@@ -279,6 +296,13 @@ module HTTP2
           send_settings(settings.entries)
           return
         end
+      end
+      if reset = frame.as?(Frame::ResetStream)
+        send_reset(
+          reset,
+          CanceledError.new(reset.stream_id, reset.error_code)
+        )
+        return
       end
 
       write_batch([frame] of Frames)
@@ -349,6 +373,11 @@ module HTTP2
           end
 
           updated = @local_settings_state.with_local(materialized)
+          if updated.enable_push?
+            raise ArgumentError.new(
+              "server push is not supported; SETTINGS_ENABLE_PUSH must be 0"
+            )
+          end
           if updated.max_frame_size > @configuration.inbound_max_frame_size
             raise ArgumentError.new(
               "SETTINGS_MAX_FRAME_SIZE exceeds the configured inbound limit"
@@ -388,6 +417,29 @@ module HTTP2
       mark_settings_sent(acknowledgement)
     end
 
+    # Sends a PING and waits for the matching acknowledgement. Concurrent PINGs
+    # with identical payloads are matched in submission order.
+    def ping(
+      payload : Bytes = Bytes.new(8, 0_u8),
+      timeout : Time::Span? = nil,
+    ) : Nil
+      frame = Frame::Ping.new(0_u8, 0_u32, payload.dup)
+      waiter = PingWaiter.new(frame.payload)
+      register_ping(waiter)
+
+      begin
+        write_frame(frame)
+        waiter.wait(timeout)
+      rescue error
+        remove_ping(waiter)
+        raise error
+      end
+    end
+
+    def ping(payload : String, timeout : Time::Span? = nil) : Nil
+      ping(payload.to_slice, timeout)
+    end
+
     def wait_until_active(timeout : Time::Span? = nil) : Nil
       current_state = state
       return if current_state.active? || current_state.draining?
@@ -416,16 +468,70 @@ module HTTP2
     end
 
     # :nodoc:
-    def remove_stream(stream : Stream) : Nil
-      @mutex.synchronize do
+    def cancel_stream(
+      stream : Stream,
+      error_code : ErrorCode = ErrorCode::CANCEL,
+    ) : Nil
+      send_reset = @mutex.synchronize do
         current = @streams[stream.id]?
-        @streams.delete(stream.id) if current && current.same?(stream)
+        unless current && current.same?(stream)
+          next false
+        end
+
+        if current.state.idle?
+          @streams.delete(stream.id)
+          current.transition_to(Stream::State::Closed)
+          current.terminate(
+            CanceledError.new(stream.id, error_code)
+          )
+          false
+        else
+          !current.state.closed?
+        end
       end
+      return unless send_reset
+
+      reset = Frame::ResetStream.new(stream.id, error_code)
+      send_reset(
+        reset,
+        CanceledError.new(stream.id, error_code)
+      )
+    rescue error : InvalidStateError
+      raise error unless stream.closed? || stream.terminal_error
     end
 
     private def submit(command : WriteCommand) : Nil
       @submission_mutex.synchronize { enqueue(command) }
       command.wait
+    end
+
+    private def send_reset(
+      frame : Frame::ResetStream,
+      error : Exception,
+    ) : Nil
+      submit(WriteCommand.reset(frame, error))
+    end
+
+    private def register_ping(waiter : PingWaiter) : Nil
+      @mutex.synchronize do
+        raise_terminal_or_state_unlocked! if @state.closed?
+        if @state.new?
+          raise InvalidStateError.new("connection has not been started")
+        end
+
+        waiters = @pending_pings[waiter.key] ||= [] of PingWaiter
+        waiters << waiter
+      end
+    end
+
+    private def remove_ping(waiter : PingWaiter) : Nil
+      @mutex.synchronize do
+        waiters = @pending_pings[waiter.key]?
+        next unless waiters
+
+        waiters.delete(waiter)
+        @pending_pings.delete(waiter.key) if waiters.empty?
+      end
     end
 
     private def enqueue(command : WriteCommand) : Nil
@@ -448,6 +554,7 @@ module HTTP2
         end
 
         begin
+          prepare_outbound(command)
           if table_size = command.encoder_table_size
             @encoder.resize_table(table_size)
           end
@@ -524,25 +631,27 @@ module HTTP2
       end
       raise error unless error.stream?
 
-      handle_stream_violation(error)
+      handle_inbound_codec_violation(error)
       nil
     end
 
     private def process_inbound_frame(frame : Frames) : Nil
+      validate_field_block_opening!(frame)
       event = @field_blocks.process(frame)
       return unless event
 
-      case event
-      when FieldBlock
-        begin
+      begin
+        case event
+        when FieldBlock
           dispatch(decode_field_block(event))
-        rescue error : ProtocolError
-          raise error unless error.stream?
-
-          handle_stream_violation(error)
+        else
+          dispatch(event)
         end
-      else
-        dispatch(event)
+      rescue error : ProtocolError
+        raise error unless error.stream?
+
+        cancel_rejected_promise(event) if event.is_a?(FieldBlock)
+        handle_stream_violation(error)
       end
     end
 
@@ -625,16 +734,318 @@ module HTTP2
           acknowledge_peer_settings(event)
         end
       when Frame::Ping
-        write_frame(event.ack) unless event.ack?
+        handle_ping(event)
       when Frame::GoAway
         handle_goaway(event)
       when Frame::WindowUpdate
-        dispatch_to_stream(event) unless event.stream_id.zero?
+        dispatch_stream_event(event) unless event.stream_id.zero?
       when Frame::Unknown
         # RFC 9113 requires unknown frame types to be ignored.
+      when FieldSection
+        if event.kind.push_promise?
+          reject_push_promise(event)
+        else
+          dispatch_stream_event(event)
+        end
       else
-        dispatch_to_stream(event)
+        dispatch_stream_event(event)
       end
+    end
+
+    private def validate_field_block_opening!(frame : Frames) : Nil
+      case frame
+      when Frame::Headers
+        event = if frame.end_stream?
+                  Stream::Event::ReceiveHeadersEndStream
+                else
+                  Stream::Event::ReceiveHeaders
+                end
+        validate_inbound_field_event!(frame.stream_id, event)
+      when Frame::PushPromise
+        validate_push_promise!(frame)
+      else
+      end
+    end
+
+    private def validate_inbound_field_event!(
+      stream_id : UInt32,
+      event : Stream::Event,
+    ) : Nil
+      @mutex.synchronize do
+        state = stream_state_unlocked(stream_id)
+        closed = @closed_streams[stream_id]?
+        return if closed.try(&.tolerate_late_frames?)
+
+        if state.idle?
+          raise ProtocolError.new(
+            "a server cannot open idle stream #{stream_id} with HEADERS"
+          )
+        end
+
+        transition = Stream::StateMachine.transition(state, event)
+        if transition.action.connection_error?
+          raise ProtocolError.new(
+            "received #{event} on stream #{stream_id} in state #{state}",
+            transition.error_code || ErrorCode::PROTOCOL_ERROR
+          )
+        end
+      end
+    end
+
+    private def validate_push_promise!(
+      frame : Frame::PushPromise,
+    ) : Nil
+      @mutex.synchronize do
+        unless @effective_local_settings_state.enable_push?
+          raise ProtocolError.new(
+            "received PUSH_PROMISE after push was disabled"
+          )
+        end
+
+        parent_state = stream_state_unlocked(frame.stream_id)
+        closed = @closed_streams[frame.stream_id]?
+        unless closed.try(&.tolerate_late_frames?)
+          transition = Stream::StateMachine.transition(
+            parent_state,
+            Stream::Event::ReceivePushPromise
+          )
+          if transition.action.connection_error?
+            raise ProtocolError.new(
+              "received PUSH_PROMISE on stream #{frame.stream_id} " \
+              "in state #{parent_state}"
+            )
+          end
+        end
+
+        promised_id = frame.promised_stream_id
+        if promised_id.odd?
+          raise ProtocolError.new(
+            "a server PUSH_PROMISE must use an even promised stream ID"
+          )
+        end
+        if promised_id <= @highest_peer_stream_id ||
+           !stream_state_unlocked(promised_id).idle?
+          raise ProtocolError.new(
+            "PUSH_PROMISE stream #{promised_id} is not an idle new stream"
+          )
+        end
+
+        promised = Stream.new(
+          self,
+          promised_id,
+          @configuration.stream_event_capacity
+        )
+        transition = Stream::StateMachine.reserve_remote(promised.state)
+        promised.transition_to(
+          transition.next_state || Stream::State::ReservedRemote
+        )
+        @streams[promised_id] = promised
+        @highest_peer_stream_id = promised_id
+        @last_processed_peer_stream_id = promised_id
+      end
+    end
+
+    private def reject_push_promise(section : FieldSection) : Nil
+      promised_id = section.promised_stream_id
+      unless promised_id
+        raise InvalidStateError.new(
+          "decoded PUSH_PROMISE is missing its promised stream ID"
+        )
+      end
+
+      stream = @mutex.synchronize { @streams[promised_id]? }
+      return unless stream
+
+      reset = Frame::ResetStream.new(promised_id, ErrorCode::CANCEL)
+      send_reset(
+        reset,
+        CanceledError.new(promised_id, ErrorCode::CANCEL)
+      )
+    end
+
+    private def cancel_rejected_promise(block : FieldBlock) : Nil
+      return unless block.kind.push_promise?
+      return unless promised_id = block.promised_stream_id
+
+      stream = @mutex.synchronize { @streams[promised_id]? }
+      return unless stream && stream.state.reserved_remote?
+
+      reset = Frame::ResetStream.new(promised_id, ErrorCode::CANCEL)
+      send_reset(
+        reset,
+        CanceledError.new(promised_id, ErrorCode::CANCEL)
+      )
+    end
+
+    private def dispatch_stream_event(event : StreamEvent) : Nil
+      case event
+      when Frame::Data
+        transition_and_deliver(
+          event,
+          event.end_stream? ? Stream::Event::ReceiveDataEndStream : Stream::Event::ReceiveData
+        )
+      when FieldSection
+        transition_and_deliver(
+          event,
+          event.end_stream? ? Stream::Event::ReceiveHeadersEndStream : Stream::Event::ReceiveHeaders
+        )
+      when Frame::ResetStream
+        handle_inbound_reset(event)
+      when Frame::Priority
+        transition_and_deliver(event, Stream::Event::ReceivePriority)
+      when Frame::WindowUpdate
+        transition_and_deliver(event, Stream::Event::ReceiveWindowUpdate)
+      else
+        raise InvalidStateError.new(
+          "unexpected stream event #{event.class}"
+        )
+      end
+    end
+
+    private def transition_and_deliver(
+      event : StreamEvent,
+      stream_event : Stream::Event,
+    ) : Nil
+      stream, ignored = @mutex.synchronize do
+        resolved = resolve_inbound_transition_unlocked(
+          event.stream_id,
+          stream_event
+        )
+        next {nil, true} unless resolved
+        state, transition = resolved
+
+        active_stream = @streams[event.stream_id]?
+        unless active_stream
+          # PRIORITY is valid in idle and closed states without creating a
+          # stream. All other absent-stream cases were rejected above.
+          next {nil, true}
+        end
+
+        next_state = transition.next_state || state
+        active_stream.transition_to(next_state)
+        if next_state.closed?
+          @streams.delete(event.stream_id)
+          retain_closed_stream_unlocked(
+            event.stream_id,
+            ClosedStream::Reason::EndStream
+          )
+        end
+        {active_stream, false}
+      end
+      return if ignored || stream.nil?
+
+      unless stream.deliver(event)
+        raise QueueFullError.new(
+          "stream #{stream.id} event queue reached its configured limit"
+        )
+      end
+    end
+
+    private def resolve_inbound_transition_unlocked(
+      stream_id : UInt32,
+      event : Stream::Event,
+    ) : Tuple(Stream::State, Stream::StateMachine::Transition)?
+      state = stream_state_unlocked(stream_id)
+      closed = @closed_streams[stream_id]?
+      return if closed.try(&.tolerate_late_frames?)
+
+      transition = Stream::StateMachine.transition(state, event)
+      case transition.action
+      when Stream::StateMachine::Action::Ignore
+        nil
+      when Stream::StateMachine::Action::ConnectionError
+        raise ProtocolError.new(
+          "received #{event} on stream #{stream_id} in state #{state}",
+          transition.error_code || ErrorCode::PROTOCOL_ERROR
+        )
+      when Stream::StateMachine::Action::StreamError
+        raise ProtocolError.new(
+          "received #{event} on stream #{stream_id} in state #{state}",
+          transition.error_code || ErrorCode::STREAM_CLOSED,
+          ErrorScope::Stream,
+          stream_id
+        )
+      when Stream::StateMachine::Action::LocalError
+        raise InvalidStateError.new(
+          "inbound transition resolved to a local error"
+        )
+      when Stream::StateMachine::Action::Allow
+        {state, transition}
+      end
+    end
+
+    private def handle_inbound_reset(frame : Frame::ResetStream) : Nil
+      stream, ignored = @mutex.synchronize do
+        state = stream_state_unlocked(frame.stream_id)
+        closed = @closed_streams[frame.stream_id]?
+        if closed
+          next {nil, true}
+        end
+
+        transition = Stream::StateMachine.transition(
+          state,
+          Stream::Event::ReceiveReset
+        )
+        if transition.action.connection_error?
+          raise ProtocolError.new(
+            "received RST_STREAM on idle stream #{frame.stream_id}"
+          )
+        end
+        if transition.action.ignore?
+          next {nil, true}
+        end
+
+        active_stream = @streams.delete(frame.stream_id)
+        unless active_stream
+          next {nil, true}
+        end
+        active_stream.transition_to(Stream::State::Closed)
+        retain_closed_stream_unlocked(
+          frame.stream_id,
+          ClosedStream::Reason::RemoteReset
+        )
+        {active_stream, false}
+      end
+      return if ignored || stream.nil?
+
+      stream.terminate(
+        StreamResetError.new(frame.stream_id, frame.error_code)
+      )
+    end
+
+    private def stream_state_unlocked(stream_id : UInt32) : Stream::State
+      if stream = @streams[stream_id]?
+        stream.state
+      elsif @closed_streams.has_key?(stream_id)
+        Stream::State::Closed
+      elsif stream_id.odd?
+        if stream_id <= @highest_local_opened_stream_id
+          Stream::State::Closed
+        else
+          Stream::State::Idle
+        end
+      elsif stream_id <= @highest_peer_stream_id
+        Stream::State::Closed
+      else
+        Stream::State::Idle
+      end
+    end
+
+    private def handle_ping(frame : Frame::Ping) : Nil
+      unless frame.ack?
+        write_frame(frame.ack)
+        return
+      end
+
+      waiter = @mutex.synchronize do
+        key = String.new(frame.payload)
+        if waiters = @pending_pings[key]?
+          matched = waiters.shift?
+          @pending_pings.delete(key) if waiters.empty?
+          matched
+        end
+      end
+      waiter.try(&.complete)
     end
 
     private def apply_peer_settings(settings : Frame::Settings) : Int32?
@@ -686,29 +1097,39 @@ module HTTP2
 
     private def handle_goaway(frame : Frame::GoAway) : Nil
       @mutex.synchronize do
-        @last_goaway = frame
-        @state = State::Draining unless @state.closed?
-        affected_ids = @streams.keys.select { |id| id > frame.last_stream_id }
-        affected_ids.each do |id|
-          if stream = @streams.delete(id)
-            stream.terminate(
-              ClosedError.new("stream was not processed before GOAWAY")
+        if !frame.last_stream_id.zero? && frame.last_stream_id.even?
+          raise ProtocolError.new(
+            "a server GOAWAY last stream ID must identify a client stream"
+          )
+        end
+        if previous = @last_goaway
+          if frame.last_stream_id > previous.last_stream_id
+            raise ProtocolError.new(
+              "successive GOAWAY last stream IDs cannot increase"
             )
           end
         end
-      end
-    end
 
-    private def dispatch_to_stream(event : StreamEvent) : Nil
-      full_stream_id = @mutex.synchronize do
-        if stream = @streams[event.stream_id]?
-          stream.id unless stream.deliver(event)
+        @last_goaway = frame
+        @state = State::Draining unless @state.closed?
+        affected_ids = @streams.compact_map do |id, stream|
+          next unless id.odd?
+          next unless stream.state.idle? || id > frame.last_stream_id
+
+          id
         end
-      end
-      if full_stream_id
-        raise QueueFullError.new(
-          "stream #{full_stream_id} event queue reached its configured limit"
-        )
+        affected_ids.each do |id|
+          if stream = @streams.delete(id)
+            stream.transition_to(Stream::State::Closed)
+            retain_closed_stream_unlocked(
+              id,
+              ClosedStream::Reason::GoAway
+            )
+            stream.terminate(
+              UnprocessedStreamError.new(id, frame)
+            )
+          end
+        end
       end
     end
 
@@ -719,21 +1140,65 @@ module HTTP2
           "stream-scoped protocol violation is missing a stream ID"
         )
       end
-      write_frame(Frame::ResetStream.new(id, error.error_code))
 
-      @mutex.synchronize do
-        @streams.delete(id).try(&.terminate(error))
+      stream = @mutex.synchronize { @streams[id]? }
+      return unless stream
+
+      send_reset(
+        Frame::ResetStream.new(id, error.error_code),
+        error
+      )
+    rescue error : InvalidStateError
+      active = @mutex.synchronize { @streams.has_key?(id) }
+      raise error if active
+    end
+
+    private def handle_inbound_codec_violation(
+      error : ProtocolError,
+    ) : Nil
+      id = error.stream_id
+      unless id
+        raise InvalidStateError.new(
+          "stream-scoped codec violation is missing a stream ID"
+        )
       end
+
+      state, tolerate = @mutex.synchronize do
+        closed = @closed_streams[id]?
+        {stream_state_unlocked(id), closed.try(&.tolerate_late_frames?) || false}
+      end
+      return if tolerate
+
+      if state.active? || state.reserved_local? || state.reserved_remote?
+        handle_stream_violation(error)
+        return
+      end
+
+      raise ProtocolError.new(
+        error.message || "invalid frame on an inactive stream",
+        error.error_code
+      )
     end
 
     private def send_goaway(error : ProtocolError) : Nil
-      write_frame(Frame::GoAway.new(0_u32, error.error_code))
+      last_stream_id = @mutex.synchronize do
+        if previous = @last_sent_goaway
+          Math.min(
+            previous.last_stream_id,
+            @last_processed_peer_stream_id
+          )
+        else
+          @last_processed_peer_stream_id
+        end
+      end
+      write_frame(Frame::GoAway.new(last_stream_id, error.error_code))
     rescue
       # The original protocol violation remains the terminal error.
     end
 
     private def terminate(error : Exception) : Nil
       close_directly = false
+      ping_waiters = [] of PingWaiter
       terminated = @mutex.synchronize do
         if @state.closed?
           false
@@ -744,6 +1209,10 @@ module HTTP2
           @streams.clear
           streams.each(&.terminate(error))
           @pending_settings.clear
+          @pending_pings.each_value do |waiters|
+            ping_waiters.concat(waiters)
+          end
+          @pending_pings.clear
           close_directly = !@transport_closer_started
           true
         end
@@ -756,6 +1225,7 @@ module HTTP2
       @handshake_done.close
       @closed_signal.close
 
+      ping_waiters.each(&.complete(error))
       close_transport if close_directly
     end
 
@@ -937,6 +1407,338 @@ module HTTP2
         end
       end
       wake_settings_timer if marked
+    end
+
+    private def prepare_outbound(command : WriteCommand) : Nil
+      @mutex.synchronize do
+        raise_terminal_or_state_unlocked! if @state.closed?
+
+        plans = {} of UInt32 => OutboundTransition
+        next_highest_local_id = @highest_local_opened_stream_id
+
+        if header_block = command.header_block
+          next_highest_local_id = plan_outbound_header_block_unlocked(
+            plans,
+            header_block,
+            next_highest_local_id
+          )
+          planned_goaway = @last_sent_goaway
+        else
+          planned_goaway = plan_outbound_frames_unlocked(
+            command,
+            plans,
+            next_highest_local_id
+          )
+        end
+
+        @highest_local_opened_stream_id = next_highest_local_id
+        plans.each_value do |plan|
+          apply_outbound_transition_unlocked(plan)
+        end
+        apply_outbound_goaway_unlocked(planned_goaway)
+      end
+    end
+
+    private def plan_outbound_header_block_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      header_block : WriteCommand::HeaderBlock,
+      highest_local_id : UInt32,
+    ) : UInt32
+      event = if header_block.end_stream
+                Stream::Event::SendHeadersEndStream
+              else
+                Stream::Event::SendHeaders
+              end
+      plan_outbound_stream_event_unlocked(
+        plans,
+        header_block.stream_id,
+        event,
+        highest_local_id,
+        @state.draining?
+      )
+    end
+
+    private def plan_outbound_frames_unlocked(
+      command : WriteCommand,
+      plans : Hash(UInt32, OutboundTransition),
+      highest_local_id : UInt32,
+    ) : Frame::GoAway?
+      planned_goaway = @last_sent_goaway
+      command.frames.each do |frame|
+        case frame
+        when Frame::GoAway
+          validate_outbound_goaway_unlocked(frame, planned_goaway)
+          planned_goaway = frame
+        when Frame::Data
+          plan_outbound_data_unlocked(plans, frame, highest_local_id)
+        when Frame::ResetStream
+          plan_outbound_stream_event_unlocked(
+            plans,
+            frame.stream_id,
+            Stream::Event::SendReset,
+            highest_local_id,
+            @state.draining?,
+            reset_code: frame.error_code,
+            close_error: command.stream_closure_error
+          )
+        when Frame::Priority
+          plan_outbound_stream_event_unlocked(
+            plans,
+            frame.stream_id,
+            Stream::Event::SendPriority,
+            highest_local_id,
+            @state.draining?
+          )
+        when Frame::WindowUpdate
+          plan_outbound_window_update_unlocked(
+            plans,
+            frame,
+            highest_local_id
+          )
+        else
+          # Connection frames and unknown extensions do not alter streams.
+        end
+      end
+      planned_goaway
+    end
+
+    private def plan_outbound_data_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      frame : Frame::Data,
+      highest_local_id : UInt32,
+    ) : Nil
+      event = if frame.end_stream?
+                Stream::Event::SendDataEndStream
+              else
+                Stream::Event::SendData
+              end
+      plan_outbound_stream_event_unlocked(
+        plans,
+        frame.stream_id,
+        event,
+        highest_local_id,
+        @state.draining?
+      )
+    end
+
+    private def plan_outbound_window_update_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      frame : Frame::WindowUpdate,
+      highest_local_id : UInt32,
+    ) : Nil
+      return if frame.stream_id.zero?
+
+      plan_outbound_stream_event_unlocked(
+        plans,
+        frame.stream_id,
+        Stream::Event::SendWindowUpdate,
+        highest_local_id,
+        @state.draining?
+      )
+    end
+
+    private def plan_outbound_stream_event_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      stream_id : UInt32,
+      event : Stream::Event,
+      highest_local_id : UInt32,
+      draining : Bool,
+      *,
+      reset_code : UInt32? = nil,
+      close_error : Exception? = nil,
+    ) : UInt32
+      stream = @streams[stream_id]?
+      unless stream
+        return highest_local_id if event.send_priority?
+
+        raise InvalidStateError.new(
+          "stream #{stream_id} is not active on this connection"
+        )
+      end
+
+      current_state = plans[stream_id]?.try(&.state) || stream.state
+      if outbound_stream_opening?(current_state, event)
+        highest_local_id = plan_local_stream_open_unlocked(
+          plans,
+          stream_id,
+          highest_local_id,
+          draining
+        )
+      end
+
+      transition = Stream::StateMachine.transition(current_state, event)
+      unless transition.action.allow?
+        raise InvalidStateError.new(
+          "cannot #{event.to_s.underscore} on stream #{stream_id} " \
+          "in state #{current_state}"
+        )
+      end
+
+      next_state = transition.next_state || current_state
+      plans[stream_id] = build_outbound_transition(
+        plans[stream_id]?,
+        stream,
+        next_state,
+        event,
+        reset_code,
+        close_error
+      )
+      highest_local_id
+    end
+
+    private def outbound_stream_opening?(
+      state : Stream::State,
+      event : Stream::Event,
+    ) : Bool
+      state.idle? &&
+        (event.send_headers? || event.send_headers_end_stream?)
+    end
+
+    private def plan_local_stream_open_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      stream_id : UInt32,
+      highest_local_id : UInt32,
+      draining : Bool,
+    ) : UInt32
+      if draining
+        raise InvalidStateError.new(
+          "cannot open stream #{stream_id} on a draining connection"
+        )
+      end
+      unless stream_id.odd?
+        raise InvalidStateError.new(
+          "clients can only open odd-numbered streams"
+        )
+      end
+      if stream_id <= highest_local_id
+        raise InvalidStateError.new(
+          "stream #{stream_id} was skipped by a higher stream identifier"
+        )
+      end
+
+      enforce_peer_concurrent_stream_limit_unlocked(plans)
+      plan_skipped_local_streams_unlocked(plans, stream_id)
+      stream_id
+    end
+
+    private def build_outbound_transition(
+      prior : OutboundTransition?,
+      stream : Stream,
+      state : Stream::State,
+      event : Stream::Event,
+      reset_code : UInt32?,
+      close_error : Exception?,
+    ) : OutboundTransition
+      reason = prior.try(&.close_reason)
+      error = prior.try(&.close_error)
+      if state.closed? && event.send_reset?
+        reason = ClosedStream::Reason::LocalReset
+        error = close_error ||
+                CanceledError.new(stream.id, reset_code || 0_u32)
+      elsif state.closed?
+        reason ||= ClosedStream::Reason::EndStream
+      end
+
+      OutboundTransition.new(stream, state, reason, error)
+    end
+
+    private def enforce_peer_concurrent_stream_limit_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+    ) : Nil
+      limit = @peer_settings_state.max_concurrent_streams
+      return unless limit
+
+      active = @streams.count do |id, stream|
+        state = plans[id]?.try(&.state) || stream.state
+        id.odd? && state.active?
+      end
+      if active.to_u64 >= limit.to_u64
+        raise ConcurrentStreamLimitError.new(limit)
+      end
+    end
+
+    private def plan_skipped_local_streams_unlocked(
+      plans : Hash(UInt32, OutboundTransition),
+      opening_stream_id : UInt32,
+    ) : Nil
+      @streams.each do |id, stream|
+        next unless id.odd? && id < opening_stream_id
+
+        state = plans[id]?.try(&.state) || stream.state
+        next unless state.idle?
+
+        plans[id] = OutboundTransition.new(
+          stream,
+          Stream::State::Closed,
+          ClosedStream::Reason::Skipped,
+          ClosedError.new(
+            "stream #{id} was skipped by stream #{opening_stream_id}"
+          )
+        )
+      end
+    end
+
+    private def apply_outbound_transition_unlocked(
+      plan : OutboundTransition,
+    ) : Nil
+      plan.stream.transition_to(plan.state)
+      return unless plan.state.closed?
+
+      current = @streams[plan.stream.id]?
+      if current && current.same?(plan.stream)
+        @streams.delete(plan.stream.id)
+      end
+      if reason = plan.close_reason
+        retain_closed_stream_unlocked(plan.stream.id, reason)
+      end
+      if error = plan.close_error
+        plan.stream.terminate(error)
+      end
+    end
+
+    private def validate_outbound_goaway_unlocked(
+      frame : Frame::GoAway,
+      previous : Frame::GoAway?,
+    ) : Nil
+      last_stream_id = frame.last_stream_id
+      if !last_stream_id.zero? && last_stream_id.odd?
+        raise InvalidStateError.new(
+          "a client GOAWAY last stream ID must identify a server stream"
+        )
+      end
+      if previous && last_stream_id > previous.last_stream_id
+        raise InvalidStateError.new(
+          "successive GOAWAY last stream IDs cannot increase"
+        )
+      end
+    end
+
+    private def apply_outbound_goaway_unlocked(
+      planned : Frame::GoAway?,
+    ) : Nil
+      return if planned == @last_sent_goaway
+
+      @last_sent_goaway = planned
+      @state = State::Draining unless @state.closed?
+    end
+
+    private def retain_closed_stream_unlocked(
+      stream_id : UInt32,
+      reason : ClosedStream::Reason,
+    ) : Nil
+      limit = @configuration.max_retained_closed_streams
+      return if limit.zero?
+
+      unless @closed_streams.has_key?(stream_id)
+        @closed_stream_order << stream_id
+      end
+      @closed_streams[stream_id] = ClosedStream.new(stream_id, reason)
+
+      while @closed_stream_order.size > limit
+        if evicted_id = @closed_stream_order.shift?
+          @closed_streams.delete(evicted_id)
+        end
+      end
     end
 
     private def materialize_frames(command : WriteCommand) : Array(Frames)

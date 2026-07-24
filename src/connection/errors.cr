@@ -14,6 +14,14 @@ module HTTP2
     class StreamIDExhaustedError < Error
     end
 
+    class ConcurrentStreamLimitError < InvalidStateError
+      getter limit : UInt32
+
+      def initialize(@limit : UInt32)
+        super("peer concurrent-stream limit #{limit} is exhausted")
+      end
+    end
+
     class QueueFullError < Error
     end
 
@@ -21,6 +29,39 @@ module HTTP2
     end
 
     class TLSNegotiationError < Error
+    end
+
+    class CanceledError < ClosedError
+      getter stream_id : UInt32
+      getter error_code : UInt32
+
+      def initialize(@stream_id : UInt32, @error_code : UInt32)
+        super("HTTP/2 stream #{stream_id} was canceled with #{error_code}")
+      end
+
+      def initialize(stream_id : UInt32, error_code : ErrorCode)
+        initialize(stream_id, error_code.to_u32)
+      end
+    end
+
+    class StreamResetError < ClosedError
+      getter stream_id : UInt32
+      getter error_code : UInt32
+
+      def initialize(@stream_id : UInt32, @error_code : UInt32)
+        super(
+          "peer reset HTTP/2 stream #{stream_id} with error code #{error_code}"
+        )
+      end
+    end
+
+    class UnprocessedStreamError < ClosedError
+      getter stream_id : UInt32
+      getter goaway : Frame::GoAway
+
+      def initialize(@stream_id : UInt32, @goaway : Frame::GoAway)
+        super("HTTP/2 stream #{stream_id} was not processed before GOAWAY")
+      end
     end
 
     class ResourceLimitError < ProtocolError

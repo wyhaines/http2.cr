@@ -6,6 +6,7 @@ module HTTP2
       getter? preface : Bool
       getter encoder_table_size : Int32?
       getter header_block : HeaderBlock?
+      getter stream_closure_error : Exception?
 
       @completion = Channel(Exception?).new(1)
 
@@ -19,6 +20,7 @@ module HTTP2
         @preface : Bool = false,
         @encoder_table_size : Int32? = nil,
         @header_block : HeaderBlock? = nil,
+        @stream_closure_error : Exception? = nil,
       )
       end
 
@@ -37,6 +39,16 @@ module HTTP2
         new(
           [] of Frames,
           header_block: HeaderBlock.new(stream_id, fields, end_stream)
+        )
+      end
+
+      def self.reset(
+        frame : Frame::ResetStream,
+        error : Exception,
+      ) : self
+        new(
+          [frame] of Frames,
+          stream_closure_error: error
         )
       end
 

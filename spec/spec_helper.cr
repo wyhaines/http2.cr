@@ -96,6 +96,32 @@ def complete_server_handshake(
   client_settings
 end
 
+def read_client_headers(io : IO, expected_stream_id : UInt32? = nil)
+  first = HTTP2::Frame.read(io).as(HTTP2::Frame::Headers)
+  if expected_stream_id
+    first.stream_id.should eq(expected_stream_id)
+  end
+
+  until first.end_headers?
+    continuation = HTTP2::Frame.read(io)
+      .as(HTTP2::Frame::Continuation)
+    continuation.stream_id.should eq(first.stream_id)
+    break if continuation.end_headers?
+  end
+  first
+end
+
+def open_client_stream(
+  stream : HTTP2::Stream,
+  *,
+  end_stream : Bool = true,
+) : Nil
+  stream.send_headers(
+    [] of HTTP2::HeaderField,
+    end_stream: end_stream
+  )
+end
+
 class FailingWriteIO < IO
   getter written_bytes : Int32 = 0
 

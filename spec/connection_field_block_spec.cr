@@ -7,6 +7,7 @@ describe HTTP2::Connection do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
+        read_client_headers(io, id)
         HTTP2::Frame::Headers.new(
           HTTP2::Frame::Headers::Flags::END_STREAM,
           id,
@@ -24,6 +25,7 @@ describe HTTP2::Connection do
       begin
         connection.wait_until_active(1.second)
         stream = connection.new_stream
+        open_client_stream(stream)
         stream_id.send(stream.id)
 
         section = stream.receive(1.second)
@@ -60,6 +62,7 @@ describe HTTP2::Connection do
         ids = stream_ids.receive
 
         ids.each_with_index do |id, split|
+          read_client_headers(io, id)
           HTTP2::Frame::Headers.new(
             0_u8,
             id,
@@ -78,6 +81,7 @@ describe HTTP2::Connection do
       begin
         connection.wait_until_active(1.second)
         streams = (0..encoded.size).map { connection.new_stream }
+        streams.each { |stream| open_client_stream(stream) }
         stream_ids.send(streams.map(&.id))
 
         streams.each do |stream|
@@ -96,9 +100,12 @@ describe HTTP2::Connection do
 
   it "closes the connection when another frame interrupts a field block" do
     UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
-        HTTP2::Frame::Headers.new(0_u8, 1_u32, Bytes[1]).write(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+        HTTP2::Frame::Headers.new(0_u8, id, Bytes[1]).write(io)
         HTTP2::Frame::Ping.new(0_u8, 0_u32, "12345678").write(io)
         io.flush
 
@@ -108,6 +115,9 @@ describe HTTP2::Connection do
 
       connection = HTTP2::Connection.start(client)
       connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      stream_id.send(stream.id)
       connection.wait_closed(1.second)
 
       error = connection.terminal_error.as(HTTP2::ProtocolError)
@@ -121,12 +131,15 @@ describe HTTP2::Connection do
       configuration = HTTP2::Connection::Configuration.new(
         max_compressed_field_section_size: 2
       )
+      stream_id = Channel(UInt32).new(1)
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
-        HTTP2::Frame::Headers.new(0_u8, 1_u32, Bytes[1, 2]).write(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+        HTTP2::Frame::Headers.new(0_u8, id, Bytes[1, 2]).write(io)
         HTTP2::Frame::Continuation.new(
           HTTP2::Frame::Continuation::Flags::END_HEADERS,
-          1_u32,
+          id,
           Bytes[3]
         ).write(io)
         io.flush
@@ -139,6 +152,9 @@ describe HTTP2::Connection do
 
       connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      stream_id.send(stream.id)
       connection.wait_closed(1.second)
 
       connection.terminal_error.should be_a(

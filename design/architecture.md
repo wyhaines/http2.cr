@@ -85,3 +85,7 @@ input may cause unbounded allocation.
   without decoding field blocks.
 - Phase 3 integrates persistent HPACK contexts, complete field blocks, and
   bounded decoded field sections.
+- Phase 4 completes stream lifecycle enforcement, concurrency limits, reset
+  and cancellation behavior, GOAWAY, PING, and push-disabled operation.
+- Phase 5 adds connection and stream flow control plus bounded streaming DATA
+  delivery without changing frame-codec ownership.
