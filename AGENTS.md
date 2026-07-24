@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Crystal shard providing HTTP/2 protocol building blocks; it does not implement a complete client or server. The public entry point is `src/http2.cr`. Core connection, stream, request, and error types live directly under `src/`; individual HTTP/2 frame implementations are in `src/frame/`, and stream-specific errors are in `src/stream/`. Specs mirror the implementation in `spec/`, with shared setup in `spec/spec_helper.cr`. Package metadata and dependencies are declared in `shard.yml`.
+This repository is a Crystal shard providing HTTP/2 protocol building blocks; it does not implement a complete client or server. The public entry point is `src/http2.cr`. Core types live directly under `src/`; connection configuration, errors, and writer helpers are in `src/connection/`, while frame implementations are in `src/frame/`. Specs mirror the implementation in `spec/`, with shared scripted-peer helpers in `spec/spec_helper.cr` and local TLS material in `spec/fixtures/`. Package metadata and dependencies are declared in `shard.yml`.
 
 ## Build, Test, and Development Commands
 

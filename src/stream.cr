@@ -1,44 +1,6 @@
-require "./stream/*"
-
 module HTTP2
+  # A registered stream mailbox. The full RFC state machine is added in Phase 4.
   class Stream
-    # https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-http2-14#section-5.1
-    #
-    # The possible states of a stream are illustrated below. The `State` enum captures
-    # each of these possible states.
-    #
-    # ```
-    #                       +--------+
-    #                 PP    |        |    PP
-    #              ,--------|  idle  |--------.
-    #             /         |        |         \
-    #            v          +--------+          v
-    #     +----------+          |           +----------+
-    #     |          |          | H         |          |
-    # ,---| reserved |          |           | reserved |---.
-    # |   | (local)  |          v           | (remote) |   |
-    # |   +----------+      +--------+      +----------+   |
-    # |      |          ES  |        |  ES          |      |
-    # |      | H    ,-------|  open  |-------.      | H    |
-    # |      |     /        |        |        \     |      |
-    # |      v    v         +--------+         v    v      |
-    # |   +----------+          |           +----------+   |
-    # |   |   half   |          |           |   half   |   |
-    # |   |  closed  |          | R         |  closed  |   |
-    # |   | (remote) |          |           | (local)  |   |
-    # |   +----------+          |           +----------+   |
-    # |        |                v                 |        |
-    # |        |  ES / R    +--------+  ES / R    |        |
-    # |        `----------->|        |<-----------'        |
-    # |  R                  | closed |                  R  |
-    # `-------------------->|        |<--------------------'
-    #                       +--------+
-    #
-    # H:  HEADERS frame (with implied CONTINUATIONs)
-    # PP: PUSH_PROMISE frame (with implied CONTINUATIONs)
-    # ES: END_STREAM flag
-    # R:  RST_STREAM frame
-    # ```
     enum State
       Idle
       ReservedLocal
@@ -49,160 +11,115 @@ module HTTP2
       Closed
     end
 
-    property state = State::Idle
-    property initial_window_size : UInt32 = 65535.to_u32
-    getter window_size : UInt32 = 65535.to_u32
-    getter? push_enabled = false
-    getter headers = HTTP::Headers.new
-    getter! data : IO::Memory?
     getter id : UInt32
 
-    def initialize(@connection : Connection, @id : UInt32)
+    @events : Channel(Frames)
+    @state : State = State::Idle
+    @terminal_signal = Channel(Nil).new
+    @terminal_error : Exception?
+    @mutex = Mutex.new
+
+    def initialize(
+      @connection : Connection,
+      @id : UInt32,
+      event_capacity : Int32,
+    )
+      if @id.zero?
+        raise ArgumentError.new("stream 0 cannot be registered")
+      end
+      if @id > FrameHeader::MAX_STREAM_ID
+        raise ArgumentError.new("stream ID must be a 31-bit unsigned integer")
+      end
+      if event_capacity <= 0
+        raise ArgumentError.new("stream event capacity must be positive")
+      end
+      @events = Channel(Frames).new(event_capacity)
     end
 
-    def send(data : Frame::Data)
-      if state.idle?
-        raise InvalidState.new("InvalidState; can not send #{data.class} in state #{state}")
-      end
+    # Sends a frame that belongs to this stream through the ordered writer.
+    def send(frame : Frames) : Nil
+      raise_terminal! if terminal_error
 
-      if data.flags.end_stream?
-        case state
-        when .open?
-          @state = State::HalfClosedLocal
-        when .half_closed_remote?, .half_closed_local?
-          @state = State::Closed
-          @connection.delete_stream id
-        else
-          # Do we need to do anything here?
+      unless frame.stream_id == id
+        raise ArgumentError.new(
+          "frame stream ID #{frame.stream_id} does not match stream #{id}"
+        )
+      end
+      @connection.write_frame(frame)
+    end
+
+    # Waits for the next raw inbound frame for this stream.
+    def receive(timeout : Time::Span? = nil) : Frames
+      raise_terminal! if terminal_error
+
+      if timeout
+        select
+        when frame = @events.receive
+          frame
+        when @terminal_signal.receive?
+          raise_terminal!
+        when timeout(timeout)
+          raise Connection::TimeoutError.new(
+            "waiting for stream #{id} timed out"
+          )
         end
-      end
-
-      @connection.write_frame data
-    end
-
-    def send(window_update : Frame::WindowUpdate)
-      @connection.write_frame window_update
-    end
-
-    def send(ping : Frame::Ping)
-      @connection.write_frame ping
-    end
-
-    def send(settings : Frame::Settings)
-      @connection.write_frame settings
-    end
-
-    def send(headers : Frame::Headers)
-      @connection.write_frame headers
-
-      if state.idle?
-        @state = State::Open
-      end
-
-      if headers.flags.end_stream?
-        case state
-        when .open?
-          @state = State::HalfClosedLocal
-        when .half_closed_remote?, .half_closed_local?
-          @state = State::Closed
-        else
-        end
-      end
-    end
-
-    def send(push_promise : Frame::PushPromise)
-    end
-
-    def receive(data : Frame::Data, **_kwargs)
-      (io = @data ||= IO::Memory.new).write data.payload
-      io.rewind
-
-      case state
-      when .idle?, .open?, .half_closed_local?
       else
-        raise InvalidState.new("Invalid State; can not receive #{data.class} when in state #{state}")
+        select
+        when frame = @events.receive
+          frame
+        when @terminal_signal.receive?
+          raise_terminal!
+        end
       end
+    end
 
-      if data.flags.end_stream?
-        case state
-        when .open?
-          @state = State::HalfClosedRemote
-        when .half_closed_local?, .half_closed_remote?
+    def state : State
+      @mutex.synchronize { @state }
+    end
+
+    def terminal_error : Exception?
+      @mutex.synchronize { @terminal_error }
+    end
+
+    def close : Nil
+      @connection.remove_stream(self)
+      terminate(Connection::ClosedError.new("HTTP/2 stream #{id} closed"))
+    end
+
+    # :nodoc:
+    def deliver(frame : Frames) : Bool
+      return false if terminal_error
+
+      select
+      when @events.send(frame)
+        true
+      else
+        false
+      end
+    rescue Channel::ClosedError
+      false
+    end
+
+    # :nodoc:
+    def terminate(error : Exception) : Nil
+      terminated = @mutex.synchronize do
+        if @terminal_error
+          false
+        else
+          @terminal_error = error
           @state = State::Closed
-        when .idle?
-        when .closed?
-        when .reserved_local?
-        when .reserved_remote?
+          true
         end
       end
-
-      update_window_for data
+      @terminal_signal.close if terminated
     end
 
-    def receive(headers : Frame::Headers, decoder : HPack::Decoder = HPack::Decoder.new)
-      @headers.merge! decoder.decode(headers.header_block_fragment)
-
-      if state.idle?
-        @state = State::Open
+    private def raise_terminal! : NoReturn
+      if error = terminal_error
+        raise error
       end
 
-      if headers.flags.end_stream?
-        case state
-        when .open?
-          @state = State::HalfClosedRemote
-        when .half_closed_remote?, .half_closed_local?
-          @state = State::Closed
-        when .idle?, .closed?, .reserved_local?, .reserved_remote?
-        end
-      end
-
-      update_window_for headers
-    end
-
-    def receive(priority : Frame::Priority, **_kwargs)
-    end
-
-    def receive(reset_stream : Frame::ResetStream, **_kwargs)
-    end
-
-    def receive(push_promise : Frame::PushPromise, **_kwargs)
-    end
-
-    def receive(ping : Frame::Ping, **_kwargs)
-      send ping.ack unless ping.ack?
-    end
-
-    def receive(go_away : Frame::GoAway, **_kwargs)
-    end
-
-    def receive(window_update : Frame::WindowUpdate, **_kwargs)
-      @window_size += window_update.window_size_increment
-    end
-
-    def receive(continuation : Frame::Continuation, **_kwargs)
-    end
-
-    def receive(settings : Frame::Settings, **_kwargs)
-      settings.entries.each do |setting|
-        case setting.known_identifier
-        when Frame::Settings::Identifier::ENABLE_PUSH
-          @push_enabled = !setting.value.zero?
-        when Frame::Settings::Identifier::INITIAL_WINDOW_SIZE
-          @window_size = setting.value
-        end
-      end
-
-      send settings.ack unless settings.ack?
-    end
-
-    def update_window_for(frame)
-      @window_size -= frame.payload.size
-
-      if @window_size < @initial_window_size // 2
-        bytes_to_add = @initial_window_size - @window_size
-        send Frame::WindowUpdate.new(id, bytes_to_add)
-        @window_size = @initial_window_size
-      end
+      raise Connection::ClosedError.new("HTTP/2 stream #{id} is closed")
     end
   end
 end

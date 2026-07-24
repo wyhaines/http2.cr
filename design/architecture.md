@@ -47,16 +47,21 @@ writer is the sole owner of outbound ordering, HPACK encoding, header
 fragmentation, and wire writes. It accepts bounded commands, including atomic
 frame batches for HEADERS/CONTINUATION sequences.
 
-Application code never executes on the reader fiber. Per-stream bounded
-mailboxes or pipes transfer events and body bytes to consumers. Slow consumers
-therefore apply backpressure without preventing the reader from processing
-connection-level control frames.
+Application code never executes on the reader fiber. Phase 2 uses bounded,
+nonblocking per-stream mailboxes; a full mailbox terminates the connection
+instead of stalling its reader. Phase 5 will replace raw DATA delivery with
+bounded body pipes whose consumption controls flow-control credit.
+
+Transport shutdown runs in the connection's transport scheduler and joins both
+protocol fibers. This keeps socket event-loop ownership consistent and makes a
+cross-fiber close deterministic, including under legacy `preview_mt`.
 
 ## Transport and Testability
 
-The engine accepts a supplied `IO`; dialing and TLS wrapping stay outside its
-wire-state logic. Production connectors return a verified transport, while
-specs use scripted duplex IO or local sockets. Timeouts will use an injected
+The engine accepts a supplied `IO`; convenience constructors perform cleartext
+prior-knowledge dialing or verified TLS wrapping before starting the same wire
+runtime. TLS requires SNI and ALPN `h2`. Specs use scripted duplex IO, loopback
+sockets, and a local certificate fixture. Timeouts will use an injected
 monotonic clock only where deterministic deadline tests require it.
 
 The default suite must never require DNS or public internet access.
@@ -76,7 +81,7 @@ input may cause unbounded allocation.
 ## Phase Boundaries
 
 - Phase 1 changes only the passive frame codec and typed error vocabulary.
-- Phase 2 builds transport lifecycle and SETTINGS/PING handshake mechanics
+- Phase 2 provides transport lifecycle and SETTINGS/PING handshake mechanics
   without decoding field blocks.
 - Phase 3 integrates the persistent HPACK contexts and complete field blocks
   after the required HPACK APIs are available.

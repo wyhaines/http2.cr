@@ -9,10 +9,11 @@ a reusable protocol core.
 
 ## Status
 
-The current code is not ready for production use. Its bounded, passive frame
-codec is complete, but the exposed connection, stream, and request types do not
-yet provide a complete client handshake, stream engine, flow control
-implementation, or HTTP message API.
+The current code is not ready for production use. Its bounded frame codec and
+connection transport runtime are complete: supplied IO, cleartext prior
+knowledge, verified TLS with ALPN, the client handshake, ordered writes, and
+control-frame dispatch are covered. SETTINGS semantics, HPACK field blocks, the
+stream state machine, flow control, and the HTTP client API remain unfinished.
 
 Development is organized in ordered phases:
 

@@ -8,7 +8,7 @@ Last updated: 2026-07-23
 | --- | --- | --- |
 | 0 — Baseline and architecture | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 1 — Frame codec and errors | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 2 — Connection and handshake | Ready | — |
+| 2 — Connection and handshake | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 3 — SETTINGS, HPACK, field blocks | Blocked on HPACK additions | — |
 | 4–8 | Not started | — |
 
@@ -52,6 +52,29 @@ The frame layer now:
 ALTSVC is deliberately handled as an unknown extension frame until extension
 support is added.
 
+## Phase 2 Connection Runtime
+
+The runtime now:
+
+- starts over caller-supplied duplex `IO`, explicit cleartext prior knowledge,
+  or verified TLS with hostname validation, SNI, and required ALPN `h2`;
+- sends the client preface and initial SETTINGS as one ordered command, then
+  requires a non-ACK server SETTINGS frame before becoming active;
+- owns one continuous reader fiber and one bounded, serialized writer with
+  atomic multi-frame batches;
+- allocates odd client stream IDs monotonically, rejects stream 0, and routes
+  frames only to explicitly registered streams through bounded mailboxes;
+- handles SETTINGS acknowledgements, PING replies, unknown frames, and GOAWAY
+  draining at connection scope;
+- maps codec errors to GOAWAY or RST_STREAM by scope and fans EOF, write
+  failures, queue exhaustion, and close to all stream waiters;
+- performs transport shutdown on its owning scheduler and waits for the reader
+  and writer fibers to exit.
+
+Local scripted peers and a checked-in certificate fixture cover cleartext and
+TLS handshakes, ALPN and hostname failures, concurrent writers, stream routing,
+GOAWAY, malformed frames, EOF, and failure propagation.
+
 ## Current Verification
 
 Run from the repository root:
@@ -64,16 +87,16 @@ crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
 ```
 
-All commands pass with 62 deterministic examples on official Crystal 1.20.0
+All commands pass with 81 deterministic examples on official Crystal 1.20.0
 and 1.21.0 containers. They also pass against the local Crystal 1.21 source
 checkout. The `preview_mt` flag emits its expected deprecation warning on
 Crystal 1.21.
 
 ## Next Work
 
-Phase 2 should first replace the spike's connection and stream coordination
-with an explicit supplied-IO runtime. Establish the client preface and initial
-SETTINGS handshake, single reader and ordered writer, odd stream-ID allocation,
-connection-level control-frame dispatch, bounded queues, and terminal failure
-fan-out. Test it against deterministic scripted peers before adding TLS
-connectors. HPACK integration remains deferred to Phase 3.
+Phase 3 begins after both HPACK additions in
+[hpack-additions.md](./hpack-additions.md) are available. It will add complete
+SETTINGS validation and acknowledgement tracking, persistent per-connection
+HPACK contexts, bounded field-block assembly, and atomic
+HEADERS/CONTINUATION fragmentation. Until then, the runtime deliberately
+delivers raw stream frames and does not decode field blocks.
