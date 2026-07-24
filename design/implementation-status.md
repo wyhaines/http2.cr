@@ -9,7 +9,7 @@ Last updated: 2026-07-23
 | 0 — Baseline and architecture | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 1 — Frame codec and errors | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 2 — Connection and handshake | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 3 — SETTINGS, HPACK, field blocks | Blocked on HPACK additions | — |
+| 3 — SETTINGS, HPACK, field blocks | In progress; inbound HPACK API pending | Verified checkpoint; final gate pending |
 | 4–8 | Not started | — |
 
 ## Phase 0 Baseline
@@ -75,6 +75,32 @@ Local scripted peers and a checked-in certificate fixture cover cleartext and
 TLS handshakes, ALPN and hostname failures, concurrent writers, stream routing,
 GOAWAY, malformed frames, EOF, and failure propagation.
 
+## Phase 3 Progress
+
+The completed Phase 3 work:
+
+- pins `hpack.cr` 1.2.0 and keeps one encoder and decoder per connection;
+- validates the six RFC 9113 settings, preserves ordered duplicate handling,
+  ignores unsupported identifiers, and keeps peer, advertised-local, and
+  acknowledged-local values separate;
+- matches SETTINGS acknowledgements in FIFO order, applies local decoder limits
+  on ACK, and closes with `SETTINGS_TIMEOUT` when the oldest sent update expires;
+- applies peer compression-table limits on the writer immediately before its
+  SETTINGS ACK, including coalesced HPACK table-size updates;
+- reassembles contiguous HEADERS/PUSH_PROMISE and CONTINUATION sequences with
+  compressed-size and continuation-count bounds;
+- encodes ordered outbound fields once on the writer, retains dynamic-table
+  state across blocks, fragments at the peer frame-size setting, and writes the
+  complete sequence atomically.
+
+Inbound field blocks deliberately remain compressed stream events. HPACK 1.2.0
+does not yet expose the requested bounded incremental decoder, result
+accounting, or hard literal cap. Using `decode_with_metadata` here would allocate
+unbounded retained output and defeat the Phase 3 resource invariant. Once that
+API lands, the reader must decode every complete block, preserve dynamic state
+after a rejected field section, and map malformed HPACK separately from local
+resource exhaustion.
+
 ## Current Verification
 
 Run from the repository root:
@@ -87,16 +113,15 @@ crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
 ```
 
-All commands pass with 81 deterministic examples on official Crystal 1.20.0
-and 1.21.0 containers. They also pass against the local Crystal 1.21 source
-checkout. The `preview_mt` flag emits its expected deprecation warning on
-Crystal 1.21.
+The Phase 3 checkpoint passes formatting, Ameba, compilation, documentation,
+and 106 deterministic examples in normal and `preview_mt` modes in the
+official Crystal 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its
+expected deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Phase 3 begins after both HPACK additions in
-[hpack-additions.md](./hpack-additions.md) are available. It will add complete
-SETTINGS validation and acknowledgement tracking, persistent per-connection
-HPACK contexts, bounded field-block assembly, and atomic
-HEADERS/CONTINUATION fragmentation. Until then, the runtime deliberately
-delivers raw stream frames and does not decode field blocks.
+Finish the second addition in
+[hpack-additions.md](./hpack-additions.md), update the dependency pin, and
+integrate its incremental decoder into the existing complete-field-block path.
+Then add cross-block inbound dynamic-reference, decoded-budget, malformed
+remainder, and hard literal-cap tests to close the Phase 3 gate.

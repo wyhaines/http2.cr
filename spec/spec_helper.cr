@@ -57,6 +57,18 @@ def wait_for_peer(
   raise error if error
 end
 
+def eventually(
+  timeout : Time::Span = 1.second,
+  message : String = "condition was not met",
+  & : -> Bool
+) : Nil
+  deadline = Time.instant + timeout
+  until yield
+    fail(message) if Time.instant >= deadline
+    Fiber.yield
+  end
+end
+
 def read_client_preface(io : IO) : HTTP2::Frame::Settings
   preface = Bytes.new(HTTP2::Connection::Preface.size)
   io.read_fully(preface)
@@ -75,6 +87,7 @@ def complete_server_handshake(
 ) : HTTP2::Frame::Settings
   client_settings = read_client_preface(io)
   settings.write(io)
+  HTTP2::Frame::Settings.ack.write(io)
   io.flush
 
   acknowledgement = HTTP2::Frame.read(io)

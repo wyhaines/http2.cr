@@ -1,3 +1,5 @@
+require "../protocol_error"
+
 module HTTP2
   class Connection
     class Error < Exception
@@ -19,6 +21,12 @@ module HTTP2
     end
 
     class TLSNegotiationError < Error
+    end
+
+    class ResourceLimitError < ProtocolError
+      def initialize(message : String)
+        super(message, ErrorCode::ENHANCE_YOUR_CALM)
+      end
     end
   end
 end

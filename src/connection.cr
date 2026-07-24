@@ -22,8 +22,12 @@ module HTTP2
     @state = State::New
     @terminal_error : Exception?
     @peer_settings : Frame::Settings?
+    @local_settings_state : SettingsState
+    @effective_local_settings_state = SettingsState.client_defaults
+    @peer_settings_state = SettingsState.server_defaults
     @last_goaway : Frame::GoAway?
     @mutex = Mutex.new
+    @submission_mutex = Mutex.new
     @write_queue : Channel(WriteCommand)
     @handshake_done = Channel(Nil).new
     @closed_signal = Channel(Nil).new
@@ -31,11 +35,18 @@ module HTTP2
     @writer_done = Channel(Nil).new
     @reader_done = Channel(Nil).new
     @transport_closer_done = Channel(Nil).new
+    @settings_timer_wakeup = Channel(Nil).new(1)
+    @settings_timer_done = Channel(Nil).new
     @writer_started = false
     @reader_started = false
     @transport_closer_started = false
+    @settings_timer_started = false
     @streams = {} of UInt32 => Stream
     @stream_ids = StreamIDAllocator.new
+    @pending_settings = [] of SettingsAcknowledgement
+    @field_blocks : FieldBlockAssembler
+    @encoder = HPack::Encoder.new
+    @decoder = HPack::Decoder.new
 
     def initialize(
       @transport : IO,
@@ -47,6 +58,19 @@ module HTTP2
       @local_settings = Frame::Settings.new(
         @configuration.initial_settings
       )
+      @local_settings_state = SettingsState.client_defaults.with_local(
+        @configuration.initial_settings
+      )
+      @field_blocks = FieldBlockAssembler.new(
+        @configuration.max_compressed_field_section_size,
+        @configuration.max_continuation_frames
+      )
+      initial_encoder_size = Math.min(
+        SettingsState::DEFAULT_HEADER_TABLE_SIZE.to_i32,
+        @configuration.max_encoder_table_size
+      )
+      @encoder.resize_table(initial_encoder_size) if initial_encoder_size !=
+                                                       SettingsState::DEFAULT_HEADER_TABLE_SIZE.to_i32
     end
 
     # Creates and starts a connection over a caller-supplied duplex IO.
@@ -125,6 +149,9 @@ module HTTP2
     # Starts the writer, emits the complete client preface atomically, then
     # starts the continuous reader.
     def start : self
+      initial_acknowledgement = SettingsAcknowledgement.new(
+        @local_settings_state
+      )
       initial_command = WriteCommand.new(
         [local_settings] of Frames,
         preface: true
@@ -134,6 +161,7 @@ module HTTP2
           raise InvalidStateError.new("connection can only be started once")
         end
         @write_queue.send(initial_command)
+        @pending_settings << initial_acknowledgement
         @state = State::Handshaking
         @writer_started = true
         @transport_closer_started = true
@@ -150,6 +178,9 @@ module HTTP2
         wait_until_stopped
         raise error
       end
+
+      mark_settings_sent(initial_acknowledgement)
+      start_settings_timer
 
       @mutex.synchronize do
         unless @state.closed?
@@ -182,6 +213,22 @@ module HTTP2
 
     def peer_settings : Frame::Settings?
       @mutex.synchronize { @peer_settings }
+    end
+
+    def local_settings_state : SettingsState
+      @mutex.synchronize { @local_settings_state }
+    end
+
+    def effective_local_settings_state : SettingsState
+      @mutex.synchronize { @effective_local_settings_state }
+    end
+
+    def peer_settings_state : SettingsState
+      @mutex.synchronize { @peer_settings_state }
+    end
+
+    def pending_settings_count : Int32
+      @mutex.synchronize { @pending_settings.size }
     end
 
     def last_goaway : Frame::GoAway?
@@ -218,14 +265,114 @@ module HTTP2
 
     # Writes one frame through the connection's sole writer fiber.
     def write_frame(frame : Frames) : Nil
+      if outbound_field_block_frame?(frame)
+        raise ArgumentError.new(
+          "field blocks must be sent with #send_headers"
+        )
+      end
+      if settings = frame.as?(Frame::Settings)
+        unless settings.ack?
+          send_settings(settings.entries)
+          return
+        end
+      end
+
       write_batch([frame] of Frames)
     end
 
     # Writes a frame batch without allowing another command to interleave.
     def write_batch(frames : Array(Frames)) : Nil
       return if frames.empty?
+      if frames.any? { |frame| outbound_field_block_frame?(frame) }
+        raise ArgumentError.new(
+          "field blocks must be sent with #send_headers"
+        )
+      end
+      if frames.any? { |frame| frame.is_a?(Frame::Settings) && !frame.ack? }
+        raise ArgumentError.new(
+          "non-ACK SETTINGS frames must be sent with #send_settings"
+        )
+      end
 
       submit(WriteCommand.new(frames.dup))
+    end
+
+    # HPACK-encodes one ordered field section on the writer fiber and sends
+    # its complete HEADERS/CONTINUATION sequence atomically.
+    def send_headers(
+      stream_id : UInt32,
+      fields : Enumerable(HeaderField),
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      ensure_registered_stream!(stream_id)
+      materialized = fields.map { |field| field }
+      submit(
+        WriteCommand.headers(
+          stream_id,
+          materialized,
+          end_stream
+        )
+      )
+    end
+
+    # Encodes ordered name/value pairs with the default field policy.
+    def send_headers(
+      stream_id : UInt32,
+      fields : Enumerable(Tuple(String, String)),
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      materialized = fields.map do |name, value|
+        HeaderField.new(name, value)
+      end
+      send_headers(stream_id, materialized, end_stream: end_stream)
+    end
+
+    # Sends a SETTINGS update and tracks its ordered acknowledgement.
+    def send_settings(
+      entries : Enumerable(Frame::Settings::Setting),
+    ) : Nil
+      materialized = entries.to_a
+      command = WriteCommand.new(
+        [Frame::Settings.new(materialized)] of Frames
+      )
+      acknowledgement = @submission_mutex.synchronize do
+        pending = @mutex.synchronize do
+          raise_terminal_or_state_unlocked! if @state.closed?
+          if @state.new?
+            raise InvalidStateError.new("connection has not been started")
+          end
+
+          updated = @local_settings_state.with_local(materialized)
+          if updated.max_frame_size > @configuration.inbound_max_frame_size
+            raise ArgumentError.new(
+              "SETTINGS_MAX_FRAME_SIZE exceeds the configured inbound limit"
+            )
+          end
+          if updated.header_table_size > @configuration.max_decoder_table_size
+            raise ArgumentError.new(
+              "SETTINGS_HEADER_TABLE_SIZE exceeds the configured decoder limit"
+            )
+          end
+
+          @local_settings_state = updated
+          pending_update = SettingsAcknowledgement.new(updated)
+          @pending_settings << pending_update
+          pending_update
+        end
+
+        begin
+          enqueue(command)
+        rescue error
+          remove_pending_settings(pending)
+          raise error
+        end
+        pending
+      end
+
+      command.wait
+      mark_settings_sent(acknowledgement)
     end
 
     def wait_until_active(timeout : Time::Span? = nil) : Nil
@@ -264,6 +411,11 @@ module HTTP2
     end
 
     private def submit(command : WriteCommand) : Nil
+      @submission_mutex.synchronize { enqueue(command) }
+      command.wait
+    end
+
+    private def enqueue(command : WriteCommand) : Nil
       current_state = state
       if current_state.new?
         raise InvalidStateError.new("connection has not been started")
@@ -271,7 +423,6 @@ module HTTP2
       raise_terminal_or_state! if current_state.closed?
 
       @write_queue.send(command)
-      command.wait
     rescue Channel::ClosedError
       raise_terminal_or_state!
     end
@@ -284,8 +435,18 @@ module HTTP2
         end
 
         begin
+          if table_size = command.encoder_table_size
+            @encoder.resize_table(table_size)
+          end
+          frames = materialize_frames(command)
+        rescue error
+          command.complete(error)
+          next
+        end
+
+        begin
           @transport.write(Preface) if command.preface?
-          command.frames.each(&.write(@transport))
+          frames.each(&.write(@transport))
           @transport.flush
           command.complete
         rescue error
@@ -309,41 +470,63 @@ module HTTP2
     end
 
     private def reader_loop : Nil
-      first_frame = true
-
+      handle_server_preface(read_server_preface)
       loop do
-        frame = begin
-          Frame.read(
-            @transport,
-            @configuration.inbound_max_frame_size
-          )
-        rescue error : ProtocolError
-          if first_frame
-            raise ProtocolError.new(
-              "invalid server connection preface: #{error.message}"
-            )
-          elsif error.stream?
-            handle_stream_violation(error)
-            next
-          else
-            raise error
+        if frame = read_frame
+          if event = @field_blocks.process(frame)
+            dispatch(event)
           end
-        end
-
-        if first_frame
-          handle_server_preface(frame)
-          first_frame = false
-        else
-          dispatch(frame)
         end
       end
     rescue error : ProtocolError
       send_goaway(error)
       terminate(error)
+    rescue error : IO::EOFError
+      handle_reader_eof(error)
     rescue error
       terminate(error) unless closed?
     ensure
       @reader_done.close
+    end
+
+    private def read_server_preface : Frames
+      Frame.read(
+        @transport,
+        effective_local_settings_state.max_frame_size
+      )
+    rescue error : ProtocolError
+      raise ProtocolError.new(
+        "invalid server connection preface: #{error.message}"
+      )
+    end
+
+    private def read_frame : Frames?
+      Frame.read(
+        @transport,
+        effective_local_settings_state.max_frame_size
+      )
+    rescue error : ProtocolError
+      if @field_blocks.pending?
+        raise ProtocolError.new(
+          "invalid frame interrupted an open field block"
+        )
+      end
+      raise error unless error.stream?
+
+      handle_stream_violation(error)
+      nil
+    end
+
+    private def handle_reader_eof(error : IO::EOFError) : Nil
+      if @field_blocks.pending?
+        terminate(
+          ProtocolError.new(
+            "connection ended before the open field block was complete"
+          )
+        )
+      else
+        terminate(error) unless closed?
+      end
     end
 
     private def handle_server_preface(frame : Frames) : Nil
@@ -354,7 +537,7 @@ module HTTP2
         )
       end
 
-      acknowledge(settings)
+      acknowledge_peer_settings(settings)
       activated = @mutex.synchronize do
         unless @state.closed?
           @peer_settings = settings
@@ -365,25 +548,72 @@ module HTTP2
       @handshake_done.close if activated
     end
 
-    private def dispatch(frame : Frames) : Nil
-      case frame
+    private def dispatch(event : StreamEvent) : Nil
+      case event
       when Frame::Settings
-        acknowledge(frame) unless frame.ack?
+        if event.ack?
+          acknowledge_local_settings
+        else
+          acknowledge_peer_settings(event)
+        end
       when Frame::Ping
-        write_frame(frame.ack) unless frame.ack?
+        write_frame(event.ack) unless event.ack?
       when Frame::GoAway
-        handle_goaway(frame)
+        handle_goaway(event)
       when Frame::WindowUpdate
-        dispatch_to_stream(frame) unless frame.stream_id.zero?
+        dispatch_to_stream(event) unless event.stream_id.zero?
       when Frame::Unknown
         # RFC 9113 requires unknown frame types to be ignored.
       else
-        dispatch_to_stream(frame)
+        dispatch_to_stream(event)
       end
     end
 
-    private def acknowledge(settings : Frame::Settings) : Nil
-      write_frame(settings.ack)
+    private def apply_peer_settings(settings : Frame::Settings) : Int32?
+      previous, updated = @mutex.synchronize do
+        previous = @peer_settings_state
+        @peer_settings_state = @peer_settings_state.with_peer(settings.entries)
+        @peer_settings = settings
+        {previous, @peer_settings_state}
+      end
+
+      return if previous.header_table_size == updated.header_table_size
+
+      Math.min(
+        updated.header_table_size.to_u64,
+        @configuration.max_encoder_table_size.to_u64
+      ).to_i32
+    end
+
+    private def acknowledge_peer_settings(
+      settings : Frame::Settings,
+    ) : Nil
+      command = @submission_mutex.synchronize do
+        table_size = apply_peer_settings(settings)
+        acknowledgement = WriteCommand.settings_ack(table_size)
+        enqueue(acknowledgement)
+        acknowledgement
+      end
+      command.wait
+    end
+
+    private def acknowledge_local_settings : Nil
+      previous, updated = @mutex.synchronize do
+        pending = @pending_settings.shift?
+        unless pending
+          raise ProtocolError.new(
+            "received a SETTINGS ACK with no outstanding SETTINGS frame"
+          )
+        end
+
+        prior_settings = @effective_local_settings_state
+        effective_settings = pending.settings
+        @effective_local_settings_state = effective_settings
+        {prior_settings, effective_settings}
+      end
+
+      apply_effective_local_settings(previous, updated)
+      wake_settings_timer
     end
 
     private def handle_goaway(frame : Frame::GoAway) : Nil
@@ -401,10 +631,10 @@ module HTTP2
       end
     end
 
-    private def dispatch_to_stream(frame : Frames) : Nil
+    private def dispatch_to_stream(event : StreamEvent) : Nil
       full_stream_id = @mutex.synchronize do
-        if stream = @streams[frame.stream_id]?
-          stream.id unless stream.deliver(frame)
+        if stream = @streams[event.stream_id]?
+          stream.id unless stream.deliver(event)
         end
       end
       if full_stream_id
@@ -445,6 +675,7 @@ module HTTP2
           streams = @streams.values
           @streams.clear
           streams.each(&.terminate(error))
+          @pending_settings.clear
           close_directly = !@transport_closer_started
           true
         end
@@ -453,6 +684,7 @@ module HTTP2
 
       @write_queue.close
       @transport_close_signal.close
+      @settings_timer_wakeup.close
       @handshake_done.close
       @closed_signal.close
 
@@ -476,12 +708,13 @@ module HTTP2
     end
 
     private def wait_until_stopped(timeout : Time::Span? = nil) : Nil
-      writer_started, reader_started, transport_closer_started =
+      writer_started, reader_started, transport_closer_started, settings_timer_started =
         @mutex.synchronize do
           {
             @writer_started,
             @reader_started,
             @transport_closer_started,
+            @settings_timer_started,
           }
         end
 
@@ -499,12 +732,179 @@ module HTTP2
       if reader_started
         wait_for_signal(@reader_done, timeout, "HTTP/2 reader shutdown")
       end
+      if settings_timer_started
+        wait_for_signal(
+          @settings_timer_done,
+          timeout,
+          "HTTP/2 SETTINGS timer shutdown"
+        )
+      end
     end
 
     private def close_transport : Nil
       @transport.close
     rescue
       # The connection's stored terminal error remains authoritative.
+    end
+
+    private def start_settings_timer : Nil
+      started = @mutex.synchronize do
+        if @state.closed?
+          false
+        else
+          @settings_timer_started = true
+          true
+        end
+      end
+      return unless started
+
+      ::spawn(name: "http2-settings-timer") { settings_timer_loop }
+    end
+
+    private def settings_timer_loop : Nil
+      loop do
+        remaining = settings_timeout_remaining
+        if remaining
+          if remaining <= Time::Span.zero
+            expire_settings
+            break if closed?
+            next
+          end
+
+          select
+          when @settings_timer_wakeup.receive?
+          when timeout(remaining)
+            expire_settings
+          end
+        else
+          @settings_timer_wakeup.receive?
+        end
+
+        break if closed?
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown wakes the timer.
+    ensure
+      @settings_timer_done.close
+    end
+
+    private def settings_timeout_remaining : Time::Span?
+      @mutex.synchronize do
+        if acknowledgement = @pending_settings.first?
+          if sent_at = acknowledgement.sent_at
+            sent_at + @configuration.settings_ack_timeout - Time.instant
+          end
+        end
+      end
+    end
+
+    private def expire_settings : Nil
+      expired = @mutex.synchronize do
+        if acknowledgement = @pending_settings.first?
+          if sent_at = acknowledgement.sent_at
+            Time.instant - sent_at >=
+              @configuration.settings_ack_timeout
+          else
+            false
+          end
+        else
+          false
+        end
+      end
+      return unless expired
+
+      error = ProtocolError.new(
+        "peer did not acknowledge SETTINGS in time",
+        ErrorCode::SETTINGS_TIMEOUT
+      )
+      send_goaway(error)
+      terminate(error)
+    end
+
+    private def wake_settings_timer : Nil
+      select
+      when @settings_timer_wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown already woke the timer.
+    end
+
+    private def remove_pending_settings(
+      acknowledgement : SettingsAcknowledgement,
+    ) : Nil
+      removed = @mutex.synchronize do
+        if index = @pending_settings.index(acknowledgement)
+          @pending_settings.delete_at(index)
+          true
+        else
+          false
+        end
+      end
+      if removed
+        wake_settings_timer
+      end
+    end
+
+    private def apply_effective_local_settings(
+      previous : SettingsState,
+      updated : SettingsState,
+    ) : Nil
+      # Phase 5 applies INITIAL_WINDOW_SIZE deltas to live streams. The
+      # decoder limit changes only when the corresponding SETTINGS is ACKed.
+      if previous.header_table_size != updated.header_table_size
+        @decoder.max_table_size = updated.header_table_size.to_i32
+      end
+    end
+
+    private def mark_settings_sent(
+      acknowledgement : SettingsAcknowledgement,
+    ) : Nil
+      marked = @mutex.synchronize do
+        if @pending_settings.includes?(acknowledgement)
+          acknowledgement.mark_sent(Time.instant)
+          true
+        else
+          false
+        end
+      end
+      wake_settings_timer if marked
+    end
+
+    private def materialize_frames(command : WriteCommand) : Array(Frames)
+      if header_block = command.header_block
+        encoded = @encoder.encode(
+          header_block.fields.map(&.to_hpack)
+        )
+        HeaderBlockFramer.frames(
+          header_block.stream_id,
+          encoded,
+          peer_settings_state.max_frame_size,
+          end_stream: header_block.end_stream
+        )
+      else
+        command.frames
+      end
+    end
+
+    private def ensure_registered_stream!(stream_id : UInt32) : Nil
+      if stream_id.zero?
+        raise ArgumentError.new("HEADERS must use a nonzero stream ID")
+      end
+
+      @mutex.synchronize do
+        unless @streams.has_key?(stream_id)
+          raise InvalidStateError.new(
+            "stream #{stream_id} is not registered on this connection"
+          )
+        end
+      end
+    end
+
+    private def outbound_field_block_frame?(frame : Frames) : Bool
+      frame.is_a?(Frame::Headers) ||
+        frame.is_a?(Frame::PushPromise) ||
+        frame.is_a?(Frame::Continuation)
     end
 
     {% if flag?(:preview_mt) %}
@@ -527,6 +927,14 @@ module HTTP2
 
     private def raise_terminal_or_state! : NoReturn
       if error = terminal_error
+        raise error
+      end
+
+      raise InvalidStateError.new("connection is not active")
+    end
+
+    private def raise_terminal_or_state_unlocked! : NoReturn
+      if error = @terminal_error
         raise error
       end
 

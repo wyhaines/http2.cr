@@ -13,7 +13,7 @@ module HTTP2
 
     getter id : UInt32
 
-    @events : Channel(Frames)
+    @events : Channel(StreamEvent)
     @state : State = State::Idle
     @terminal_signal = Channel(Nil).new
     @terminal_error : Exception?
@@ -33,7 +33,7 @@ module HTTP2
       if event_capacity <= 0
         raise ArgumentError.new("stream event capacity must be positive")
       end
-      @events = Channel(Frames).new(event_capacity)
+      @events = Channel(StreamEvent).new(event_capacity)
     end
 
     # Sends a frame that belongs to this stream through the ordered writer.
@@ -48,8 +48,30 @@ module HTTP2
       @connection.write_frame(frame)
     end
 
-    # Waits for the next raw inbound frame for this stream.
-    def receive(timeout : Time::Span? = nil) : Frames
+    # Encodes and atomically sends an ordered field section.
+    def send_headers(
+      fields : Enumerable(HeaderField),
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      raise_terminal! if terminal_error
+      @connection.send_headers(id, fields, end_stream: end_stream)
+    end
+
+    # Encodes ordered name/value pairs with the default field policy.
+    def send_headers(
+      fields : Enumerable(Tuple(String, String)),
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      materialized = fields.map do |name, value|
+        HeaderField.new(name, value)
+      end
+      send_headers(materialized, end_stream: end_stream)
+    end
+
+    # Waits for the next inbound frame or completed header field block.
+    def receive(timeout : Time::Span? = nil) : StreamEvent
       raise_terminal! if terminal_error
 
       if timeout
@@ -87,11 +109,11 @@ module HTTP2
     end
 
     # :nodoc:
-    def deliver(frame : Frames) : Bool
+    def deliver(event : StreamEvent) : Bool
       return false if terminal_error
 
       select
-      when @events.send(frame)
+      when @events.send(event)
         true
       else
         false

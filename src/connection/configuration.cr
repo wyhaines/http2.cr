@@ -7,11 +7,21 @@ module HTTP2
       getter inbound_max_frame_size : Int32
       getter writer_queue_capacity : Int32
       getter stream_event_capacity : Int32
+      getter settings_ack_timeout : Time::Span
+      getter max_compressed_field_section_size : Int32
+      getter max_continuation_frames : Int32
+      getter max_encoder_table_size : Int32
+      getter max_decoder_table_size : Int32
 
       def initialize(
         @inbound_max_frame_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
         @writer_queue_capacity : Int32 = 32,
         @stream_event_capacity : Int32 = 32,
+        @settings_ack_timeout : Time::Span = 10.seconds,
+        @max_compressed_field_section_size : Int32 = 64 * 1024,
+        @max_continuation_frames : Int32 = 16,
+        @max_encoder_table_size : Int32 = 64 * 1024,
+        @max_decoder_table_size : Int32 = 64 * 1024,
         initial_settings : Enumerable(Frame::Settings::Setting) = [] of Frame::Settings::Setting,
       )
         unless FrameHeader::DEFAULT_MAX_PAYLOAD <= @inbound_max_frame_size <= FrameHeader::MAX_PAYLOAD
@@ -26,9 +36,36 @@ module HTTP2
         if @stream_event_capacity <= 0
           raise ArgumentError.new("stream event capacity must be positive")
         end
+        if @settings_ack_timeout <= Time::Span.zero
+          raise ArgumentError.new(
+            "SETTINGS acknowledgement timeout must be positive"
+          )
+        end
+        if @max_compressed_field_section_size < 0
+          raise ArgumentError.new(
+            "maximum compressed field-section size cannot be negative"
+          )
+        end
+        if @max_continuation_frames < 0
+          raise ArgumentError.new(
+            "maximum CONTINUATION frame count cannot be negative"
+          )
+        end
+        if @max_encoder_table_size < 0
+          raise ArgumentError.new(
+            "maximum encoder table size cannot be negative"
+          )
+        end
+        if @max_decoder_table_size < 0
+          raise ArgumentError.new(
+            "maximum decoder table size cannot be negative"
+          )
+        end
 
         @initial_settings = initial_settings.map { |setting| setting }
         synchronize_advertised_frame_size!
+        synchronize_advertised_header_table_size!
+        SettingsState.client_defaults.with_local(@initial_settings)
       end
 
       def initial_settings : Array(Frame::Settings::Setting)
@@ -51,6 +88,27 @@ module HTTP2
           @initial_settings << Frame::Settings::Setting.new(
             Frame::Settings::Identifier::MAX_FRAME_SIZE,
             @inbound_max_frame_size.to_u32
+          )
+        end
+      end
+
+      private def synchronize_advertised_header_table_size!
+        identifier = Frame::Settings::Identifier::HEADER_TABLE_SIZE.to_u16
+        advertised = @initial_settings.reverse_each.find do |setting|
+          setting.identifier == identifier
+        end
+
+        if advertised
+          if advertised.value > @max_decoder_table_size
+            raise ArgumentError.new(
+              "SETTINGS_HEADER_TABLE_SIZE exceeds max_decoder_table_size"
+            )
+          end
+        elsif @max_decoder_table_size <
+                SettingsState::DEFAULT_HEADER_TABLE_SIZE
+          @initial_settings << Frame::Settings::Setting.new(
+            Frame::Settings::Identifier::HEADER_TABLE_SIZE,
+            @max_decoder_table_size.to_u32
           )
         end
       end

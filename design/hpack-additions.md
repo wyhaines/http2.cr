@@ -7,6 +7,8 @@ while this work is in progress, but both additions should land before phase 3.
 
 ## 1. Encoder Dynamic-Table Size Updates
 
+**Status:** available in `hpack.cr` 1.2.0.
+
 ### Goal
 
 Add a public encoder operation that changes the dynamic-table capacity and
@@ -58,6 +60,9 @@ remain green, and formatting, Ameba, and normal plus `-Dpreview_mt` specs must
 pass.
 
 ## 2. Bounded, Incremental Decoder Output
+
+**Status:** still required; `hpack.cr` 1.2.0 does not provide `decode_each`,
+decoded field-section accounting, or a hard decoded-string cap.
 
 ### Goal
 

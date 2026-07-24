@@ -32,6 +32,25 @@ describe HTTP2::Connection::Configuration do
     end
     expect_raises(ArgumentError) do
       HTTP2::Connection::Configuration.new(
+        settings_ack_timeout: Time::Span.zero
+      )
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_compressed_field_section_size: -1
+      )
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(max_continuation_frames: -1)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(max_encoder_table_size: -1)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(max_decoder_table_size: -1)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
         inbound_max_frame_size: 32_768,
         initial_settings: [
           HTTP2::Frame::Settings::Setting.new(
@@ -41,6 +60,28 @@ describe HTTP2::Connection::Configuration do
         ]
       )
     end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_decoder_table_size: 1_024,
+        initial_settings: [
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::HEADER_TABLE_SIZE,
+            2_048_u32
+          ),
+        ]
+      )
+    end
+  end
+
+  it "advertises a decoder table cap below the protocol default" do
+    configuration = HTTP2::Connection::Configuration.new(
+      max_decoder_table_size: 1_024
+    )
+    header_table_size = configuration.initial_settings.find do |setting|
+      setting.known_identifier.try(&.header_table_size?)
+    end
+
+    header_table_size.try(&.value).should eq(1_024_u32)
   end
 end
 

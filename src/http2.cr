@@ -1,6 +1,7 @@
 require "./version"
 require "hpack"
 require "./frame"
+require "./header_field"
 require "./connection"
 require "./request"
 require "./aliases"
