@@ -761,6 +761,13 @@ module HTTP2
       command.wait
     end
 
+    # Enqueues a command without waiting for the writer to flush it. Used by
+    # the reader fiber for protocol acknowledgements so a write-stalled
+    # transport cannot wedge inbound frame processing.
+    private def submit_nowait(command : WriteCommand) : Nil
+      @submission_mutex.synchronize { enqueue(command) }
+    end
+
     private def submit_data(frame : Frame::Data) : Nil
       stream = @mutex.synchronize do
         active = @streams[frame.stream_id]?
@@ -1884,7 +1891,7 @@ module HTTP2
 
     private def handle_ping(frame : Frame::Ping) : Nil
       unless frame.ack?
-        write_frame(frame.ack)
+        submit_nowait(WriteCommand.new([frame.ack] of Frames))
         return
       end
 
@@ -1922,13 +1929,10 @@ module HTTP2
     private def acknowledge_peer_settings(
       settings : Frame::Settings,
     ) : Nil
-      command = @submission_mutex.synchronize do
+      @submission_mutex.synchronize do
         table_size = apply_peer_settings(settings)
-        acknowledgement = WriteCommand.settings_ack(table_size)
-        enqueue(acknowledgement)
-        acknowledgement
+        enqueue(WriteCommand.settings_ack(table_size))
       end
-      command.wait
     end
 
     private def acknowledge_local_settings : Nil
