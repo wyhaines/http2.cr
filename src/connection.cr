@@ -133,7 +133,8 @@ module HTTP2
     # deadlines). Against untrusted or unreliable peers, set them and/or
     # enable `Configuration#keepalive_interval`; otherwise a silent or
     # write-stalled peer can hold blocked callers indefinitely.
-    # `HTTP2::Client` configures both by default.
+    # `HTTP2::Client` sets both timeouts by default; keepalive remains
+    # opt-in.
     def self.connect_prior_knowledge(
       host : String,
       port : Int = 80,
@@ -165,7 +166,8 @@ module HTTP2
     # deadlines). Against untrusted or unreliable peers, set them and/or
     # enable `Configuration#keepalive_interval`; otherwise a silent or
     # write-stalled peer can hold blocked callers indefinitely.
-    # `HTTP2::Client` configures both by default.
+    # `HTTP2::Client` sets both timeouts by default; keepalive remains
+    # opt-in.
     def self.connect_tls(
       host : String,
       port : Int = 443,

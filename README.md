@@ -166,7 +166,8 @@ The initial stable target is an HTTP/2 client. It does not provide:
 - Raw `Connection.connect_*`/`Connection.start` default to no transport
   timeouts and no keepalive; set `read_timeout:`/`write_timeout:` or
   `Configuration#keepalive_interval` when talking to untrusted peers.
-  `HTTP2::Client` configures these by default.
+  `HTTP2::Client` sets read and write timeouts by default; keepalive
+  remains opt-in.
 
 A gRPC adapter belongs in a separate shard above the streaming API.
 
