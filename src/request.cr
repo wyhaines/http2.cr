@@ -1,57 +1,58 @@
-require "mime/media_type"
-{% if !flag?(:without_zlib) %}
-  require "compress/deflate"
-  require "compress/gzip"
-{% end %}
-require "uri"
-require "http/cookie"
-require "http/params"
-require "socket"
+require "./headers"
 
 module HTTP2
+  # One HTTP request. The client derives HTTP/2 pseudo-fields from the method,
+  # target, and its origin; callers provide only regular fields.
   class Request
-    property headers : HTTP::Headers = HTTP::Headers.new
-    property trailers : HTTP::Headers? = nil
+    alias Body = (String | Bytes | IO)?
+
+    getter method : String
+    getter target : String
+    getter headers : Headers
+    getter trailers : Headers
     getter body : IO?
-    property version : String = "2.0"
-    @cookies : Cookies?
-    @query_params : URI::Params?
-    @uri : URI?
-    alias RequestBody = (String | Bytes | IO)?
+    getter body_length : Int64?
 
-    def self.new(headers : Headers = HTTP::Headers.new, body : RequestBody = nil, trailers : HTTP::Headers? = nil)
-      new(headers.try(&.dup), body, trailers, internal: nil)
+    # Creates a request. `target` is an origin-form path, an absolute URI for
+    # the same client origin, `*` for OPTIONS, or authority form for CONNECT.
+    def initialize(
+      @method : String,
+      @target : String,
+      @headers : Headers = Headers.new,
+      body : Body = nil,
+      @trailers : Headers = Headers.new,
+    )
+      case body
+      when String
+        @body = IO::Memory.new(body)
+        @body_length = body.bytesize.to_i64
+      when Bytes
+        owned = body.dup
+        @body = IO::Memory.new(owned)
+        @body_length = owned.size.to_i64
+      when IO
+        @body = body
+        @body_length = nil
+      when Nil
+        @body = nil
+        @body_length = 0_i64
+      end
     end
 
-    private def initialize(@headers, body, @trailers, internal : Nil)
-      self.body = body
-    end
-
-    def body=(body : String | Bytes)
-      @body = IO::Memory.new(body)
-    end
-
-    def body=(@body : IO); end
-
-    def body=(@body : Nil)
-      request_method = method
-      @headers["Content-Length"] = "0" if request_method == "POST" || request_method == "PUT"
-    end
-
-    def method : String
-      headers[":method"]?.to_s
-    end
-
-    def path : String
-      headers[":path"]?.to_s
-    end
-
-    def scheme : String
-      headers[":scheme"]?.to_s
-    end
-
-    def authority : String
-      headers[":authority"]?.to_s
+    def initialize(
+      method : String,
+      target : String,
+      headers : HTTP::Headers,
+      body : Body = nil,
+      trailers : HTTP::Headers? = nil,
+    )
+      initialize(
+        method,
+        target,
+        Headers.new(headers),
+        body,
+        trailers ? Headers.new(trailers) : Headers.new
+      )
     end
   end
 end

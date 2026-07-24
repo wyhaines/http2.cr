@@ -109,7 +109,7 @@ describe HTTP2::Connection do
       end
     end
 
-    expect_raises(OpenSSL::SSL::Error) do
+    error = expect_raises(HTTP2::Connection::TLSVerificationError) do
       HTTP2::Connection.connect_tls(
         "127.0.0.1",
         server.local_address.port,
@@ -117,6 +117,8 @@ describe HTTP2::Connection do
         context: tls_client_context
       )
     end
+    error.server_name.should eq("wrong.example")
+    error.cause.should be_a(OpenSSL::SSL::Error)
     select
     when peer_done.receive
     when timeout(2.seconds)

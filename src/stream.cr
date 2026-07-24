@@ -3,6 +3,12 @@ require "./stream_body"
 module HTTP2
   # A registered HTTP/2 stream and its bounded inbound event mailbox.
   class Stream
+    # :nodoc:
+    abstract class InboundValidator
+      abstract def validate(section : Connection::FieldSection) : Nil
+      abstract def validate_data(size : Int32, end_stream : Bool) : Nil
+    end
+
     enum State
       Idle
       ReservedLocal
@@ -58,6 +64,7 @@ module HTTP2
     @receive_window : Int64
     @terminal_signal = Channel(Nil).new
     @terminal_error : Exception?
+    @inbound_validator : InboundValidator?
     @mutex = Mutex.new
     @outbound_mutex = Mutex.new
 
@@ -293,24 +300,56 @@ module HTTP2
 
     # Waits for the next inbound non-DATA frame or decoded field section.
     # Response DATA is available through #body.
-    def receive(timeout : Time::Span? = nil) : StreamEvent
+    def receive(
+      timeout : Time::Span? = nil,
+      cancellation : Channel(Nil)? = nil,
+    ) : StreamEvent
       raise_terminal! if terminal_error
 
-      if timeout
+      if timeout && cancellation
+        receive_with_timeout_and_cancellation(timeout, cancellation)
+      elsif timeout
+        receive_with_timeout(timeout)
+      elsif cancellation
+        receive_with_cancellation(cancellation)
+      else
+        receive_without_deadline
+      end
+    end
+
+    # Waits for one metadata event, returning nil when the remote message ends.
+    #
+    # :nodoc:
+    def receive_until_remote_end(
+      cancellation : Channel(Nil)? = nil,
+    ) : StreamEvent?
+      if @body.completed?
         select
-        when frame = @events.receive
-          frame
+        when event = @events.receive
+          return event
+        else
+          return if @body.finished?
+          raise_terminal!
+        end
+      end
+
+      if cancellation
+        select
+        when event = @events.receive
+          event
+        when @body.completion_signal.receive?
+          receive_after_body_completion
         when @terminal_signal.receive?
           raise_terminal!
-        when timeout(timeout)
-          raise Connection::TimeoutError.new(
-            "waiting for stream #{id} timed out"
-          )
+        when cancellation.receive?
+          raise WaitCanceledError.new("waiting for stream #{id} was canceled")
         end
       else
         select
-        when frame = @events.receive
-          frame
+        when event = @events.receive
+          event
+        when @body.completion_signal.receive?
+          receive_after_body_completion
         when @terminal_signal.receive?
           raise_terminal!
         end
@@ -350,6 +389,40 @@ module HTTP2
 
     def close : Nil
       cancel
+    end
+
+    # Terminates local work with a caller-selected public error.
+    #
+    # :nodoc:
+    def abort(
+      error : Exception,
+      error_code : ErrorCode = ErrorCode::CANCEL,
+    ) : Nil
+      @connection.cancel_stream(self, error_code, error)
+    end
+
+    # :nodoc:
+    def inbound_validator=(validator : InboundValidator) : Nil
+      @mutex.synchronize do
+        unless @state.idle?
+          raise Connection::InvalidStateError.new(
+            "an inbound validator must be installed before a stream opens"
+          )
+        end
+        @inbound_validator = validator
+      end
+    end
+
+    # :nodoc:
+    def validate_inbound(section : Connection::FieldSection) : Nil
+      validator = @mutex.synchronize { @inbound_validator }
+      validator.try(&.validate(section))
+    end
+
+    # :nodoc:
+    def validate_inbound_data(size : Int32, end_stream : Bool) : Nil
+      validator = @mutex.synchronize { @inbound_validator }
+      validator.try(&.validate_data(size, end_stream))
     end
 
     # :nodoc:
@@ -414,7 +487,7 @@ module HTTP2
       end
       return 0 unless terminated
 
-      discarded = @body.terminate(error)
+      discarded = @body.finished? ? 0 : @body.terminate(error)
       @terminal_signal.close
       discarded
     end
@@ -425,6 +498,73 @@ module HTTP2
       end
 
       raise Connection::ClosedError.new("HTTP/2 stream #{id} is closed")
+    end
+
+    private def receive_after_body_completion : StreamEvent?
+      select
+      when event = @events.receive
+        event
+      else
+        return if @body.finished?
+        raise_terminal!
+      end
+    end
+
+    private def receive_with_timeout_and_cancellation(
+      duration : Time::Span,
+      cancellation : Channel(Nil),
+    ) : StreamEvent
+      select
+      when frame = @events.receive
+        frame
+      when @terminal_signal.receive?
+        raise_terminal!
+      when cancellation.receive?
+        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+      when timeout(duration)
+        raise Connection::TimeoutError.new(
+          "waiting for stream #{id} timed out"
+        )
+      end
+    end
+
+    private def receive_with_timeout(duration : Time::Span) : StreamEvent
+      select
+      when frame = @events.receive
+        frame
+      when @terminal_signal.receive?
+        raise_terminal!
+      when timeout(duration)
+        raise Connection::TimeoutError.new(
+          "waiting for stream #{id} timed out"
+        )
+      end
+    end
+
+    private def receive_with_cancellation(
+      cancellation : Channel(Nil),
+    ) : StreamEvent
+      select
+      when frame = @events.receive
+        frame
+      when @terminal_signal.receive?
+        raise_terminal!
+      when cancellation.receive?
+        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+      end
+    end
+
+    private def receive_without_deadline : StreamEvent
+      select
+      when frame = @events.receive
+        frame
+      when @terminal_signal.receive?
+        raise_terminal!
+      end
+    end
+
+    # :nodoc:
+    class WaitCanceledError < Exception
     end
   end
 end

@@ -6,6 +6,12 @@ module HTTP2
   # Flow-control credit is returned only after bytes leave this buffer. Closing
   # an unfinished body discards its buffered bytes and cancels the stream.
   class StreamBody < IO
+    class ReadTimeoutError < IO::Error
+    end
+
+    class ReadCanceledError < IO::Error
+    end
+
     @chunks = Deque(Bytes).new
     @chunk_offset = 0
     @buffered_bytes = 0
@@ -15,6 +21,7 @@ module HTTP2
     @mutex = Mutex.new
     @read_mutex = Mutex.new
     @wakeup = Channel(Nil).new(1)
+    @completion_signal = Channel(Nil).new
 
     getter capacity : Int32
 
@@ -29,6 +36,17 @@ module HTTP2
     end
 
     def read(slice : Bytes) : Int32
+      read_with_timeout(slice)
+    end
+
+    # Reads with an optional inactivity timeout and cancellation signal.
+    #
+    # :nodoc:
+    def read_with_timeout(
+      slice : Bytes,
+      timeout : Time::Span? = nil,
+      cancellation : Channel(Nil)? = nil,
+    ) : Int32
       return 0 if slice.empty?
 
       @read_mutex.synchronize do
@@ -56,7 +74,7 @@ module HTTP2
           end
 
           if wait
-            @wakeup.receive?
+            wait_for_data(timeout, cancellation)
             next
           end
 
@@ -83,6 +101,7 @@ module HTTP2
       end
 
       notify
+      complete
       @on_consumed.call(discarded) if discarded > 0
       @on_cancel.call if cancel
     end
@@ -93,6 +112,15 @@ module HTTP2
 
     def finished? : Bool
       @mutex.synchronize { @finished }
+    end
+
+    def completed? : Bool
+      @mutex.synchronize { @finished || @closed || !@terminal_error.nil? }
+    end
+
+    # :nodoc:
+    def completion_signal : Channel(Nil)
+      @completion_signal
     end
 
     def buffered_bytes : Int32
@@ -125,7 +153,10 @@ module HTTP2
           true
         end
       end
-      notify if changed
+      if changed
+        notify
+        complete
+      end
     end
 
     # Marks the body terminal, discards buffered data, and returns the number
@@ -141,7 +172,10 @@ module HTTP2
           {discard_unlocked, true}
         end
       end
-      notify if changed
+      if changed
+        notify
+        complete
+      end
       discarded
     end
 
@@ -160,6 +194,41 @@ module HTTP2
       end
     rescue Channel::ClosedError
       # No wakeup is needed after the body has been abandoned.
+    end
+
+    private def complete : Nil
+      @completion_signal.close
+    rescue Channel::ClosedError
+      # Completion is idempotent across finish, reset, and close races.
+    end
+
+    private def wait_for_data(
+      duration : Time::Span?,
+      cancellation : Channel(Nil)?,
+    ) : Nil
+      if duration && cancellation
+        select
+        when @wakeup.receive?
+        when cancellation.receive?
+          raise ReadCanceledError.new("response body read was canceled")
+        when timeout(duration)
+          raise ReadTimeoutError.new("response body read timed out")
+        end
+      elsif duration
+        select
+        when @wakeup.receive?
+        when timeout(duration)
+          raise ReadTimeoutError.new("response body read timed out")
+        end
+      elsif cancellation
+        select
+        when @wakeup.receive?
+        when cancellation.receive?
+          raise ReadCanceledError.new("response body read was canceled")
+        end
+      else
+        @wakeup.receive?
+      end
     end
   end
 end

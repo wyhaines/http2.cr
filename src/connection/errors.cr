@@ -31,6 +31,17 @@ module HTTP2
     class TLSNegotiationError < Error
     end
 
+    class TLSVerificationError < TLSNegotiationError
+      getter server_name : String
+
+      def initialize(@server_name : String, cause : Exception)
+        super(
+          "TLS certificate or hostname verification failed for #{server_name}",
+          cause
+        )
+      end
+    end
+
     class CanceledError < ClosedError
       getter stream_id : UInt32
       getter error_code : UInt32

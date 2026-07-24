@@ -34,10 +34,15 @@ Transport IO (TCP, TLS, or a test double)
   allocation, connection flow-control windows, HPACK contexts, reader/writer
   fibers, and terminal error.
 - `Stream` owns its state-machine position, stream windows, bounded inbound
-  events/body storage, response metadata, and cancellation state. It never
+  events/body storage, HTTP validator hook, and cancellation state. It never
   reads from or writes directly to the socket.
 - `Client` owns dialing, TLS policy, origin-based connection reuse, request
-  policy, and the eventual public request API.
+  validation, timeout policy, and the public request API.
+
+The client is bound to one normalized `http` or `https` origin. Absolute
+request targets must match that origin; ordinary CONNECT targets use authority
+form. This deliberately avoids unsafe cross-origin reuse or implicit
+connection coalescing.
 
 ## Concurrency Model
 
@@ -58,6 +63,16 @@ The writer splits them by the peer frame size and both send windows. Blocked
 DATA remains pending outside the control queue, so SETTINGS, PING, GOAWAY,
 RST_STREAM, HEADERS, and WINDOW_UPDATE continue to make progress.
 
+Each client request installs a bounded, library-owned HTTP response validator
+before opening its stream. It validates field syntax, pseudo-field context,
+status, trailers, and content length on the reader path without invoking
+application code. A malformed response therefore becomes a stream-scoped
+`PROTOCOL_ERROR` before invalid metadata or DATA reaches the caller.
+
+Request body upload runs independently of response metadata consumption. This
+allows a complete early non-tunnel response to stop a flow-blocked upload
+without discarding an already complete, buffered response body.
+
 Transport shutdown runs in the connection's transport scheduler and joins both
 protocol fibers. This keeps socket event-loop ownership consistent and makes a
 cross-fiber close deterministic, including under legacy `preview_mt`.
@@ -71,6 +86,16 @@ sockets, and a local certificate fixture. Timeouts will use an injected
 monotonic clock only where deterministic deadline tests require it.
 
 The default suite must never require DNS or public internet access.
+
+Client connect, read, and write timeouts apply to dialing and transport
+operations. The idle timeout bounds a blocked streaming body read or trailer
+wait. Cancellation tokens remain active after response headers are returned,
+so they also stop response-body and trailer waits.
+
+For ordinary CONNECT, request `IO` is tunnel data rather than HTTP content.
+The client sends it only after a successful final response and ignores a
+content-length field on that response when validating tunnel DATA. Once the
+tunnel is established, either direction can end independently.
 
 ## Errors, Shutdown, and Limits
 
@@ -95,3 +120,5 @@ input may cause unbounded allocation.
   and cancellation behavior, GOAWAY, PING, and push-disabled operation.
 - Phase 5 owns connection and stream flow control plus bounded streaming DATA
   delivery without changing frame-codec ownership.
+- Phase 6 owns HTTP field/message validation, the ordered request/response
+  model, timeout and cancellation policy, and origin-bound connection reuse.

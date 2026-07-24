@@ -110,8 +110,19 @@ module HTTP2
       host : String,
       port : Int = 80,
       configuration : Configuration = Configuration.new,
+      *,
+      connect_timeout : Time::Span? = nil,
+      read_timeout : Time::Span? = nil,
+      write_timeout : Time::Span? = nil,
     ) : self
-      transport = TCPSocket.new(host, port)
+      transport = TCPSocket.new(
+        host,
+        port,
+        connect_timeout,
+        connect_timeout
+      )
+      transport.read_timeout = read_timeout
+      transport.write_timeout = write_timeout
       begin
         new(transport, configuration).start
       rescue error
@@ -128,8 +139,18 @@ module HTTP2
       server_name : String = host,
       context : OpenSSL::SSL::Context::Client = OpenSSL::SSL::Context::Client.new,
       configuration : Configuration = Configuration.new,
+      connect_timeout : Time::Span? = nil,
+      read_timeout : Time::Span? = nil,
+      write_timeout : Time::Span? = nil,
     ) : self
-      transport = TCPSocket.new(host, port)
+      transport = TCPSocket.new(
+        host,
+        port,
+        connect_timeout,
+        connect_timeout
+      )
+      transport.read_timeout = read_timeout
+      transport.write_timeout = write_timeout
       begin
         start_tls(
           transport,
@@ -165,6 +186,9 @@ module HTTP2
       end
 
       new(tls, configuration).start
+    rescue error : OpenSSL::SSL::Error
+      transport.close unless transport.closed?
+      raise TLSVerificationError.new(server_name, error)
     rescue error
       transport.close unless transport.closed?
       raise error
@@ -594,7 +618,9 @@ module HTTP2
     def cancel_stream(
       stream : Stream,
       error_code : ErrorCode = ErrorCode::CANCEL,
+      terminal_error : Exception? = nil,
     ) : Nil
+      error = terminal_error || CanceledError.new(stream.id, error_code)
       send_reset = @mutex.synchronize do
         current = @streams[stream.id]?
         unless current && current.same?(stream)
@@ -606,7 +632,7 @@ module HTTP2
           current.transition_to(Stream::State::Closed)
           terminate_stream_unlocked(
             current,
-            CanceledError.new(stream.id, error_code)
+            error
           )
           false
         else
@@ -618,7 +644,7 @@ module HTTP2
       reset = Frame::ResetStream.new(stream.id, error_code)
       send_reset(
         reset,
-        CanceledError.new(stream.id, error_code)
+        error
       )
     rescue error : InvalidStateError
       raise error unless stream.closed? || stream.terminal_error
@@ -1532,6 +1558,7 @@ module HTTP2
           frame.stream_id,
           flow_size
         )
+        stream.validate_inbound_data(frame.data.size, frame.end_stream?)
         apply_inbound_data_transition_unlocked(
           stream,
           frame.stream_id,
@@ -1603,6 +1630,11 @@ module HTTP2
       event : StreamEvent,
       stream_event : Stream::Event,
     ) : Nil
+      if section = event.as?(FieldSection)
+        stream = @mutex.synchronize { @streams[section.stream_id]? }
+        stream.try(&.validate_inbound(section))
+      end
+
       stream, ignored = @mutex.synchronize do
         resolved = resolve_inbound_transition_unlocked(
           event.stream_id,

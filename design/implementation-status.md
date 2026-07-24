@@ -12,7 +12,8 @@ Last updated: 2026-07-24
 | 3 — SETTINGS, HPACK, field blocks | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 4 — Stream state and control frames | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 5 — Flow control and streaming DATA | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 6–8 | Not started | — |
+| 6 — HTTP semantics and public client API | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
+| 7–8 | Not started | — |
 
 ## Phase 0 Baseline
 
@@ -147,6 +148,36 @@ Deterministic tests cover tiny and negative windows, padded DATA, receive and
 send overflow, slow consumers, concurrent uploads/downloads, IO sources,
 control-frame progress, source failure, and reset while flow-blocked.
 
+## Phase 6 HTTP Semantics and Public Client API
+
+Phase 6 now:
+
+- exposes an origin-bound `HTTP2::Client`, explicit request metadata, ordered
+  duplicate-preserving headers, informational responses, streaming response
+  bodies, and blocking trailer access;
+- derives request pseudo-fields from the method, target, and origin, including
+  ordinary CONNECT authority-form rules, tunnel I/O deferred until a successful
+  response, independent tunnel half-closes, and same-origin checks for absolute
+  targets;
+- validates lowercase field names and values, pseudo-field ordering, context,
+  and uniqueness, connection-specific fields, `te: trailers`, and duplicate
+  content lengths before malformed data reaches application code;
+- enforces response status and content rules for informational responses,
+  HEAD, 204, 304, successful CONNECT, DATA, and trailers with stream-scoped
+  `PROTOCOL_ERROR` resets;
+- streams each available request `IO` chunk without rewinding or waiting for
+  source EOF, verifies declared lengths, supports request trailers, and stops
+  blocked uploads after complete early responses without discarding completed
+  response content;
+- exposes connect, read, write, and idle timeouts plus request cancellation,
+  verified TLS/hostname errors, required ALPN, and safe concurrent connection
+  reuse within one normalized origin.
+
+Hermetic tests cover GET, streaming POST, concurrent requests, owned cleartext
+dialing/reuse, informational responses, request and response trailers, CONNECT,
+malformed field sections, content-length failures, no-content responses,
+timeouts, cancellation, and early response completion.
+
 ## Current Verification
 
 Run from the repository root:
@@ -160,14 +191,13 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 5 gate passes formatting, Ameba, compilation, documentation, and 154
+The Phase 6 gate passes formatting, Ameba, compilation, documentation, and 187
 deterministic examples in normal and `preview_mt` modes in the official Crystal
 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
 deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Begin Phase 6 by defining HTTP request/response semantics and a stable client
-API over the streaming connection core. Validate pseudo-fields, response
-status, content lengths, informational responses, trailers, CONNECT, and
-per-operation timeouts before adding origin-based connection reuse.
+Begin Phase 7 with graceful local and remote GOAWAY draining, explicit replay
+policy for provably unprocessed requests, drain deadlines, and deterministic
+shutdown/recovery under injected transport failures.

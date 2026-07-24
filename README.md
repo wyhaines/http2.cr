@@ -14,8 +14,11 @@ runtime, SETTINGS state, persistent inbound and outbound HPACK contexts, and
 bounded field-block processing are covered. Stream state, concurrency limits,
 reset and cancellation behavior, GOAWAY, PING, and push-disabled operation are
 also implemented. Independent connection/stream flow control, fair streaming
-DATA output, and bounded response body readers are implemented. HTTP semantics
-and the public client API remain unfinished.
+DATA output, and bounded response body readers are implemented. The public
+origin-bound client now validates HTTP/2 messages and supports concurrent
+requests, streaming request and response bodies, informational responses,
+trailers, timeouts, and cancellation. Graceful recovery, adversarial
+hardening, and independent interoperability work remain.
 
 Development is organized in ordered phases:
 
@@ -35,17 +38,48 @@ dependencies:
 
 Then run `shards install`.
 
-## Usage
+## Client Usage
 
-The public client API is intentionally deferred until the protocol engine is
-correct. Requiring the shard currently exposes experimental protocol
-primitives:
+Create one client per origin; it safely reuses that origin's HTTP/2 connection.
+Field names must already be lowercase. `HTTP2::Headers` preserves insertion
+order and repeated names.
 
 ```crystal
 require "http2"
+
+client = HTTP2::Client.new(
+  "https://example.com",
+  timeouts: HTTP2::Client::Timeouts.new(
+    connect: 5.seconds,
+    read: 30.seconds,
+    write: 30.seconds,
+    idle: 30.seconds
+  )
+)
+
+begin
+  response = client.get(
+    "/items",
+    HTTP2::Headers{"accept" => "application/json"}
+  )
+  puts response.status
+  puts response.body.gets_to_end
+  pp response.trailers
+ensure
+  client.close
+end
 ```
 
-These types can change before `1.0`.
+Pass an `IO` as a request body to stream it from its current position. A
+`Cancellation` can be shared with `#get`, `#post`, or `#request`; canceling it
+resets only that request's stream. Cleartext `http` origins use explicit HTTP/2
+prior knowledge. HTTPS verifies the certificate and hostname and requires ALPN
+`h2` by default. For ordinary CONNECT, a supplied `IO` is treated as tunnel
+data and is not read until the peer returns a successful response; either
+tunnel direction can then close independently.
+
+Redirects, cookies, content decompression, retries, and cross-origin connection
+coalescing are intentionally not client policy in this shard.
 
 ## Development
 
