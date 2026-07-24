@@ -3,6 +3,7 @@ name: HTTP2 CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -28,6 +29,11 @@ jobs:
 
       - name: Install dependencies
         run: shards install
+      - name: Install nghttp2 interoperability server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nghttp2-server
+          nghttpd --version
       - name: Build Ameba
         run: shards build ameba -Dpreview_mt
       - name: Check formatting
@@ -38,6 +44,10 @@ jobs:
         run: crystal spec -t -s
       - name: Run preview_mt specs
         run: crystal spec -Dpreview_mt -t -s
+      - name: Run nghttp2 interoperability specs
+        run: spec/interop/run_nghttp2.sh
+      - name: Run preview_mt nghttp2 interoperability specs
+        run: spec/interop/run_nghttp2.sh -Dpreview_mt
       - name: Build shard
         run: crystal build src/http2.cr
       - name: Build documentation

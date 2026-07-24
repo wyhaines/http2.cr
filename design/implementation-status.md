@@ -14,7 +14,7 @@ Last updated: 2026-07-24
 | 5 — Flow control and streaming DATA | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 6 — HTTP semantics and public client API | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 7 — Shutdown, recovery, and hardening | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 8 — Interoperability and release | Not started | — |
+| 8 — Interoperability and release | Complete locally | Gate passed on Crystal 1.20.0 and 1.21.0; RC publication pending |
 
 ## Phase 0 Baseline
 
@@ -208,6 +208,32 @@ replay decisions, one-shot bodies, open-stream and pending-operation limits,
 decoded-field-count HPACK synchronization, keepalive failure, control/empty
 frame floods, diagnostics backpressure, EOF, and injected write failures.
 
+## Phase 8 Interoperability and Release
+
+Phase 8 now:
+
+- provides an opt-in, public-network-free runner for independent nghttp2
+  cleartext and TLS servers using a temporary document root and the checked-in
+  certificate fixture;
+- verifies TLS ALPN, padded frames, response trailers, a 256 KiB duplex echo
+  under constrained flow-control windows, a fragmented 24 KiB request field,
+  twelve concurrent streams, cancellation with RST_STREAM, follow-up reuse,
+  and graceful GOAWAY;
+- checks nghttp2's verbose trace to ensure the independent peer actually
+  receives the expected RST_STREAM and GOAWAY frames;
+- adds seeded property coverage for bounded arbitrary frame parsing,
+  randomized truncation, and persistent HPACK encode/fragment/reassemble/decode
+  cycles, with `HTTP2_PROPERTY_CASES` available for longer local runs;
+- runs ordinary and nghttp2 suites in normal and `preview_mt` modes for every
+  supported Crystal version in CI, including tag builds;
+- documents architecture, client usage, streaming, cancellation, timeouts,
+  TLS behavior, recovery, diagnostics, and current limitations;
+- adds a changelog and SemVer/release policy and prepares version
+  `1.0.0-rc.1`.
+
+Publishing the `v1.0.0-rc.1` tag and GitHub release remains an explicit
+maintainer action; no branch or tag has been pushed.
+
 ## Current Verification
 
 Run from the repository root:
@@ -217,17 +243,21 @@ crystal tool format --check
 bin/ameba
 crystal spec -t -s
 crystal spec -Dpreview_mt -t -s
+spec/interop/run_nghttp2.sh
+spec/interop/run_nghttp2.sh -Dpreview_mt
 crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 7 gate passes formatting, Ameba, compilation, documentation, and 207
-deterministic examples in normal and `preview_mt` modes in the official Crystal
-1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
-deprecation warning on Crystal 1.21.
+The Phase 8 gate passes formatting, Ameba, compilation, documentation, 210
+deterministic examples, and five independent nghttp2 examples in normal and
+`preview_mt` modes in the official Crystal 1.20.0 and 1.21.0 containers.
+An additional 5,000-case property stress run passes on Crystal 1.21.0.
+nghttp2 1.59.0 was used for the local release matrix. The `preview_mt` flag
+emits its expected deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Begin Phase 8 with hermetic nghttp2 interoperability, frame/field-block fuzz or
-property coverage, release documentation, changelog and versioning policy, and
-a release-candidate process.
+A maintainer can publish `v1.0.0-rc.1`, collect downstream feedback, and repeat
+the documented release gate for any fixes. Publish final `1.0.0` only after the
+release candidate has been exercised by downstream users.

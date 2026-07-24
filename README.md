@@ -9,23 +9,29 @@ a reusable protocol core.
 
 ## Status
 
-The current code is not ready for production use. Its frame codec, transport
-runtime, SETTINGS state, persistent inbound and outbound HPACK contexts, and
-bounded field-block processing are covered. Stream state, concurrency limits,
-reset and cancellation behavior, GOAWAY, PING, and push-disabled operation are
-also implemented. Independent connection/stream flow control, fair streaming
-DATA output, and bounded response body readers are implemented. The public
-origin-bound client now validates HTTP/2 messages and supports concurrent
-requests, streaming request and response bodies, informational responses,
-trailers, timeouts, and cancellation. Graceful GOAWAY draining, opt-in safe
-replay, keepalive, bounded abuse controls, and structured diagnostics are also
-implemented. Independent interoperability and release hardening remain.
+The source tree is prepared as `1.0.0-rc.1`, the first release candidate for
+the rebuilt client. All implementation phases are complete, including an
+independent local nghttp2 matrix. The candidate is suitable for integration
+testing; validate it under your workload before production deployment and
+report API or protocol issues before the final 1.0 release.
 
 Development is organized in ordered phases:
 
 - [Implementation roadmap](design/http2-implementation-roadmap.md)
 - [Architecture decisions](design/architecture.md)
 - [Current implementation status](design/implementation-status.md)
+- [Changelog](CHANGELOG.md)
+- [Release and versioning policy](RELEASING.md)
+
+## Architecture
+
+One reader fiber parses and validates inbound frames. One ordered writer owns
+outbound HPACK state, field-block fragmentation, and fair flow-controlled DATA
+scheduling. Each connection has persistent HPACK contexts, bounded queues, and
+bounded per-stream response storage. `HTTP2::Client` adds HTTP semantics,
+timeouts, cancellation, safe origin reuse, and explicit replay policy above
+that protocol core. See the [architecture document](design/architecture.md)
+for ownership and shutdown details.
 
 ## Installation
 
@@ -35,6 +41,7 @@ Add the shard to your application's `shard.yml`:
 dependencies:
   http2:
     github: wyhaines/http2.cr
+    version: 1.0.0-rc.1
 ```
 
 Then run `shards install`.
@@ -74,11 +81,61 @@ end
 
 Pass an `IO` as a request body to stream it from its current position. A
 `Cancellation` can be shared with `#get`, `#post`, or `#request`; canceling it
-resets only that request's stream. Cleartext `http` origins use explicit HTTP/2
-prior knowledge. HTTPS verifies the certificate and hostname and requires ALPN
-`h2` by default. For ordinary CONNECT, a supplied `IO` is treated as tunnel
-data and is not read until the peer returns a successful response; either
-tunnel direction can then close independently.
+resets only that request's stream:
+
+```crystal
+cancellation = HTTP2::Cancellation.new
+upload = File.open("events.ndjson")
+begin
+  response = client.post(
+    "/events",
+    upload,
+    HTTP2::Headers{"content-type" => "application/x-ndjson"},
+    trailers: HTTP2::Headers{"x-upload-complete" => "true"},
+    cancellation: cancellation
+  )
+
+  # Another fiber may call `cancellation.cancel`.
+  IO.copy(response.body, STDOUT)
+  pp response.trailers
+ensure
+  upload.close
+end
+```
+
+String and Bytes bodies have a known length and are owned by the request.
+Caller-supplied `IO` bodies stream once from their current position.
+
+## Timeouts and TLS
+
+Timeouts apply independently:
+
+| Setting | Covers |
+| --- | --- |
+| `connect` | DNS lookup and TCP connection |
+| `read` | Transport reads, handshake, and response headers |
+| `write` | Transport writes and blocked upload progress |
+| `idle` | A blocked response-body read or trailer wait |
+
+Nil disables one timeout. A request `Cancellation` remains active after
+response headers arrive, so it can interrupt body and trailer waits.
+
+Cleartext `http` origins use direct HTTP/2 prior knowledge; HTTP/1.1 `Upgrade`
+is not attempted. HTTPS verifies the certificate and hostname, sends SNI, and
+requires ALPN `h2`. Supply a configured `OpenSSL::SSL::Context::Client` to add
+a private trust root or client certificate:
+
+```crystal
+tls = OpenSSL::SSL::Context::Client.new
+tls.ca_certificates = "/etc/my-service/ca.pem"
+client = HTTP2::Client.new("https://service.internal", tls_context: tls)
+```
+
+For ordinary CONNECT, a supplied `IO` is tunnel data and is not read until the
+peer returns a successful response; either tunnel direction can then close
+independently.
+
+## Recovery and Diagnostics
 
 Automatic replay is disabled by default. `Idempotent` or `AnyRequest` retries
 only a request proven unprocessed by GOAWAY or `REFUSED_STREAM`, up to
@@ -97,8 +154,17 @@ frame metadata, settings, lifecycle changes, and typed errors. Diagnostics
 exclude HTTP field values and GOAWAY debug data; check
 `#dropped_diagnostic_count` when the consumer is slower than the connection.
 
-Redirects, cookies, content decompression, and cross-origin connection
-coalescing are intentionally not client policy in this shard.
+## Limitations
+
+The initial stable target is an HTTP/2 client. It does not provide:
+
+- a server role, HTTP/1.1 fallback, or `h2c` upgrade;
+- server-push consumption or RFC 9218 priority scheduling;
+- extended CONNECT, ALTSVC/ORIGIN handling, or cross-origin coalescing;
+- redirect, cookie, proxy, decompression, or retry policy beyond the explicit
+  proven-unprocessed replay modes.
+
+A gRPC adapter belongs in a separate shard above the streaming API.
 
 ## Development
 
@@ -117,6 +183,16 @@ bin/ameba
 crystal spec -t -s
 crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
+```
+
+Deterministic property cases run with the ordinary specs. Increase their count
+with `HTTP2_PROPERTY_CASES=5000 crystal spec spec/property_spec.cr`.
+
+Install `nghttpd`, then run the independent local interoperability matrix:
+
+```sh
+spec/interop/run_nghttp2.sh
+spec/interop/run_nghttp2.sh -Dpreview_mt
 ```
 
 Tests must be hermetic. Do not add public-network dependencies to the default

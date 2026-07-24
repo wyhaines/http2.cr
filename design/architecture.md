@@ -124,6 +124,25 @@ closes the connection if its ACK deadline expires. Structured diagnostics use
 a nonblocking bounded channel; they report frame metadata, settings, lifecycle
 changes, and typed errors without HTTP field values or GOAWAY debug data.
 
+## Verification and Release Boundary
+
+The ordinary spec suite is hermetic and uses in-memory or loopback scripted
+peers. Seeded property cases feed bounded arbitrary frames to the passive codec
+and repeatedly encode, fragment, reassemble, and decode ordered HPACK field
+blocks with persistent compression state.
+
+An opt-in runner starts independent nghttp2 cleartext and TLS servers against a
+temporary document root. It exercises ALPN, padded fields and DATA,
+fragmentation, constrained flow-control windows, trailers, reset recovery,
+GOAWAY, and multiplexing without public-network access. CI runs both suites on
+every supported Crystal version in normal and multi-threaded modes.
+
+The documented client, request, response, headers, cancellation, timeout,
+replay, and configuration surfaces are the compatibility boundary for 1.0.
+Items marked `:nodoc:` are internal. Low-level frame and connection APIs remain
+advanced surfaces and receive compatibility guarantees only where explicitly
+documented.
+
 ## Phase Boundaries
 
 - Phase 1 changes only the passive frame codec and typed error vocabulary.
@@ -139,3 +158,5 @@ changes, and typed errors without HTTP field values or GOAWAY debug data.
   model, timeout and cancellation policy, and origin-bound connection reuse.
 - Phase 7 owns draining and recovery, explicit safe replay, resource
   hardening, keepalive, abuse controls, and structured diagnostics.
+- Phase 8 owns independent interoperability, property coverage, the supported
+  compiler matrix, public release documentation, and versioning policy.
