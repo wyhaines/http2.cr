@@ -128,6 +128,12 @@ module HTTP2
     end
 
     # Opens a cleartext connection using HTTP/2 prior knowledge.
+    #
+    # `read_timeout` and `write_timeout` default to `nil` (no transport
+    # deadlines). Against untrusted or unreliable peers, set them and/or
+    # enable `Configuration#keepalive_interval`; otherwise a silent or
+    # write-stalled peer can hold blocked callers indefinitely.
+    # `HTTP2::Client` configures both by default.
     def self.connect_prior_knowledge(
       host : String,
       port : Int = 80,
@@ -154,6 +160,12 @@ module HTTP2
     end
 
     # Opens a verified TLS connection that requires ALPN to select `h2`.
+    #
+    # `read_timeout` and `write_timeout` default to `nil` (no transport
+    # deadlines). Against untrusted or unreliable peers, set them and/or
+    # enable `Configuration#keepalive_interval`; otherwise a silent or
+    # write-stalled peer can hold blocked callers indefinitely.
+    # `HTTP2::Client` configures both by default.
     def self.connect_tls(
       host : String,
       port : Int = 443,
@@ -2329,20 +2341,19 @@ module HTTP2
           next
         end
 
-        begin
-          ping(next_keepalive_payload, @configuration.keepalive_timeout)
-        rescue PingLimitError
+        case outcome = run_keepalive_probe
+        when PingLimitError
           wait_for_keepalive_activity(interval)
-        rescue error : TimeoutError
+        when TimeoutError
           terminate(
             KeepaliveTimeoutError.new(
               "HTTP/2 keepalive PING timed out",
-              error
+              outcome
             )
           )
           break
-        rescue error
-          terminate(error) unless closed?
+        when Exception
+          terminate(outcome) unless closed?
           break
         end
       end
@@ -2350,6 +2361,31 @@ module HTTP2
       # Connection shutdown wakes keepalive.
     ensure
       @keepalive_done.close
+    end
+
+    # Runs one keepalive PING in a helper fiber so the probe is bounded by
+    # keepalive_timeout even when command submission or the transport write
+    # itself blocks on a stalled peer. The helper fiber is released by
+    # connection termination (queues close and waiters are failed).
+    private def run_keepalive_probe : Exception?
+      result = Channel(Exception?).new(1)
+      payload = next_keepalive_payload
+      probe_timeout = @configuration.keepalive_timeout
+      ::spawn(name: "http2-keepalive-probe") do
+        ping(payload, probe_timeout)
+        result.send(nil)
+      rescue error
+        result.send(error) rescue nil
+      end
+
+      select
+      when outcome = result.receive
+        outcome
+      when timeout(probe_timeout)
+        TimeoutError.new(
+          "HTTP/2 keepalive PING did not complete within #{probe_timeout}"
+        )
+      end
     end
 
     private def wait_for_keepalive_activity(duration : Time::Span) : Nil

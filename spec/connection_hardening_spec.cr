@@ -271,6 +271,30 @@ describe HTTP2::Connection do
     end
   end
 
+  it "terminates a write-stalled connection within the keepalive deadline" do
+    transport = StallingWriteIO.new
+    connection = HTTP2::Connection.start(
+      transport,
+      HTTP2::Connection::Configuration.new(
+        keepalive_interval: 50.milliseconds,
+        keepalive_timeout: 250.milliseconds
+      )
+    )
+    begin
+      connection.wait_until_active(1.second)
+      transport.stall!
+
+      eventually(
+        timeout: 3.seconds,
+        message: "keepalive did not terminate the stalled connection"
+      ) { connection.closed? }
+      connection.terminal_error
+        .should be_a(HTTP2::Connection::KeepaliveTimeoutError)
+    ensure
+      connection.close
+    end
+  end
+
   it "rejects excessive inbound control traffic" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|

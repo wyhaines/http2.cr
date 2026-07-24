@@ -168,3 +168,62 @@ class FailingWriteIO < IO
     @closed
   end
 end
+
+class StallingWriteIO < IO
+  getter written_bytes : Int32 = 0
+
+  @read_data : Bytes
+  @read_offset = 0
+  @closed = false
+  @closed_signal = Channel(Nil).new
+  @stall = Channel(Nil).new
+  @stalled = false
+
+  def initialize
+    handshake = IO::Memory.new
+    HTTP2::Frame::Settings
+      .new([] of HTTP2::Frame::Settings::Setting)
+      .write(handshake)
+    HTTP2::Frame::Settings.ack.write(handshake)
+    @read_data = handshake.to_slice
+  end
+
+  # After this call every write blocks until the transport is closed.
+  def stall! : Nil
+    @stalled = true
+  end
+
+  def read(slice : Bytes) : Int32
+    return 0 if @closed
+
+    if @read_offset < @read_data.size
+      count = Math.min(slice.size, @read_data.size - @read_offset)
+      slice[0, count].copy_from(@read_data[@read_offset, count])
+      @read_offset += count
+      count
+    else
+      @closed_signal.receive?
+      0
+    end
+  end
+
+  def write(slice : Bytes) : Nil
+    if @stalled
+      @stall.receive?
+      raise IO::Error.new("transport closed while a write was stalled")
+    end
+    @written_bytes += slice.size
+  end
+
+  def close : Nil
+    return if @closed
+
+    @closed = true
+    @stall.close
+    @closed_signal.close
+  end
+
+  def closed?
+    @closed
+  end
+end
