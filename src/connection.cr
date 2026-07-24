@@ -419,6 +419,17 @@ module HTTP2
           "non-ACK SETTINGS frames must be sent with #send_settings"
         )
       end
+      if frames.any?(Frame::WindowUpdate)
+        raise ArgumentError.new(
+          "WINDOW_UPDATE frames are managed by connection flow control; " \
+          "receive credit is returned by consuming stream bodies"
+        )
+      end
+      if frames.any? { |frame| frame.is_a?(Frame::Settings) && frame.ack? }
+        raise ArgumentError.new(
+          "SETTINGS acknowledgements are sent automatically by the connection"
+        )
+      end
 
       submit(WriteCommand.new(frames.dup))
     end
