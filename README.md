@@ -114,7 +114,7 @@ Timeouts apply independently:
 | --- | --- |
 | `connect` | DNS lookup and TCP connection |
 | `read` | Transport reads, handshake, and response headers |
-| `write` | Transport writes and blocked upload progress |
+| `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
 | `idle` | A blocked response-body read or trailer wait |
 
 Nil disables one timeout. A request `Cancellation` remains active after
