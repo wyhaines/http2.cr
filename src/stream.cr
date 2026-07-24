@@ -1,3 +1,5 @@
+require "./stream_body"
+
 module HTTP2
   # A registered HTTP/2 stream and its bounded inbound event mailbox.
   class Stream
@@ -48,17 +50,24 @@ module HTTP2
     end
 
     getter id : UInt32
+    getter body : StreamBody
 
     @events : Channel(StreamEvent)
     @state : State = State::Idle
+    @send_window : Int64
+    @receive_window : Int64
     @terminal_signal = Channel(Nil).new
     @terminal_error : Exception?
     @mutex = Mutex.new
+    @outbound_mutex = Mutex.new
 
     def initialize(
       @connection : Connection,
       @id : UInt32,
       event_capacity : Int32,
+      send_window : Int64,
+      receive_window : Int64,
+      body_capacity : Int32,
     )
       if @id.zero?
         raise ArgumentError.new("stream 0 cannot be registered")
@@ -70,6 +79,15 @@ module HTTP2
         raise ArgumentError.new("stream event capacity must be positive")
       end
       @events = Channel(StreamEvent).new(event_capacity)
+      @send_window = send_window
+      @receive_window = receive_window
+      @body = StreamBody.new(
+        body_capacity,
+        ->(amount : Int32) do
+          @connection.release_receive_credit(@id, amount)
+        end,
+        -> { cancel }
+      )
     end
 
     # An exhaustive transition table for standard stream-associated frames.
@@ -198,7 +216,14 @@ module HTTP2
           "frame stream ID #{frame.stream_id} does not match stream #{id}"
         )
       end
-      @connection.write_frame(frame)
+
+      @outbound_mutex.synchronize do
+        if data = frame.as?(Frame::Data)
+          @connection.send_data_frame(data)
+        else
+          @connection.write_frame(frame)
+        end
+      end
     end
 
     # Encodes and atomically sends an ordered field section.
@@ -208,7 +233,9 @@ module HTTP2
       end_stream : Bool = false,
     ) : Nil
       raise_terminal! if terminal_error
-      @connection.send_headers(id, fields, end_stream: end_stream)
+      @outbound_mutex.synchronize do
+        @connection.send_headers(id, fields, end_stream: end_stream)
+      end
     end
 
     # Encodes ordered name/value pairs with the default field policy.
@@ -223,7 +250,49 @@ module HTTP2
       send_headers(materialized, end_stream: end_stream)
     end
 
-    # Waits for the next inbound frame or decoded field section.
+    # Sends DATA while respecting connection and stream flow control. Large
+    # buffers are split into bounded writer commands and wire frames.
+    def send_data(
+      data : Bytes,
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      raise_terminal! if terminal_error
+      @outbound_mutex.synchronize do
+        @connection.send_data(id, data, end_stream: end_stream)
+      end
+    end
+
+    def send_data(
+      data : String,
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      send_data(data.to_slice, end_stream: end_stream)
+    end
+
+    # Streams an IO without rewinding it. The END_STREAM flag is placed on the
+    # final nonempty frame, or on one empty DATA frame when the IO is empty.
+    def send_data(
+      source : IO,
+      *,
+      end_stream : Bool = true,
+    ) : Nil
+      raise_terminal! if terminal_error
+      @outbound_mutex.synchronize do
+        @connection.send_data(id, source, end_stream: end_stream)
+      end
+    rescue error
+      begin
+        cancel unless closed?
+      rescue
+        # Preserve the body source or connection error that stopped streaming.
+      end
+      raise error
+    end
+
+    # Waits for the next inbound non-DATA frame or decoded field section.
+    # Response DATA is available through #body.
     def receive(timeout : Time::Span? = nil) : StreamEvent
       raise_terminal! if terminal_error
 
@@ -260,6 +329,19 @@ module HTTP2
       @mutex.synchronize { @terminal_error }
     end
 
+    # :nodoc:
+    def terminal_signal : Channel(Nil)
+      @terminal_signal
+    end
+
+    def send_window : Int64
+      @mutex.synchronize { @send_window }
+    end
+
+    def receive_window : Int64
+      @mutex.synchronize { @receive_window }
+    end
+
     # Cancels an active stream with RST_STREAM(CANCEL). An idle stream has not
     # appeared on the wire and is closed locally without sending a reset.
     def cancel(error_code : ErrorCode = ErrorCode::CANCEL) : Nil
@@ -273,6 +355,36 @@ module HTTP2
     # :nodoc:
     def transition_to(next_state : State) : Nil
       @mutex.synchronize { @state = next_state }
+    end
+
+    # :nodoc:
+    def adjust_send_window(delta : Int64) : Int64
+      @mutex.synchronize { @send_window += delta }
+    end
+
+    # :nodoc:
+    def send_window=(value : Int64) : Nil
+      @mutex.synchronize { @send_window = value }
+    end
+
+    # :nodoc:
+    def adjust_receive_window(delta : Int64) : Int64
+      @mutex.synchronize { @receive_window += delta }
+    end
+
+    # :nodoc:
+    def receive_window=(value : Int64) : Nil
+      @mutex.synchronize { @receive_window = value }
+    end
+
+    # :nodoc:
+    def finish_body : Nil
+      @body.finish
+    end
+
+    # :nodoc:
+    def deliver_data(data : Bytes) : Bool
+      @body.enqueue(data)
     end
 
     # :nodoc:
@@ -290,7 +402,7 @@ module HTTP2
     end
 
     # :nodoc:
-    def terminate(error : Exception) : Nil
+    def terminate(error : Exception) : Int32
       terminated = @mutex.synchronize do
         if @terminal_error
           false
@@ -300,7 +412,11 @@ module HTTP2
           true
         end
       end
-      @terminal_signal.close if terminated
+      return 0 unless terminated
+
+      discarded = @body.terminate(error)
+      @terminal_signal.close
+      discarded
     end
 
     private def raise_terminal! : NoReturn

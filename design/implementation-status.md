@@ -1,6 +1,6 @@
 # HTTP/2 Implementation Status
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 ## Phase Progress
 
@@ -11,7 +11,8 @@ Last updated: 2026-07-23
 | 2 — Connection and handshake | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 3 — SETTINGS, HPACK, field blocks | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 4 — Stream state and control frames | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 5–8 | Not started | — |
+| 5 — Flow control and streaming DATA | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
+| 6–8 | Not started | — |
 
 ## Phase 0 Baseline
 
@@ -125,6 +126,27 @@ Phase 4 now:
 - accepts deprecated PRIORITY frames without creating streams or depending on
   a priority tree.
 
+## Phase 5 Flow Control and Streaming DATA
+
+Phase 5 now:
+
+- keeps independent signed 64-bit connection and stream send/receive windows,
+  including legal negative send windows after initial-window reductions;
+- applies SETTINGS initial-window deltas to live streams and rejects connection
+  or stream window overflow with the required `FLOW_CONTROL_ERROR` scope;
+- charges the complete DATA payload, including Pad Length and padding, while
+  leaving all control and field-block frames outside flow control;
+- schedules outbound DATA round-robin across streams, fragments it by frame and
+  window limits, and lets control work bypass flow-blocked bodies;
+- exposes bounded per-stream response body readers and returns receive credit
+  only when application bytes are consumed (or discarded);
+- streams request DATA from buffers or the current position of an `IO`, places
+  `END_STREAM` exactly, and wakes blocked writers on reset or cancellation.
+
+Deterministic tests cover tiny and negative windows, padded DATA, receive and
+send overflow, slow consumers, concurrent uploads/downloads, IO sources,
+control-frame progress, source failure, and reset while flow-blocked.
+
 ## Current Verification
 
 Run from the repository root:
@@ -138,14 +160,14 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 4 gate passes formatting, Ameba, compilation, documentation, and 136
+The Phase 5 gate passes formatting, Ameba, compilation, documentation, and 154
 deterministic examples in normal and `preview_mt` modes in the official Crystal
 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
 deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Begin Phase 5 by implementing independent connection and stream flow-control
-windows. Add fair outbound DATA scheduling and bounded streaming body delivery,
-then cover tiny windows, slow consumers, concurrent bodies, and cancellation
-while blocked.
+Begin Phase 6 by defining HTTP request/response semantics and a stable client
+API over the streaming connection core. Validate pseudo-fields, response
+status, content lengths, informational responses, trailers, CONNECT, and
+per-operation timeouts before adding origin-based connection reuse.

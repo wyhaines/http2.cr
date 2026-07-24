@@ -44,17 +44,10 @@ describe HTTP2::Connection do
         )
         stream.state.should eq(HTTP2::Stream::State::Open)
 
-        stream.send(
-          HTTP2::Frame::Data.new(
-            HTTP2::Frame::Data::Flags::END_STREAM,
-            stream.id,
-            "request"
-          )
-        )
+        stream.send_data("request", end_stream: true)
         stream.state.should eq(HTTP2::Stream::State::HalfClosedLocal)
 
-        response = stream.receive(1.second).as(HTTP2::Frame::Data)
-        response.data.should eq("response".to_slice)
+        stream.body.gets_to_end.should eq("response")
         stream.state.should eq(HTTP2::Stream::State::Closed)
         connection.stream?(stream.id).should be_nil
         wait_for_peer(peer_result)
@@ -83,14 +76,25 @@ describe HTTP2::Connection do
 
         HTTP2::Frame::Data.new(0_u8, id, "late").write(io)
         io.flush
-        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset = loop do
+          frame = HTTP2::Frame.read(io)
+          next if frame.is_a?(HTTP2::Frame::WindowUpdate)
+
+          break frame.as(HTTP2::Frame::ResetStream)
+        end
         reset.stream_id.should eq(id)
         reset.error_code.should eq(HTTP2::ErrorCode::STREAM_CLOSED.to_u32)
 
         ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
         ping.write(io)
         io.flush
-        HTTP2::Frame.read(io).as(HTTP2::Frame::Ping).ack?.should be_true
+        loop do
+          frame = HTTP2::Frame.read(io)
+          next if frame.is_a?(HTTP2::Frame::WindowUpdate)
+
+          frame.as(HTTP2::Frame::Ping).ack?.should be_true
+          break
+        end
       end
 
       connection = HTTP2::Connection.start(client)
@@ -100,9 +104,7 @@ describe HTTP2::Connection do
         open_client_stream(stream, end_stream: false)
         stream_id.send(stream.id)
 
-        stream.receive(1.second).as(HTTP2::Frame::Data).data.should eq(
-          "first".to_slice
-        )
+        stream.body.gets_to_end.should eq("first")
         stream.state.should eq(HTTP2::Stream::State::HalfClosedRemote)
         first_received.send(nil)
 
@@ -287,7 +289,7 @@ describe HTTP2::Connection do
     end
   end
 
-  it "rejects an invalid batch without applying partial transitions" do
+  it "rejects DATA batches without applying partial transitions" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)
       batch_rejected = Channel(Nil).new(1)
@@ -311,7 +313,7 @@ describe HTTP2::Connection do
         open_client_stream(stream, end_stream: false)
         stream_id.send(stream.id)
 
-        expect_raises(HTTP2::Connection::InvalidStateError) do
+        expect_raises(ArgumentError, /DATA frames must be sent/) do
           connection.write_batch([
             HTTP2::Frame::Data.new(
               HTTP2::Frame::Data::Flags::END_STREAM,

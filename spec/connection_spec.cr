@@ -68,6 +68,17 @@ describe HTTP2::Connection::Configuration do
       HTTP2::Connection::Configuration.new(max_decoder_table_size: -1)
     end
     expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(max_buffered_body_bytes: 0)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(outbound_data_chunk_size: 0)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        outbound_data_chunk_size: HTTP2::FrameHeader::MAX_PAYLOAD + 1
+      )
+    end
+    expect_raises(ArgumentError) do
       HTTP2::Connection::Configuration.new(
         inbound_max_frame_size: 32_768,
         initial_settings: [
@@ -100,6 +111,17 @@ describe HTTP2::Connection::Configuration do
         ]
       )
     end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_buffered_body_bytes: 1_024,
+        initial_settings: [
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+            2_048_u32
+          ),
+        ]
+      )
+    end
   end
 
   it "advertises a decoder table cap below the protocol default" do
@@ -123,6 +145,20 @@ describe HTTP2::Connection::Configuration do
 
     max_header_list_size.try(&.value).should eq(1_024_u32)
     configuration.max_decoded_string_size.should eq(1_024)
+  end
+
+  it "bounds the advertised receive window by the body buffer" do
+    configuration = HTTP2::Connection::Configuration.new(
+      max_buffered_body_bytes: 1_024,
+      outbound_data_chunk_size: 2_048
+    )
+    initial_window_size = configuration.initial_settings.find do |setting|
+      setting.known_identifier.try(&.initial_window_size?)
+    end
+
+    initial_window_size.try(&.value).should eq(1_024_u32)
+    configuration.max_buffered_body_bytes.should eq(1_024)
+    configuration.outbound_data_chunk_size.should eq(2_048)
   end
 
   it "advertises push disabled and rejects enabling unsupported push" do
@@ -317,7 +353,11 @@ describe HTTP2::Connection do
         complete_server_handshake(io)
         id = stream_id.receive
         read_client_headers(io, id)
-        HTTP2::Frame::Data.new(0_u8, id, "body").write(io)
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          id,
+          "body"
+        ).write(io)
       end
 
       connection = HTTP2::Connection.start(client)
@@ -329,8 +369,7 @@ describe HTTP2::Connection do
         open_client_stream(stream)
         stream_id.send(stream.id)
 
-        frame = stream.receive(1.second).as(HTTP2::Frame::Data)
-        frame.data.should eq("body".to_slice)
+        stream.body.gets_to_end.should eq("body")
         wait_for_peer(peer_result)
       ensure
         connection.close
@@ -420,8 +459,13 @@ describe HTTP2::Connection do
         complete_server_handshake(io)
         id = stream_id.receive
         read_client_headers(io, id)
-        HTTP2::Frame::Data.new(0_u8, id, "first").write(io)
-        HTTP2::Frame::Data.new(0_u8, id, "second").write(io)
+        2.times do
+          HTTP2::Frame::Headers.new(
+            HTTP2::Frame::Headers::Flags::END_HEADERS,
+            id,
+            Bytes.empty
+          ).write(io)
+        end
       end
 
       configuration = HTTP2::Connection::Configuration.new(

@@ -78,6 +78,56 @@ describe HTTP2::Connection do
     end
   end
 
+  it "applies acknowledged initial-window changes to active streams" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        2.times do
+          settings = HTTP2::Frame.read(io).as(HTTP2::Frame::Settings)
+          settings.ack?.should be_false
+          HTTP2::Frame::Settings.ack.write(io)
+          io.flush
+        end
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        max_buffered_body_bytes: 10
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        eventually { connection.pending_settings_count.zero? }
+        stream = connection.new_stream
+        open_client_stream(stream, end_stream: false)
+        stream_id.send(stream.id)
+        stream.receive_window.should eq(10_i64)
+
+        connection.send_settings([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+            4_u32
+          ),
+        ])
+        eventually { stream.receive_window == 4_i64 }
+
+        connection.send_settings([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+            8_u32
+          ),
+        ])
+        eventually { stream.receive_window == 8_i64 }
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "matches ACKs to multiple local SETTINGS frames in FIFO order" do
     UNIXSocket.pair do |client, peer|
       updates_received = Channel(Nil).new(1)

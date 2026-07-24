@@ -1,5 +1,6 @@
 require "openssl"
 require "socket"
+require "deque"
 require "./connection/*"
 require "./stream"
 
@@ -33,6 +34,7 @@ module HTTP2
     @mutex = Mutex.new
     @submission_mutex = Mutex.new
     @write_queue : Channel(WriteCommand)
+    @data_queue : Channel(WriteCommand)
     @handshake_done = Channel(Nil).new
     @closed_signal = Channel(Nil).new
     @transport_close_signal = Channel(Nil).new
@@ -51,6 +53,14 @@ module HTTP2
     @stream_ids = StreamIDAllocator.new
     @pending_settings = [] of SettingsAcknowledgement
     @pending_pings = {} of String => Array(PingWaiter)
+    @connection_send_window : Int64 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
+    @connection_receive_window : Int64 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
+    @pending_connection_window_update : Int64 = 0_i64
+    @pending_stream_window_updates = {} of UInt32 => Int64
+    @flow_control_wakeup = Channel(Nil).new(1)
+    @pending_data = {} of UInt32 => Deque(WriteCommand)
+    @data_schedule = Deque(UInt32).new
+    @pending_data_count = 0
     @field_blocks : FieldBlockAssembler
     @encoder : HPack::Encoder
     @decoder : HPack::Decoder
@@ -60,6 +70,9 @@ module HTTP2
       @configuration : Configuration = Configuration.new,
     )
       @write_queue = Channel(WriteCommand).new(
+        @configuration.writer_queue_capacity
+      )
+      @data_queue = Channel(WriteCommand).new(
         @configuration.writer_queue_capacity
       )
       @local_settings = Frame::Settings.new(
@@ -256,6 +269,14 @@ module HTTP2
       end
     end
 
+    def send_window : Int64
+      @mutex.synchronize { @connection_send_window }
+    end
+
+    def receive_window : Int64
+      @mutex.synchronize { @connection_receive_window }
+    end
+
     def retained_closed_stream_count : Int32
       @mutex.synchronize { @closed_streams.size }
     end
@@ -278,7 +299,10 @@ module HTTP2
         stream = Stream.new(
           self,
           id,
-          @configuration.stream_event_capacity
+          @configuration.stream_event_capacity,
+          @peer_settings_state.initial_window_size.to_i64,
+          @effective_local_settings_state.initial_window_size.to_i64,
+          @configuration.max_buffered_body_bytes
         )
         @streams[id] = stream
       end
@@ -286,6 +310,10 @@ module HTTP2
 
     # Writes one frame through the connection's sole writer fiber.
     def write_frame(frame : Frames) : Nil
+      if data = frame.as?(Frame::Data)
+        send_data_frame(data)
+        return
+      end
       if outbound_field_block_frame?(frame)
         raise ArgumentError.new(
           "field blocks must be sent with #send_headers"
@@ -316,6 +344,11 @@ module HTTP2
           "field blocks must be sent with #send_headers"
         )
       end
+      if frames.any?(Frame::Data)
+        raise ArgumentError.new(
+          "DATA frames must be sent individually or with #send_data"
+        )
+      end
       if frames.any? { |frame| frame.is_a?(Frame::Settings) && !frame.ack? }
         raise ArgumentError.new(
           "non-ACK SETTINGS frames must be sent with #send_settings"
@@ -323,6 +356,89 @@ module HTTP2
       end
 
       submit(WriteCommand.new(frames.dup))
+    end
+
+    # Sends application data through the flow-control scheduler.
+    def send_data(
+      stream_id : UInt32,
+      data : Bytes,
+      *,
+      end_stream : Bool = false,
+    ) : Nil
+      ensure_registered_stream!(stream_id)
+
+      if data.empty?
+        submit_data(
+          Frame::Data.new(
+            end_stream ? Frame::Data::Flags::END_STREAM : Frame::Data::Flags.new(0_u8),
+            stream_id,
+            Bytes.empty
+          )
+        )
+        return
+      end
+
+      offset = 0
+      chunk_size = @configuration.outbound_data_chunk_size
+      while offset < data.size
+        size = Math.min(chunk_size, data.size - offset)
+        final = offset + size == data.size
+        flags = if end_stream && final
+                  Frame::Data::Flags::END_STREAM
+                else
+                  Frame::Data::Flags.new(0_u8)
+                end
+        submit_data(
+          Frame::Data.new(
+            flags,
+            stream_id,
+            data[offset, size].dup
+          )
+        )
+        offset += size
+      end
+    end
+
+    # Streams DATA from the source's current position without rewinding it.
+    def send_data(
+      stream_id : UInt32,
+      source : IO,
+      *,
+      end_stream : Bool = true,
+    ) : Nil
+      ensure_registered_stream!(stream_id)
+      chunk_size = @configuration.outbound_data_chunk_size
+      current = Bytes.new(chunk_size)
+      current_size = source.read(current)
+
+      if current_size.zero?
+        send_data(stream_id, Bytes.empty, end_stream: end_stream)
+        return
+      end
+
+      loop do
+        following = Bytes.new(chunk_size)
+        following_size = source.read(following)
+        final = following_size.zero?
+        send_data(
+          stream_id,
+          current[0, current_size],
+          end_stream: end_stream && final
+        )
+        break if final
+
+        current = following
+        current_size = following_size
+      end
+    end
+
+    # Preserves explicit DATA padding while still applying flow control. A
+    # padded frame is atomic because splitting it would change its wire shape.
+    #
+    # :nodoc:
+    def send_data_frame(frame : Frame::Data) : Nil
+      ensure_registered_stream!(frame.stream_id)
+      submit_data(frame)
     end
 
     # HPACK-encodes one ordered field section on the writer fiber and sends
@@ -396,6 +512,13 @@ module HTTP2
                 "decoded field-section limit"
               )
             end
+          end
+          if updated.initial_window_size >
+               @configuration.max_buffered_body_bytes.to_u32
+            raise ArgumentError.new(
+              "SETTINGS_INITIAL_WINDOW_SIZE exceeds the configured " \
+              "body-buffer limit"
+            )
           end
 
           @local_settings_state = updated
@@ -481,7 +604,8 @@ module HTTP2
         if current.state.idle?
           @streams.delete(stream.id)
           current.transition_to(Stream::State::Closed)
-          current.terminate(
+          terminate_stream_unlocked(
+            current,
             CanceledError.new(stream.id, error_code)
           )
           false
@@ -500,9 +624,63 @@ module HTTP2
       raise error unless stream.closed? || stream.terminal_error
     end
 
+    # Returns receive-window credit after application bytes leave a bounded
+    # stream body. Connection credit is always restored; stream credit is
+    # omitted once the peer has ended that stream.
+    #
+    # :nodoc:
+    def release_receive_credit(stream_id : UInt32, amount : Int32) : Nil
+      return if amount <= 0
+
+      wake = @mutex.synchronize do
+        next false if @state.closed?
+
+        queue_connection_credit_unlocked(amount.to_i64)
+        if stream = @streams[stream_id]?
+          state = stream.state
+          if state.open? || state.half_closed_local?
+            @pending_stream_window_updates[stream_id] =
+              (@pending_stream_window_updates[stream_id]? || 0_i64) + amount
+          end
+        end
+        true
+      end
+      wake_flow_control if wake
+    end
+
     private def submit(command : WriteCommand) : Nil
       @submission_mutex.synchronize { enqueue(command) }
       command.wait
+    end
+
+    private def submit_data(frame : Frame::Data) : Nil
+      stream = @mutex.synchronize do
+        active = @streams[frame.stream_id]?
+        unless active
+          raise ClosedError.new(
+            "HTTP/2 stream #{frame.stream_id} is closed"
+          )
+        end
+        active
+      end
+      command = WriteCommand.data(frame, stream)
+      enqueue_data(command, stream)
+      command.wait(stream)
+    end
+
+    private def queue_connection_credit_unlocked(amount : Int64) : Nil
+      return if amount <= 0
+
+      @pending_connection_window_update += amount
+    end
+
+    private def wake_flow_control : Nil
+      select
+      when @flow_control_wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown already woke the writer.
     end
 
     private def send_reset(
@@ -546,40 +724,390 @@ module HTTP2
       raise_terminal_or_state!
     end
 
+    private def enqueue_data(command : WriteCommand, stream : Stream) : Nil
+      current_state = state
+      if current_state.new?
+        raise InvalidStateError.new("connection has not been started")
+      end
+      raise_terminal_or_state! if current_state.closed?
+
+      select
+      when @data_queue.send(command)
+      when stream.terminal_signal.receive?
+        if error = stream.terminal_error
+          raise error
+        end
+        raise ClosedError.new("HTTP/2 stream #{stream.id} is closed")
+      end
+    rescue Channel::ClosedError
+      raise_terminal_or_state!
+    end
+
     private def writer_loop : Nil
-      while command = @write_queue.receive?
-        if error = terminal_error
-          command.complete(error)
+      loop do
+        if command = poll_write_command
+          process_write_command(command)
+          next
+        end
+        break if terminal_error
+
+        if frames = take_pending_window_updates
+          write_scheduled_frames(frames)
           next
         end
 
-        begin
-          prepare_outbound(command)
-          if table_size = command.encoder_table_size
-            @encoder.resize_table(table_size)
+        if can_accept_pending_data?
+          if command = poll_data_command
+            enqueue_pending_data(command)
           end
-          frames = materialize_frames(command)
-        rescue error
-          command.complete(error)
+        end
+
+        if scheduled = next_scheduled_data_frame
+          command, frame = scheduled
+          if write_scheduled_data(command, frame)
+            finish_scheduled_data(command, frame)
+          end
           next
         end
 
-        begin
-          @transport.write(Preface) if command.preface?
-          frames.each(&.write(@transport))
-          @transport.flush
-          command.complete
-        rescue error
-          command.complete(error)
-          terminate(error)
-        end
+        wait_for_writer_work
       end
     ensure
       error = terminal_error || ClosedError.new("HTTP/2 writer stopped")
       while command = @write_queue.receive?
         command.complete(error)
       end
+      while command = @data_queue.receive?
+        command.complete(error)
+      end
+      fail_pending_data(error)
       @writer_done.close
+    end
+
+    private def poll_write_command : WriteCommand?
+      command = nil
+      select
+      when received = @write_queue.receive?
+        command = received
+      else
+      end
+      command
+    end
+
+    private def poll_data_command : WriteCommand?
+      command = nil
+      select
+      when received = @data_queue.receive?
+        command = received
+      else
+      end
+      command
+    end
+
+    private def wait_for_writer_work : Nil
+      if can_accept_pending_data?
+        select
+        when command = @write_queue.receive?
+          process_write_command(command) if command
+        when command = @data_queue.receive?
+          enqueue_pending_data(command) if command
+        when @flow_control_wakeup.receive?
+        end
+      else
+        select
+        when command = @write_queue.receive?
+          process_write_command(command) if command
+        when @flow_control_wakeup.receive?
+        end
+      end
+    end
+
+    private def can_accept_pending_data? : Bool
+      @pending_data_count < @configuration.writer_queue_capacity
+    end
+
+    private def process_write_command(command : WriteCommand) : Nil
+      if command.data_block
+        if error = terminal_error
+          command.complete(error)
+        else
+          enqueue_pending_data(command)
+        end
+        return
+      end
+      if error = terminal_error
+        command.complete(error)
+        return
+      end
+
+      begin
+        prepare_outbound(command)
+        if table_size = command.encoder_table_size
+          @encoder.resize_table(table_size)
+        end
+        frames = materialize_frames(command)
+      rescue error
+        command.complete(error)
+        return
+      end
+
+      begin
+        @transport.write(Preface) if command.preface?
+        frames.each(&.write(@transport))
+        @transport.flush
+        command.complete
+      rescue error
+        command.complete(error)
+        terminate(error)
+      end
+    end
+
+    private def write_scheduled_frames(frames : Array(Frames)) : Nil
+      frames.each(&.write(@transport))
+      @transport.flush
+    rescue error
+      terminate(error)
+    end
+
+    private def enqueue_pending_data(command : WriteCommand) : Nil
+      block = command.data_block
+      unless block
+        command.complete(
+          InvalidStateError.new("DATA command has no DATA block")
+        )
+        return
+      end
+
+      queue = @pending_data[block.stream_id]?
+      unless queue
+        queue = Deque(WriteCommand).new
+        @pending_data[block.stream_id] = queue
+        @data_schedule << block.stream_id
+      end
+      queue << command
+      @pending_data_count += 1
+    end
+
+    private def next_scheduled_data_frame : Tuple(WriteCommand, Frame::Data)?
+      candidates = @data_schedule.size
+      candidates.times do
+        stream_id = @data_schedule.shift
+        queue = @pending_data[stream_id]
+        command = queue.first
+
+        if error = data_command_error(command)
+          queue.shift.complete(error)
+          @pending_data_count -= 1
+          retain_data_stream(stream_id, queue)
+          next
+        end
+
+        begin
+          frame = plan_scheduled_data_frame(command)
+        rescue error
+          queue.shift.complete(error)
+          @pending_data_count -= 1
+          retain_data_stream(stream_id, queue)
+          next
+        end
+
+        unless frame
+          @data_schedule << stream_id
+          next
+        end
+
+        return {command, frame}
+      end
+      nil
+    end
+
+    private def data_command_error(command : WriteCommand) : Exception?
+      @mutex.synchronize do
+        if error = @terminal_error
+          error
+        elsif block = command.data_block
+          if error = block.stream.terminal_error
+            error
+          elsif current = @streams[block.stream_id]?
+            if current.same?(block.stream)
+              nil
+            else
+              ClosedError.new(
+                "HTTP/2 stream #{block.stream_id} is closed"
+              )
+            end
+          else
+            ClosedError.new(
+              "HTTP/2 stream #{block.stream_id} is closed"
+            )
+          end
+        else
+          InvalidStateError.new("DATA command has no DATA block")
+        end
+      end
+    end
+
+    private def plan_scheduled_data_frame(
+      command : WriteCommand,
+    ) : Frame::Data?
+      block = command.data_block
+      unless block
+        raise InvalidStateError.new("DATA command has no DATA block")
+      end
+
+      @mutex.synchronize do
+        raise_terminal_or_state_unlocked! if @state.closed?
+        stream = @streams[block.stream_id]?
+        unless stream
+          raise ClosedError.new(
+            "HTTP/2 stream #{block.stream_id} is closed"
+          )
+        end
+
+        max_frame_size = @peer_settings_state.max_frame_size.to_i64
+        flow_size = if block.padded?
+                      size = block.frame.payload.size.to_i64
+                      if size > max_frame_size
+                        raise ArgumentError.new(
+                          "padded DATA payload exceeds the peer maximum frame size"
+                        )
+                      end
+                      size
+                    else
+                      remaining = block.remaining.to_i64
+                      if remaining.zero?
+                        0_i64
+                      else
+                        available = [
+                          remaining,
+                          max_frame_size,
+                          @connection_send_window,
+                          stream.send_window,
+                        ].min
+                        next if available <= 0
+                        available
+                      end
+                    end
+
+        if flow_size > 0 &&
+           (@connection_send_window < flow_size ||
+           stream.send_window < flow_size)
+          next
+        end
+
+        frame = block.build_frame(
+          block.padded? ? block.frame.data.size : flow_size.to_i32
+        )
+        plans = {} of UInt32 => OutboundTransition
+        plan_outbound_data_unlocked(
+          plans,
+          frame,
+          @highest_local_opened_stream_id
+        )
+
+        @connection_send_window -= frame.payload.size.to_i64
+        stream.adjust_send_window(-frame.payload.size.to_i64)
+        plans.each_value do |plan|
+          apply_outbound_transition_unlocked(plan)
+        end
+        frame
+      end
+    end
+
+    private def write_scheduled_data(
+      command : WriteCommand,
+      frame : Frame::Data,
+    ) : Bool
+      frame.write(@transport)
+      @transport.flush
+      true
+    rescue error
+      command.complete(error)
+      terminate(error)
+      false
+    end
+
+    private def finish_scheduled_data(
+      command : WriteCommand,
+      frame : Frame::Data,
+    ) : Nil
+      block = command.data_block
+      return unless block
+
+      block.advance(frame)
+      stream_id = block.stream_id
+      queue = @pending_data[stream_id]
+      if block.complete?
+        queue.shift
+        @pending_data_count -= 1
+        command.complete
+      end
+      retain_data_stream(stream_id, queue)
+    end
+
+    private def retain_data_stream(
+      stream_id : UInt32,
+      queue : Deque(WriteCommand),
+    ) : Nil
+      if queue.empty?
+        @pending_data.delete(stream_id)
+      else
+        @data_schedule << stream_id
+      end
+    end
+
+    private def fail_pending_data(error : Exception) : Nil
+      @pending_data.each_value do |queue|
+        queue.each(&.complete(error))
+      end
+      @pending_data.clear
+      @data_schedule.clear
+      @pending_data_count = 0
+    end
+
+    private def take_pending_window_updates : Array(Frames)?
+      @mutex.synchronize do
+        return if @pending_connection_window_update.zero? &&
+                  @pending_stream_window_updates.empty?
+
+        frames = [] of Frames
+        append_window_updates(
+          frames,
+          0_u32,
+          @pending_connection_window_update
+        )
+        @connection_receive_window += @pending_connection_window_update
+        @pending_connection_window_update = 0_i64
+
+        @pending_stream_window_updates.each do |stream_id, amount|
+          stream = @streams[stream_id]?
+          next unless stream
+
+          state = stream.state
+          next unless state.open? || state.half_closed_local?
+
+          stream.adjust_receive_window(amount)
+          append_window_updates(frames, stream_id, amount)
+        end
+        @pending_stream_window_updates.clear
+        frames.empty? ? nil : frames
+      end
+    end
+
+    private def append_window_updates(
+      frames : Array(Frames),
+      stream_id : UInt32,
+      amount : Int64,
+    ) : Nil
+      maximum = FrameHeader::MAX_STREAM_ID.to_i64
+      while amount > 0
+        increment = Math.min(amount, maximum)
+        frames << Frame::WindowUpdate.new(
+          stream_id,
+          increment.to_u32
+        )
+        amount -= increment
+      end
     end
 
     private def transport_closer_loop : Nil
@@ -738,7 +1266,9 @@ module HTTP2
       when Frame::GoAway
         handle_goaway(event)
       when Frame::WindowUpdate
-        dispatch_stream_event(event) unless event.stream_id.zero?
+        handle_window_update(event)
+      when Frame::Data
+        handle_inbound_data(event)
       when Frame::Unknown
         # RFC 9113 requires unknown frame types to be ignored.
       when FieldSection
@@ -833,7 +1363,10 @@ module HTTP2
         promised = Stream.new(
           self,
           promised_id,
-          @configuration.stream_event_capacity
+          @configuration.stream_event_capacity,
+          @peer_settings_state.initial_window_size.to_i64,
+          @effective_local_settings_state.initial_window_size.to_i64,
+          @configuration.max_buffered_body_bytes
         )
         transition = Stream::StateMachine.reserve_remote(promised.state)
         promised.transition_to(
@@ -879,11 +1412,6 @@ module HTTP2
 
     private def dispatch_stream_event(event : StreamEvent) : Nil
       case event
-      when Frame::Data
-        transition_and_deliver(
-          event,
-          event.end_stream? ? Stream::Event::ReceiveDataEndStream : Stream::Event::ReceiveData
-        )
       when FieldSection
         transition_and_deliver(
           event,
@@ -893,13 +1421,182 @@ module HTTP2
         handle_inbound_reset(event)
       when Frame::Priority
         transition_and_deliver(event, Stream::Event::ReceivePriority)
-      when Frame::WindowUpdate
-        transition_and_deliver(event, Stream::Event::ReceiveWindowUpdate)
       else
         raise InvalidStateError.new(
           "unexpected stream event #{event.class}"
         )
       end
+    end
+
+    private def handle_window_update(
+      frame : Frame::WindowUpdate,
+    ) : Nil
+      increment = frame.window_size_increment.to_i64
+      if frame.stream_id.zero?
+        @mutex.synchronize do
+          updated = @connection_send_window + increment
+          if updated > FrameHeader::MAX_STREAM_ID.to_i64
+            raise ProtocolError.new(
+              "connection flow-control window exceeded the protocol maximum",
+              ErrorCode::FLOW_CONTROL_ERROR
+            )
+          end
+          @connection_send_window = updated
+        end
+        wake_flow_control
+        return
+      end
+
+      changed = @mutex.synchronize do
+        resolved = resolve_inbound_transition_unlocked(
+          frame.stream_id,
+          Stream::Event::ReceiveWindowUpdate
+        )
+        next false unless resolved
+
+        state, transition = resolved
+        stream = @streams[frame.stream_id]?
+        next false unless stream
+
+        stream.transition_to(transition.next_state || state)
+        next false unless state.open? || state.half_closed_remote?
+
+        updated = stream.send_window + increment
+        if updated > FrameHeader::MAX_STREAM_ID.to_i64
+          raise ProtocolError.new(
+            "stream #{frame.stream_id} flow-control window exceeded " \
+            "the protocol maximum",
+            ErrorCode::FLOW_CONTROL_ERROR,
+            ErrorScope::Stream,
+            frame.stream_id
+          )
+        end
+        stream.adjust_send_window(increment)
+        true
+      end
+      wake_flow_control if changed
+    end
+
+    private def handle_inbound_data(frame : Frame::Data) : Nil
+      flow_size = frame.payload.size.to_i64
+      begin
+        stream, ignored = accept_inbound_data(frame, flow_size)
+
+        if ignored || stream.nil?
+          release_discarded_connection_credit(flow_size)
+          return
+        end
+
+        data = frame.data.dup
+        unless stream.deliver_data(data)
+          release_discarded_connection_credit(flow_size)
+          return if stream.body.closed? || stream.terminal_error
+
+          raise QueueFullError.new(
+            "stream #{stream.id} body reached its configured byte limit"
+          )
+        end
+
+        overhead = frame.payload.size - data.size
+        release_receive_credit(stream.id, overhead) if overhead > 0
+        stream.finish_body if frame.end_stream?
+      rescue error : ProtocolError
+        release_discarded_connection_credit(flow_size) if error.stream?
+        raise error
+      end
+    end
+
+    private def accept_inbound_data(
+      frame : Frame::Data,
+      flow_size : Int64,
+    ) : Tuple(Stream?, Bool)
+      @mutex.synchronize do
+        charge_connection_receive_window_unlocked(flow_size)
+        event = if frame.end_stream?
+                  Stream::Event::ReceiveDataEndStream
+                else
+                  Stream::Event::ReceiveData
+                end
+        resolved = resolve_inbound_transition_unlocked(
+          frame.stream_id,
+          event
+        )
+        next {nil, true} unless resolved
+        state, transition = resolved
+
+        stream = @streams[frame.stream_id]?
+        next {nil, true} unless stream
+
+        charge_stream_receive_window_unlocked(
+          stream,
+          frame.stream_id,
+          flow_size
+        )
+        apply_inbound_data_transition_unlocked(
+          stream,
+          frame.stream_id,
+          state,
+          transition
+        )
+        {stream, false}
+      end
+    end
+
+    private def charge_connection_receive_window_unlocked(
+      flow_size : Int64,
+    ) : Nil
+      @connection_receive_window -= flow_size
+      return unless @connection_receive_window < 0
+
+      raise ProtocolError.new(
+        "peer exceeded the connection flow-control window",
+        ErrorCode::FLOW_CONTROL_ERROR
+      )
+    end
+
+    private def charge_stream_receive_window_unlocked(
+      stream : Stream,
+      stream_id : UInt32,
+      flow_size : Int64,
+    ) : Nil
+      receive_window = stream.adjust_receive_window(-flow_size)
+      return unless receive_window < 0
+
+      raise ProtocolError.new(
+        "peer exceeded stream #{stream_id}'s flow-control window",
+        ErrorCode::FLOW_CONTROL_ERROR,
+        ErrorScope::Stream,
+        stream_id
+      )
+    end
+
+    private def apply_inbound_data_transition_unlocked(
+      stream : Stream,
+      stream_id : UInt32,
+      state : Stream::State,
+      transition : Stream::StateMachine::Transition,
+    ) : Nil
+      next_state = transition.next_state || state
+      stream.transition_to(next_state)
+      return unless next_state.closed?
+
+      @streams.delete(stream_id)
+      retain_closed_stream_unlocked(
+        stream_id,
+        ClosedStream::Reason::EndStream
+      )
+    end
+
+    private def release_discarded_connection_credit(amount : Int64) : Nil
+      return if amount <= 0
+
+      wake = @mutex.synchronize do
+        next false if @state.closed?
+
+        queue_connection_credit_unlocked(amount)
+        true
+      end
+      wake_flow_control if wake
     end
 
     private def transition_and_deliver(
@@ -938,6 +1635,9 @@ module HTTP2
         raise QueueFullError.new(
           "stream #{stream.id} event queue reached its configured limit"
         )
+      end
+      if section = event.as?(FieldSection)
+        stream.finish_body if section.end_stream?
       end
     end
 
@@ -1008,9 +1708,11 @@ module HTTP2
       end
       return if ignored || stream.nil?
 
-      stream.terminate(
+      discarded = stream.terminate(
         StreamResetError.new(frame.stream_id, frame.error_code)
       )
+      release_discarded_connection_credit(discarded.to_i64)
+      wake_flow_control
     end
 
     private def stream_state_unlocked(stream_id : UInt32) : Stream::State
@@ -1051,10 +1753,14 @@ module HTTP2
     private def apply_peer_settings(settings : Frame::Settings) : Int32?
       previous, updated = @mutex.synchronize do
         previous = @peer_settings_state
-        @peer_settings_state = @peer_settings_state.with_peer(settings.entries)
+        next_settings = previous.with_peer(settings.entries)
+        apply_peer_initial_window_size_unlocked(previous, next_settings)
+        @peer_settings_state = next_settings
         @peer_settings = settings
-        {previous, @peer_settings_state}
+        {previous, next_settings}
       end
+      wake_flow_control if previous.initial_window_size !=
+                             updated.initial_window_size
 
       return if previous.header_table_size == updated.header_table_size
 
@@ -1087,6 +1793,10 @@ module HTTP2
 
         prior_settings = @effective_local_settings_state
         effective_settings = pending.settings
+        apply_local_initial_window_size_unlocked(
+          prior_settings,
+          effective_settings
+        )
         @effective_local_settings_state = effective_settings
         {prior_settings, effective_settings}
       end
@@ -1125,12 +1835,14 @@ module HTTP2
               id,
               ClosedStream::Reason::GoAway
             )
-            stream.terminate(
+            terminate_stream_unlocked(
+              stream,
               UnprocessedStreamError.new(id, frame)
             )
           end
         end
       end
+      wake_flow_control
     end
 
     private def handle_stream_violation(error : ProtocolError) : Nil
@@ -1220,8 +1932,10 @@ module HTTP2
       return unless terminated
 
       @write_queue.close
+      @data_queue.close
       @transport_close_signal.close
       @settings_timer_wakeup.close
+      @flow_control_wakeup.close
       @handshake_done.close
       @closed_signal.close
 
@@ -1388,10 +2102,56 @@ module HTTP2
       previous : SettingsState,
       updated : SettingsState,
     ) : Nil
-      # Phase 5 applies INITIAL_WINDOW_SIZE deltas to live streams. The
-      # decoder limit changes only when the corresponding SETTINGS is ACKed.
+      # Decoder limits change only when the corresponding SETTINGS is ACKed.
       if previous.header_table_size != updated.header_table_size
         @decoder.max_table_size = updated.header_table_size.to_i32
+      end
+    end
+
+    private def apply_peer_initial_window_size_unlocked(
+      previous : SettingsState,
+      updated : SettingsState,
+    ) : Nil
+      return if previous.initial_window_size == updated.initial_window_size
+
+      delta = updated.initial_window_size.to_i64 -
+              previous.initial_window_size.to_i64
+      changes = [] of Tuple(Stream, Int64)
+      @streams.each_value do |stream|
+        state = stream.state
+        value = if state.idle?
+                  updated.initial_window_size.to_i64
+                elsif state.open? || state.half_closed_remote?
+                  stream.send_window + delta
+                else
+                  next
+                end
+        if value > FrameHeader::MAX_STREAM_ID.to_i64
+          raise ProtocolError.new(
+            "SETTINGS_INITIAL_WINDOW_SIZE overflowed a stream window",
+            ErrorCode::FLOW_CONTROL_ERROR
+          )
+        end
+        changes << {stream, value}
+      end
+      changes.each do |stream, value|
+        stream.send_window = value
+      end
+    end
+
+    private def apply_local_initial_window_size_unlocked(
+      previous : SettingsState,
+      updated : SettingsState,
+    ) : Nil
+      delta = updated.initial_window_size.to_i64 -
+              previous.initial_window_size.to_i64
+      @streams.each_value do |stream|
+        state = stream.state
+        if state.idle?
+          stream.receive_window = updated.initial_window_size.to_i64
+        elsif state.open? || state.half_closed_local?
+          stream.adjust_receive_window(delta)
+        end
       end
     end
 
@@ -1692,7 +2452,19 @@ module HTTP2
         retain_closed_stream_unlocked(plan.stream.id, reason)
       end
       if error = plan.close_error
-        plan.stream.terminate(error)
+        terminate_stream_unlocked(plan.stream, error)
+      end
+    end
+
+    private def terminate_stream_unlocked(
+      stream : Stream,
+      error : Exception,
+    ) : Nil
+      discarded = stream.terminate(error)
+      @pending_stream_window_updates.delete(stream.id)
+      if discarded > 0
+        queue_connection_credit_unlocked(discarded.to_i64)
+        wake_flow_control
       end
     end
 

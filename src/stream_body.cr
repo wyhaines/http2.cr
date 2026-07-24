@@ -1,0 +1,165 @@
+require "deque"
+
+module HTTP2
+  # A bounded, read-only stream of inbound DATA octets.
+  #
+  # Flow-control credit is returned only after bytes leave this buffer. Closing
+  # an unfinished body discards its buffered bytes and cancels the stream.
+  class StreamBody < IO
+    @chunks = Deque(Bytes).new
+    @chunk_offset = 0
+    @buffered_bytes = 0
+    @finished = false
+    @closed = false
+    @terminal_error : Exception?
+    @mutex = Mutex.new
+    @read_mutex = Mutex.new
+    @wakeup = Channel(Nil).new(1)
+
+    getter capacity : Int32
+
+    def initialize(
+      @capacity : Int32,
+      @on_consumed : Int32 -> Nil,
+      @on_cancel : -> Nil,
+    )
+      if @capacity <= 0
+        raise ArgumentError.new("stream body capacity must be positive")
+      end
+    end
+
+    def read(slice : Bytes) : Int32
+      return 0 if slice.empty?
+
+      @read_mutex.synchronize do
+        loop do
+          count, error, wait = @mutex.synchronize do
+            if chunk = @chunks.first?
+              available = chunk.size - @chunk_offset
+              count = Math.min(slice.size, available)
+              slice[0, count].copy_from(chunk[@chunk_offset, count])
+              @chunk_offset += count
+              @buffered_bytes -= count
+
+              if @chunk_offset == chunk.size
+                @chunks.shift
+                @chunk_offset = 0
+              end
+              {count, nil, false}
+            elsif error = @terminal_error
+              {0, error, false}
+            elsif @finished || @closed
+              {0, nil, false}
+            else
+              {0, nil, true}
+            end
+          end
+
+          if wait
+            @wakeup.receive?
+            next
+          end
+
+          raise error if error
+          @on_consumed.call(count) if count > 0
+          return count
+        end
+      end
+    end
+
+    def write(slice : Bytes) : NoReturn
+      raise IO::Error.new("HTTP/2 response bodies are read-only")
+    end
+
+    def close : Nil
+      discarded, cancel = @mutex.synchronize do
+        if @closed
+          {0, false}
+        else
+          @closed = true
+          discarded = discard_unlocked
+          {discarded, !@finished && @terminal_error.nil?}
+        end
+      end
+
+      notify
+      @on_consumed.call(discarded) if discarded > 0
+      @on_cancel.call if cancel
+    end
+
+    def closed? : Bool
+      @mutex.synchronize { @closed }
+    end
+
+    def finished? : Bool
+      @mutex.synchronize { @finished }
+    end
+
+    def buffered_bytes : Int32
+      @mutex.synchronize { @buffered_bytes }
+    end
+
+    # :nodoc:
+    def enqueue(data : Bytes) : Bool
+      return true if data.empty?
+
+      accepted = @mutex.synchronize do
+        next false if @closed || @finished || @terminal_error
+        next false if data.size > @capacity - @buffered_bytes
+
+        @chunks << data
+        @buffered_bytes += data.size
+        true
+      end
+      notify if accepted
+      accepted
+    end
+
+    # :nodoc:
+    def finish : Nil
+      changed = @mutex.synchronize do
+        if @finished || @terminal_error
+          false
+        else
+          @finished = true
+          true
+        end
+      end
+      notify if changed
+    end
+
+    # Marks the body terminal, discards buffered data, and returns the number
+    # of flow-controlled application octets that were discarded.
+    #
+    # :nodoc:
+    def terminate(error : Exception) : Int32
+      discarded, changed = @mutex.synchronize do
+        if @terminal_error || @closed
+          {0, false}
+        else
+          @terminal_error = error
+          {discard_unlocked, true}
+        end
+      end
+      notify if changed
+      discarded
+    end
+
+    private def discard_unlocked : Int32
+      discarded = @buffered_bytes
+      @chunks.clear
+      @chunk_offset = 0
+      @buffered_bytes = 0
+      discarded
+    end
+
+    private def notify : Nil
+      select
+      when @wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # No wakeup is needed after the body has been abandoned.
+    end
+  end
+end

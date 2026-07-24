@@ -15,6 +15,8 @@ module HTTP2
       getter max_encoder_table_size : Int32
       getter max_decoder_table_size : Int32
       getter max_retained_closed_streams : Int32
+      getter max_buffered_body_bytes : Int32
+      getter outbound_data_chunk_size : Int32
 
       def initialize(
         @inbound_max_frame_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
@@ -28,6 +30,8 @@ module HTTP2
         @max_encoder_table_size : Int32 = 64 * 1024,
         @max_decoder_table_size : Int32 = 64 * 1024,
         @max_retained_closed_streams : Int32 = 256,
+        @max_buffered_body_bytes : Int32 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i32,
+        @outbound_data_chunk_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
         initial_settings : Enumerable(Frame::Settings::Setting) = [] of Frame::Settings::Setting,
       )
         @max_decoded_string_size =
@@ -41,6 +45,7 @@ module HTTP2
         synchronize_advertised_frame_size!
         synchronize_advertised_header_table_size!
         synchronize_advertised_field_section_size!
+        synchronize_advertised_initial_window_size!
         SettingsState.client_defaults.with_local(@initial_settings)
       end
 
@@ -69,6 +74,17 @@ module HTTP2
         if @max_retained_closed_streams <= 0
           raise ArgumentError.new(
             "maximum retained closed-stream count must be positive"
+          )
+        end
+        if @max_buffered_body_bytes <= 0
+          raise ArgumentError.new(
+            "maximum buffered body bytes must be positive"
+          )
+        end
+        unless 0 < @outbound_data_chunk_size <= FrameHeader::MAX_PAYLOAD
+          raise ArgumentError.new(
+            "outbound DATA chunk size must be between 1 and " \
+            "#{FrameHeader::MAX_PAYLOAD}"
           )
         end
       end
@@ -193,6 +209,28 @@ module HTTP2
           @initial_settings << Frame::Settings::Setting.new(
             Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE,
             @max_decoded_field_section_size.to_u32
+          )
+        end
+      end
+
+      private def synchronize_advertised_initial_window_size!
+        identifier = Frame::Settings::Identifier::INITIAL_WINDOW_SIZE.to_u16
+        advertised = @initial_settings.reverse_each.find do |setting|
+          setting.identifier == identifier
+        end
+
+        if advertised
+          if advertised.value > @max_buffered_body_bytes.to_u32
+            raise ArgumentError.new(
+              "SETTINGS_INITIAL_WINDOW_SIZE exceeds " \
+              "max_buffered_body_bytes"
+            )
+          end
+        elsif @max_buffered_body_bytes <
+                SettingsState::DEFAULT_INITIAL_WINDOW_SIZE
+          @initial_settings << Frame::Settings::Setting.new(
+            Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+            @max_buffered_body_bytes.to_u32
           )
         end
       end

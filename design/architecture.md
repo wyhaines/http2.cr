@@ -47,10 +47,16 @@ writer is the sole owner of outbound ordering, HPACK encoding, header
 fragmentation, and wire writes. It accepts bounded commands, including atomic
 frame batches for HEADERS/CONTINUATION sequences.
 
-Application code never executes on the reader fiber. Phase 2 uses bounded,
-nonblocking per-stream mailboxes; a full mailbox terminates the connection
-instead of stalling its reader. Phase 5 will replace raw DATA delivery with
-bounded body pipes whose consumption controls flow-control credit.
+Application code never executes on the reader fiber. Non-DATA events use
+bounded, nonblocking per-stream mailboxes; a full mailbox terminates the
+connection instead of stalling its reader. DATA enters bounded per-stream body
+readers. Application consumption returns receive credit, while the writer
+sends resulting WINDOW_UPDATE frames without blocking the reader.
+
+Outbound DATA commands are bounded chunks scheduled round-robin across streams.
+The writer splits them by the peer frame size and both send windows. Blocked
+DATA remains pending outside the control queue, so SETTINGS, PING, GOAWAY,
+RST_STREAM, HEADERS, and WINDOW_UPDATE continue to make progress.
 
 Transport shutdown runs in the connection's transport scheduler and joins both
 protocol fibers. This keeps socket event-loop ownership consistent and makes a
@@ -87,5 +93,5 @@ input may cause unbounded allocation.
   bounded decoded field sections.
 - Phase 4 completes stream lifecycle enforcement, concurrency limits, reset
   and cancellation behavior, GOAWAY, PING, and push-disabled operation.
-- Phase 5 adds connection and stream flow control plus bounded streaming DATA
+- Phase 5 owns connection and stream flow control plus bounded streaming DATA
   delivery without changing frame-codec ownership.

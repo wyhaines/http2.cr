@@ -13,8 +13,9 @@ The current code is not ready for production use. Its frame codec, transport
 runtime, SETTINGS state, persistent inbound and outbound HPACK contexts, and
 bounded field-block processing are covered. Stream state, concurrency limits,
 reset and cancellation behavior, GOAWAY, PING, and push-disabled operation are
-also implemented. Flow control, streaming DATA, and the HTTP client API remain
-unfinished.
+also implemented. Independent connection/stream flow control, fair streaming
+DATA output, and bounded response body readers are implemented. HTTP semantics
+and the public client API remain unfinished.
 
 Development is organized in ordered phases:
 
