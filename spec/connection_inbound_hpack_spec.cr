@@ -134,6 +134,62 @@ describe HTTP2::Connection do
     end
   end
 
+  it "bounds decoded field count while preserving decoder state" do
+    UNIXSocket.pair do |client, peer|
+      configuration = HTTP2::Connection::Configuration.new(
+        max_decoded_fields: 2
+      )
+      stream_ids = Channel(Tuple(UInt32, UInt32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        first_id, second_id = stream_ids.receive
+        read_client_headers(io, first_id)
+        read_client_headers(io, second_id)
+
+        write_inbound_field_block(
+          io,
+          first_id,
+          Bytes[
+            0x88,
+            0x00, 0x01, 0x78, 0x01, 0x61,
+            0x40, 0x01, 0x6b, 0x01, 0x76,
+          ]
+        )
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(first_id)
+        reset.error_code.should eq(
+          HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32
+        )
+
+        write_inbound_field_block(io, second_id, Bytes[0xbe])
+      end
+
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        first_stream = connection.new_stream
+        second_stream = connection.new_stream
+        open_client_stream(first_stream)
+        open_client_stream(second_stream)
+        stream_ids.send({first_stream.id, second_stream.id})
+
+        error = expect_raises(HTTP2::ProtocolError) do
+          first_stream.receive(1.second)
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+
+        section = second_stream.receive(1.second)
+          .as(HTTP2::Connection::FieldSection)
+        section.fields.map { |field| {field.name, field.value} }.should eq([
+          {"k", "v"},
+        ])
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "reports malformed suppressed bytes as a compression error" do
     UNIXSocket.pair do |client, peer|
       configuration = HTTP2::Connection::Configuration.new(

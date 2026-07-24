@@ -32,6 +32,21 @@ describe HTTP2::Request do
     end
   end
 
+  it "reproduces owned bodies but not caller-owned IO bodies" do
+    owned = HTTP2::Request.new("POST", "/", body: "repeat")
+    owned.replayable_body?.should be_true
+    owned.body_for_attempt.try(&.gets_to_end).should eq("repeat")
+    owned.body_for_attempt.try(&.gets_to_end).should eq("repeat")
+
+    streamed = HTTP2::Request.new(
+      "POST",
+      "/",
+      body: IO::Memory.new("once")
+    )
+    streamed.replayable_body?.should be_false
+    streamed.body_for_attempt.should be(streamed.body)
+  end
+
   it "accepts standard headers while preserving repeated values" do
     headers = HTTP::Headers.new
     headers.add("x-value", "one")

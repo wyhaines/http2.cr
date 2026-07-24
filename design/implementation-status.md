@@ -13,7 +13,8 @@ Last updated: 2026-07-24
 | 4 — Stream state and control frames | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 5 — Flow control and streaming DATA | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 6 — HTTP semantics and public client API | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 7–8 | Not started | — |
+| 7 — Shutdown, recovery, and hardening | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
+| 8 — Interoperability and release | Not started | — |
 
 ## Phase 0 Baseline
 
@@ -178,6 +179,35 @@ dialing/reuse, informational responses, request and response trailers, CONNECT,
 malformed field sections, content-length failures, no-content responses,
 timeouts, cancellation, and early response completion.
 
+## Phase 7 Shutdown, Recovery, and Hardening
+
+Phase 7 now:
+
+- sends local `GOAWAY(NO_ERROR)`, refuses new streams while draining, allows
+  established streams to finish, and terminates deterministically at a
+  configurable drain deadline;
+- drains peer GOAWAY connections while selecting a fresh owned connection for
+  new work, preserves provably unprocessed stream errors, validates successive
+  GOAWAY frames, and reciprocates shutdown after a bounded inbound-quiet
+  interval;
+- provides opt-in `Never`, `Idempotent`, and `AnyRequest` replay policies with
+  an attempt cap, retrying only GOAWAY-unprocessed or `REFUSED_STREAM`
+  requests and never replaying caller-owned body IO;
+- bounds registered streams, writer/data queues, outstanding SETTINGS and
+  PING operations, compressed bytes, decoded field bytes/count, body buffers,
+  CONTINUATION frames, and retained closed-stream metadata;
+- supports optional inbound-idle keepalive PING with an acknowledgement
+  timeout and bounds peer control/empty-frame rates with
+  `ENHANCE_YOUR_CALM`;
+- exposes a nonblocking bounded diagnostics channel for frame metadata,
+  settings, lifecycle changes, and typed connection/stream errors without
+  HTTP field values or GOAWAY debug data.
+
+Adversarial tests cover graceful completion and forced drain, safe and refused
+replay decisions, one-shot bodies, open-stream and pending-operation limits,
+decoded-field-count HPACK synchronization, keepalive failure, control/empty
+frame floods, diagnostics backpressure, EOF, and injected write failures.
+
 ## Current Verification
 
 Run from the repository root:
@@ -191,13 +221,13 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 6 gate passes formatting, Ameba, compilation, documentation, and 187
+The Phase 7 gate passes formatting, Ameba, compilation, documentation, and 207
 deterministic examples in normal and `preview_mt` modes in the official Crystal
 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
 deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Begin Phase 7 with graceful local and remote GOAWAY draining, explicit replay
-policy for provably unprocessed requests, drain deadlines, and deterministic
-shutdown/recovery under injected transport failures.
+Begin Phase 8 with hermetic nghttp2 interoperability, frame/field-block fuzz or
+property coverage, release documentation, changelog and versioning policy, and
+a release-candidate process.

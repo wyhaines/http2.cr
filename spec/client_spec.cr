@@ -27,6 +27,225 @@ private def client_read_field_section(
   }
 end
 
+describe "HTTP2::Client recovery" do
+  it "replays a proven-unprocessed owned POST only when explicitly allowed" do
+    server = TCPServer.new("127.0.0.1", 0)
+    peer_result = scripted_peer(server) do |listener_io|
+      listener = listener_io.as(TCPServer)
+
+      first = listener.accept
+      begin
+        complete_server_handshake(first)
+        request = client_read_field_section(first, HPack::Decoder.new)
+        field_pairs(request[:fields]).should contain({":method", "POST"})
+
+        HTTP2::Frame::GoAway.new(
+          0_u32,
+          HTTP2::ErrorCode::NO_ERROR
+        ).write(first)
+        first.flush
+        loop do
+          break if HTTP2::Frame.read(first).is_a?(HTTP2::Frame::GoAway)
+        end
+        first.read(Bytes.new(1)).should eq(0)
+      ensure
+        first.close
+      end
+
+      second = listener.accept
+      begin
+        complete_server_handshake(second)
+        request = client_read_field_section(second, HPack::Decoder.new)
+        field_pairs(request[:fields]).should contain({":method", "POST"})
+        request[:end_stream].should be_false
+
+        body = IO::Memory.new
+        ended = false
+        until ended
+          frame = HTTP2::Frame.read(second)
+          next if frame.is_a?(HTTP2::Frame::WindowUpdate)
+
+          data = frame.as(HTTP2::Frame::Data)
+          data.stream_id.should eq(request[:stream_id])
+          body.write(data.data)
+          ended = data.end_stream?
+        end
+        body.to_s.should eq("repeatable")
+
+        write_server_fields(
+          second,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      ensure
+        second.close
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "http://127.0.0.1:#{server.local_address.port}",
+      replay_policy: HTTP2::Client::ReplayPolicy::AnyRequest,
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 1.second,
+        read: 1.second,
+        write: 1.second
+      )
+    )
+    begin
+      response = http.post("/", "repeatable")
+      response.status.should eq(204)
+      response.stream_id.should eq(1_u32)
+      wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close
+    end
+  end
+
+  it "retries REFUSED_STREAM for an opted-in idempotent request" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+        first = client_read_field_section(io, decoder)
+        HTTP2::Frame::ResetStream.new(
+          first[:stream_id],
+          HTTP2::ErrorCode::REFUSED_STREAM
+        ).write(io)
+        io.flush
+
+        second = client_read_field_section(io, decoder)
+        second[:stream_id].should eq(3_u32)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          second[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        replay_policy: HTTP2::Client::ReplayPolicy::Idempotent
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(204)
+        response.stream_id.should eq(3_u32)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "does not replay GOAWAY streams under the default policy" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        HTTP2::Frame::GoAway.new(
+          0_u32,
+          HTTP2::ErrorCode::NO_ERROR
+        ).write(io)
+        io.flush
+        loop do
+          break if HTTP2::Frame.read(io).is_a?(HTTP2::Frame::GoAway)
+        end
+        request[:stream_id].should eq(1_u32)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      expect_raises(HTTP2::Connection::UnprocessedStreamError) do
+        http.get("/")
+      end
+      wait_for_peer(peer_result)
+      http.close
+    end
+  end
+
+  it "does not replay a caller-owned streaming IO" do
+    server = TCPServer.new("127.0.0.1", 0)
+    peer_result = scripted_peer(server) do |listener_io|
+      listener = listener_io.as(TCPServer)
+      socket = listener.accept
+      begin
+        complete_server_handshake(socket)
+        client_read_field_section(socket, HPack::Decoder.new)
+        HTTP2::Frame::GoAway.new(
+          0_u32,
+          HTTP2::ErrorCode::NO_ERROR
+        ).write(socket)
+        socket.flush
+        loop do
+          break if HTTP2::Frame.read(socket).is_a?(HTTP2::Frame::GoAway)
+        end
+      ensure
+        socket.close
+        listener.close
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "http://127.0.0.1:#{server.local_address.port}",
+      replay_policy: HTTP2::Client::ReplayPolicy::AnyRequest,
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 1.second,
+        read: 1.second,
+        write: 1.second
+      )
+    )
+    begin
+      expect_raises(HTTP2::Connection::UnprocessedStreamError) do
+        http.post("/", IO::Memory.new("one-shot"))
+      end
+      wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close unless server.closed?
+    end
+  end
+
+  it "validates the replay-attempt limit" do
+    expect_raises(ArgumentError, /replay attempt/) do
+      HTTP2::Client.new(
+        "https://example.test",
+        max_replay_attempts: -1
+      )
+    end
+  end
+
+  it "gracefully closes its owned connection" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::NO_ERROR.to_u32)
+        io.read(Bytes.new(1)).should eq(0)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      connection.wait_until_active(1.second)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      http.graceful_close(1.second)
+      http.closed?.should be_true
+      wait_for_peer(peer_result)
+    end
+  end
+end
+
 private def write_server_fields(
   io : IO,
   encoder : HPack::Encoder,

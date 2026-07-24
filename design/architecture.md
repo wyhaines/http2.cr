@@ -44,6 +44,12 @@ request targets must match that origin; ordinary CONNECT targets use authority
 form. This deliberately avoids unsafe cross-origin reuse or implicit
 connection coalescing.
 
+After peer GOAWAY, the client selects a fresh connection for new requests
+while the old connection drains streams at or below the peer's last processed
+ID. Automatic replay is opt-in and applies only to GOAWAY streams proven
+unprocessed or `REFUSED_STREAM`; caller-owned request-body IO is never rewound
+or replayed.
+
 ## Concurrency Model
 
 Each connection has exactly one reader fiber and one writer/scheduler. The
@@ -76,6 +82,9 @@ without discarding an already complete, buffered response body.
 Transport shutdown runs in the connection's transport scheduler and joins both
 protocol fibers. This keeps socket event-loop ownership consistent and makes a
 cross-fiber close deterministic, including under legacy `preview_mt`.
+Graceful shutdown sends GOAWAY, refuses new streams, and joins its drain and
+optional keepalive monitors after established streams finish or the configured
+deadline expires.
 
 ## Transport and Testability
 
@@ -105,9 +114,15 @@ state. A terminal connection result is stored once, closes outbound work, and
 wakes every stream waiter.
 
 Limits are explicit configuration: maximum inbound frame size, compressed and
-decoded field-section sizes, concurrent streams, queued writes, buffered body
-bytes, continuation fragments, and retained closed-stream metadata. No peer
-input may cause unbounded allocation.
+decoded field-section sizes and field count, registered streams, queued
+writes, outstanding SETTINGS and PING operations, buffered body bytes,
+continuation fragments, inbound control/empty-frame rates, diagnostics, and
+retained closed-stream metadata. No peer input may cause unbounded allocation.
+
+Optional keepalive sends one bounded PING after an inbound-idle interval and
+closes the connection if its ACK deadline expires. Structured diagnostics use
+a nonblocking bounded channel; they report frame metadata, settings, lifecycle
+changes, and typed errors without HTTP field values or GOAWAY debug data.
 
 ## Phase Boundaries
 
@@ -122,3 +137,5 @@ input may cause unbounded allocation.
   delivery without changing frame-codec ownership.
 - Phase 6 owns HTTP field/message validation, the ordered request/response
   model, timeout and cancellation policy, and origin-bound connection reuse.
+- Phase 7 owns draining and recovery, explicit safe replay, resource
+  hardening, keepalive, abuse controls, and structured diagnostics.

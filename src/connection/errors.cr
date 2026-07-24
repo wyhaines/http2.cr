@@ -8,10 +8,21 @@ module HTTP2
     class InvalidStateError < Error
     end
 
+    class DrainingError < InvalidStateError
+    end
+
     class ClosedError < Error
     end
 
     class StreamIDExhaustedError < Error
+    end
+
+    class OpenStreamLimitError < InvalidStateError
+      getter limit : Int32
+
+      def initialize(@limit : Int32)
+        super("local open-stream limit #{limit} is exhausted")
+      end
     end
 
     class ConcurrentStreamLimitError < InvalidStateError
@@ -25,7 +36,24 @@ module HTTP2
     class QueueFullError < Error
     end
 
+    class PingLimitError < InvalidStateError
+      getter limit : Int32
+
+      def initialize(@limit : Int32)
+        super("pending PING limit #{limit} is exhausted")
+      end
+    end
+
     class TimeoutError < Error
+    end
+
+    class DrainTimeoutError < TimeoutError
+    end
+
+    class KeepaliveTimeoutError < TimeoutError
+    end
+
+    class DrainedError < ClosedError
     end
 
     class TLSNegotiationError < Error

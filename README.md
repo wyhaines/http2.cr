@@ -17,8 +17,9 @@ also implemented. Independent connection/stream flow control, fair streaming
 DATA output, and bounded response body readers are implemented. The public
 origin-bound client now validates HTTP/2 messages and supports concurrent
 requests, streaming request and response bodies, informational responses,
-trailers, timeouts, and cancellation. Graceful recovery, adversarial
-hardening, and independent interoperability work remain.
+trailers, timeouts, and cancellation. Graceful GOAWAY draining, opt-in safe
+replay, keepalive, bounded abuse controls, and structured diagnostics are also
+implemented. Independent interoperability and release hardening remain.
 
 Development is organized in ordered phases:
 
@@ -49,6 +50,7 @@ require "http2"
 
 client = HTTP2::Client.new(
   "https://example.com",
+  replay_policy: HTTP2::Client::ReplayPolicy::Idempotent,
   timeouts: HTTP2::Client::Timeouts.new(
     connect: 5.seconds,
     read: 30.seconds,
@@ -66,7 +68,7 @@ begin
   puts response.body.gets_to_end
   pp response.trailers
 ensure
-  client.close
+  client.graceful_close
 end
 ```
 
@@ -78,7 +80,24 @@ prior knowledge. HTTPS verifies the certificate and hostname and requires ALPN
 data and is not read until the peer returns a successful response; either
 tunnel direction can then close independently.
 
-Redirects, cookies, content decompression, retries, and cross-origin connection
+Automatic replay is disabled by default. `Idempotent` or `AnyRequest` retries
+only a request proven unprocessed by GOAWAY or `REFUSED_STREAM`, up to
+`max_replay_attempts`. Nil, String, and Bytes bodies can be reproduced;
+caller-owned streaming `IO` is never replayed.
+
+`Client#graceful_close` sends GOAWAY and waits for established streams until
+`Connection::Configuration#drain_timeout`; `#close` remains an immediate,
+idempotent cancellation. Connection configuration also bounds open streams,
+queued work, field sections, buffered bodies, control/empty-frame rates, and
+retained closed-stream state. Optional keepalive is enabled with
+`keepalive_interval`.
+
+Advanced users can consume `Connection#diagnostics`, a bounded channel of
+frame metadata, settings, lifecycle changes, and typed errors. Diagnostics
+exclude HTTP field values and GOAWAY debug data; check
+`#dropped_diagnostic_count` when the consumer is slower than the connection.
+
+Redirects, cookies, content decompression, and cross-origin connection
 coalescing are intentionally not client policy in this shard.
 
 ## Development

@@ -11,6 +11,21 @@ module HTTP2
     class ClosedError < HTTPError
     end
 
+    # Opt-in policy for replaying only requests that the peer proves were not
+    # processed through GOAWAY or RST_STREAM(REFUSED_STREAM).
+    enum ReplayPolicy
+      Never
+      Idempotent
+      AnyRequest
+
+      def allows?(method : String) : Bool
+        return false if never?
+        return true if any_request?
+
+        method.in?("GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE")
+      end
+    end
+
     # Per-operation deadlines. Nil disables the corresponding timeout.
     #
     # `connect` covers DNS and TCP dialing, `read` covers transport reads and
@@ -58,9 +73,12 @@ module HTTP2
 
     getter timeouts : Timeouts
     getter connection_configuration : Connection::Configuration
+    getter replay_policy : ReplayPolicy
+    getter max_replay_attempts : Int32
 
     @origin : Origin
     @connection : Connection?
+    @retired_connections = [] of Connection
     @supplied_connection : Bool
     @closed = false
     @mutex = Mutex.new
@@ -74,8 +92,15 @@ module HTTP2
       @timeouts : Timeouts = Timeouts.new,
       @connection_configuration : Connection::Configuration = Connection::Configuration.new,
       @tls_context : OpenSSL::SSL::Context::Client = OpenSSL::SSL::Context::Client.new,
+      @replay_policy : ReplayPolicy = ReplayPolicy::Never,
+      @max_replay_attempts : Int32 = 1,
       connection : Connection? = nil,
     )
+      if @max_replay_attempts < 0
+        raise ArgumentError.new(
+          "maximum replay attempt count cannot be negative"
+        )
+      end
       uri = origin.is_a?(URI) ? origin : URI.parse(origin)
       @origin = parse_origin(uri, require_origin_only: true)
       @connection = connection
@@ -149,6 +174,33 @@ module HTTP2
         raise RequestCanceledError.new("HTTP/2 request was canceled")
       end
 
+      replay_attempts = 0
+      draining_retries = 0
+      loop do
+        begin
+          return perform_request(request, cancellation)
+        rescue error : Connection::DrainingError
+          draining_retries += 1
+          raise error if @supplied_connection || draining_retries > 1
+          check_cancellation!(cancellation)
+        rescue error : Connection::UnprocessedStreamError
+          unless should_replay?(request, error, replay_attempts, cancellation)
+            raise error
+          end
+          replay_attempts += 1
+        rescue error : Connection::StreamResetError
+          unless should_replay?(request, error, replay_attempts, cancellation)
+            raise error
+          end
+          replay_attempts += 1
+        end
+      end
+    end
+
+    private def perform_request(
+      request : Request,
+      cancellation : Cancellation?,
+    ) : Response
       prepared = prepare(request)
       connection = ready_connection
       check_cancellation!(cancellation)
@@ -207,15 +259,28 @@ module HTTP2
 
     # Closes the reusable origin connection and cancels unfinished requests.
     def close : Nil
-      connection = @mutex.synchronize do
-        next if @closed
+      connections = take_connections_for_close
+      connections.each(&.close)
+    end
 
-        @closed = true
-        current = @connection
-        @connection = nil
-        current
+    # Gracefully drains all connections currently owned by this client.
+    def graceful_close(
+      timeout : Time::Span = @connection_configuration.drain_timeout,
+    ) : Nil
+      if timeout <= Time::Span.zero
+        raise ArgumentError.new("drain timeout must be positive")
       end
-      connection.try(&.close)
+
+      connections = take_connections_for_close
+      first_error = nil
+      connections.each do |connection|
+        begin
+          connection.graceful_close(timeout)
+        rescue error
+          first_error ||= error
+        end
+      end
+      raise first_error if first_error
     end
 
     def closed? : Bool
@@ -266,14 +331,19 @@ module HTTP2
       @mutex.synchronize do
         raise ClosedError.new("HTTP/2 client is closed") if @closed
 
+        @retired_connections.reject!(&.closed?)
         if current = @connection
-          return current unless current.closed?
+          return current unless current.closed? || current.draining?
           if @supplied_connection
             raise(
               current.terminal_error ||
-              ClosedError.new("supplied HTTP/2 connection is closed")
+              Connection::DrainingError.new(
+                "supplied HTTP/2 connection is draining or closed"
+              )
             )
           end
+          @retired_connections << current unless current.closed?
+          @connection = nil
         end
 
         @connection = dial
@@ -377,7 +447,7 @@ module HTTP2
       PreparedRequest.new(
         pseudo_fields,
         request.trailers.to_header_fields,
-        request.body,
+        request.body_for_attempt,
         request.body_length,
         content_length,
         connect
@@ -703,6 +773,43 @@ module HTTP2
     private def check_cancellation!(cancellation : Cancellation?) : Nil
       if cancellation.try(&.canceled?)
         raise RequestCanceledError.new("HTTP/2 request was canceled")
+      end
+    end
+
+    private def should_replay?(
+      request : Request,
+      error : Exception,
+      replay_attempts : Int32,
+      cancellation : Cancellation?,
+    ) : Bool
+      return false if cancellation.try(&.canceled?)
+      return false if replay_attempts >= @max_replay_attempts
+      return false unless request.replayable_body?
+      return false unless @replay_policy.allows?(request.method)
+
+      case error
+      when Connection::UnprocessedStreamError
+        !@supplied_connection
+      when Connection::StreamResetError
+        error.error_code == ErrorCode::REFUSED_STREAM.to_u32
+      else
+        false
+      end
+    end
+
+    private def take_connections_for_close : Array(Connection)
+      @mutex.synchronize do
+        next [] of Connection if @closed
+
+        @closed = true
+        connections = @retired_connections
+        if current = @connection
+          connections << current
+        end
+        @retired_connections = [] of Connection
+        @connection = nil
+        connections.uniq!
+        connections
       end
     end
 

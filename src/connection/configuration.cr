@@ -7,9 +7,16 @@ module HTTP2
       getter inbound_max_frame_size : Int32
       getter writer_queue_capacity : Int32
       getter stream_event_capacity : Int32
+      getter max_open_streams : Int32
+      getter max_pending_settings : Int32
+      getter max_pending_pings : Int32
       getter settings_ack_timeout : Time::Span
+      getter drain_timeout : Time::Span
+      getter keepalive_interval : Time::Span?
+      getter keepalive_timeout : Time::Span
       getter max_compressed_field_section_size : Int32
       getter max_decoded_field_section_size : Int32
+      getter max_decoded_fields : Int32
       getter max_decoded_string_size : Int32
       getter max_continuation_frames : Int32
       getter max_encoder_table_size : Int32
@@ -17,14 +24,25 @@ module HTTP2
       getter max_retained_closed_streams : Int32
       getter max_buffered_body_bytes : Int32
       getter outbound_data_chunk_size : Int32
+      getter inbound_frame_rate_window : Time::Span
+      getter max_control_frames_per_window : Int32
+      getter max_empty_frames_per_window : Int32
+      getter diagnostic_queue_capacity : Int32
 
       def initialize(
         @inbound_max_frame_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
         @writer_queue_capacity : Int32 = 32,
         @stream_event_capacity : Int32 = 32,
+        @max_open_streams : Int32 = 100,
+        @max_pending_settings : Int32 = 8,
+        @max_pending_pings : Int32 = 8,
         @settings_ack_timeout : Time::Span = 10.seconds,
+        @drain_timeout : Time::Span = 30.seconds,
+        @keepalive_interval : Time::Span? = nil,
+        @keepalive_timeout : Time::Span = 10.seconds,
         @max_compressed_field_section_size : Int32 = 64 * 1024,
         @max_decoded_field_section_size : Int32 = 64 * 1024,
+        @max_decoded_fields : Int32 = 256,
         max_decoded_string_size : Int32? = nil,
         @max_continuation_frames : Int32 = 16,
         @max_encoder_table_size : Int32 = 64 * 1024,
@@ -32,6 +50,10 @@ module HTTP2
         @max_retained_closed_streams : Int32 = 256,
         @max_buffered_body_bytes : Int32 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i32,
         @outbound_data_chunk_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
+        @inbound_frame_rate_window : Time::Span = 1.second,
+        @max_control_frames_per_window : Int32 = 1_000,
+        @max_empty_frames_per_window : Int32 = 1_000,
+        @diagnostic_queue_capacity : Int32 = 128,
         initial_settings : Enumerable(Frame::Settings::Setting) = [] of Frame::Settings::Setting,
       )
         @max_decoded_string_size =
@@ -54,6 +76,13 @@ module HTTP2
       end
 
       private def validate_runtime_limits! : Nil
+        validate_queue_limits!
+        validate_timeout_limits!
+        validate_buffer_limits!
+        validate_frame_rate_limits!
+      end
+
+      private def validate_queue_limits! : Nil
         unless FrameHeader::DEFAULT_MAX_PAYLOAD <= @inbound_max_frame_size <= FrameHeader::MAX_PAYLOAD
           raise ArgumentError.new(
             "inbound maximum frame size must be between " \
@@ -66,11 +95,46 @@ module HTTP2
         if @stream_event_capacity <= 0
           raise ArgumentError.new("stream event capacity must be positive")
         end
+        if @max_open_streams <= 0
+          raise ArgumentError.new("maximum open-stream count must be positive")
+        end
+        if @max_pending_settings <= 0
+          raise ArgumentError.new(
+            "maximum pending SETTINGS count must be positive"
+          )
+        end
+        if @max_pending_pings <= 0
+          raise ArgumentError.new(
+            "maximum pending PING count must be positive"
+          )
+        end
+        if @diagnostic_queue_capacity <= 0
+          raise ArgumentError.new(
+            "diagnostic queue capacity must be positive"
+          )
+        end
+      end
+
+      private def validate_timeout_limits! : Nil
         if @settings_ack_timeout <= Time::Span.zero
           raise ArgumentError.new(
             "SETTINGS acknowledgement timeout must be positive"
           )
         end
+        if @drain_timeout <= Time::Span.zero
+          raise ArgumentError.new("drain timeout must be positive")
+        end
+        if interval = @keepalive_interval
+          if interval <= Time::Span.zero
+            raise ArgumentError.new("keepalive interval must be positive")
+          end
+        end
+        if @keepalive_timeout <= Time::Span.zero
+          raise ArgumentError.new("keepalive timeout must be positive")
+        end
+      end
+
+      private def validate_buffer_limits! : Nil
         if @max_retained_closed_streams <= 0
           raise ArgumentError.new(
             "maximum retained closed-stream count must be positive"
@@ -89,6 +153,24 @@ module HTTP2
         end
       end
 
+      private def validate_frame_rate_limits! : Nil
+        if @inbound_frame_rate_window <= Time::Span.zero
+          raise ArgumentError.new(
+            "inbound frame-rate window must be positive"
+          )
+        end
+        if @max_control_frames_per_window <= 0
+          raise ArgumentError.new(
+            "maximum control-frame count must be positive"
+          )
+        end
+        if @max_empty_frames_per_window <= 0
+          raise ArgumentError.new(
+            "maximum empty-frame count must be positive"
+          )
+        end
+      end
+
       private def validate_field_section_limits! : Nil
         if @max_compressed_field_section_size < 0
           raise ArgumentError.new(
@@ -98,6 +180,11 @@ module HTTP2
         if @max_decoded_field_section_size < 0
           raise ArgumentError.new(
             "maximum decoded field-section size cannot be negative"
+          )
+        end
+        if @max_decoded_fields < 0
+          raise ArgumentError.new(
+            "maximum decoded field count cannot be negative"
           )
         end
         if @max_decoded_string_size < 0

@@ -13,6 +13,8 @@ module HTTP2
     getter body : IO?
     getter body_length : Int64?
 
+    @owned_body : Bytes?
+
     # Creates a request. `target` is an origin-form path, an absolute URI for
     # the same client origin, `*` for OPTIONS, or authority form for CONNECT.
     def initialize(
@@ -24,16 +26,21 @@ module HTTP2
     )
       case body
       when String
-        @body = IO::Memory.new(body)
-        @body_length = body.bytesize.to_i64
+        owned = body.to_slice.dup
+        @owned_body = owned
+        @body = IO::Memory.new(owned)
+        @body_length = owned.size.to_i64
       when Bytes
         owned = body.dup
+        @owned_body = owned
         @body = IO::Memory.new(owned)
         @body_length = owned.size.to_i64
       when IO
+        @owned_body = nil
         @body = body
         @body_length = nil
       when Nil
+        @owned_body = nil
         @body = nil
         @body_length = 0_i64
       end
@@ -53,6 +60,21 @@ module HTTP2
         body,
         trailers ? Headers.new(trailers) : Headers.new
       )
+    end
+
+    # Whether the client can reproduce this body for a proven-unprocessed
+    # retry. String and Bytes bodies are owned; caller-supplied IO is not.
+    def replayable_body? : Bool
+      @body.nil? || !@owned_body.nil?
+    end
+
+    # :nodoc:
+    def body_for_attempt : IO?
+      if owned = @owned_body
+        IO::Memory.new(owned)
+      else
+        @body
+      end
     end
   end
 end

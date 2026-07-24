@@ -7,7 +7,8 @@ require "./stream"
 module HTTP2
   # Owns one HTTP/2 transport, its ordered writer, reader, and stream registry.
   class Connection
-    Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_slice
+    Preface          = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_slice
+    DrainQuietPeriod = 10.milliseconds
 
     enum State
       New
@@ -43,10 +44,19 @@ module HTTP2
     @transport_closer_done = Channel(Nil).new
     @settings_timer_wakeup = Channel(Nil).new(1)
     @settings_timer_done = Channel(Nil).new
+    @drain_wakeup = Channel(Nil).new(1)
+    @drain_done = Channel(Nil).new
+    @keepalive_wakeup = Channel(Nil).new(1)
+    @keepalive_done = Channel(Nil).new
     @writer_started = false
     @reader_started = false
     @transport_closer_started = false
     @settings_timer_started = false
+    @drain_started = false
+    @keepalive_started = false
+    @drain_deadline : Time::Instant?
+    @last_inbound_activity = Time.instant
+    @keepalive_sequence = 0_u32
     @streams = {} of UInt32 => Stream
     @closed_streams = {} of UInt32 => ClosedStream
     @closed_stream_order = [] of UInt32
@@ -62,8 +72,12 @@ module HTTP2
     @data_schedule = Deque(UInt32).new
     @pending_data_count = 0
     @field_blocks : FieldBlockAssembler
+    @inbound_frame_rate_limiter : InboundFrameRateLimiter
     @encoder : HPack::Encoder
     @decoder : HPack::Decoder
+    @diagnostics : Channel(Diagnostic)
+    @diagnostic_mutex = Mutex.new
+    @dropped_diagnostic_count = 0_u64
 
     def initialize(
       @transport : IO,
@@ -85,6 +99,11 @@ module HTTP2
         @configuration.max_compressed_field_section_size,
         @configuration.max_continuation_frames
       )
+      @inbound_frame_rate_limiter = InboundFrameRateLimiter.new(
+        @configuration.inbound_frame_rate_window,
+        @configuration.max_control_frames_per_window,
+        @configuration.max_empty_frames_per_window
+      )
       @encoder = HPack::Encoder.new
       @decoder = HPack::Decoder.new(
         max_decoded_string_size: @configuration.max_decoded_string_size
@@ -95,6 +114,9 @@ module HTTP2
       )
       @encoder.resize_table(initial_encoder_size) if initial_encoder_size !=
                                                        SettingsState::DEFAULT_HEADER_TABLE_SIZE.to_i32
+      @diagnostics = Channel(Diagnostic).new(
+        @configuration.diagnostic_queue_capacity
+      )
     end
 
     # Creates and starts a connection over a caller-supplied duplex IO.
@@ -218,6 +240,7 @@ module HTTP2
           transport_closer_loop
         end
       end
+      emit_lifecycle("handshaking")
 
       begin
         initial_command.wait
@@ -305,6 +328,16 @@ module HTTP2
       @mutex.synchronize { @closed_streams.size }
     end
 
+    # A bounded stream of structured connection events. Producers never block;
+    # inspect `#dropped_diagnostic_count` to detect a slow consumer.
+    def diagnostics : Channel(Diagnostic)
+      @diagnostics
+    end
+
+    def dropped_diagnostic_count : UInt64
+      @diagnostic_mutex.synchronize { @dropped_diagnostic_count }
+    end
+
     def stream?(id : UInt32) : Stream?
       return if id.zero?
 
@@ -313,10 +346,18 @@ module HTTP2
 
     def new_stream : Stream
       @mutex.synchronize do
+        if @state.draining?
+          raise DrainingError.new(
+            "new streams cannot be opened on a draining connection"
+          )
+        end
         unless @state.handshaking? || @state.active?
           raise InvalidStateError.new(
             "new streams require a handshaking or active connection"
           )
+        end
+        if @streams.size >= @configuration.max_open_streams
+          raise OpenStreamLimitError.new(@configuration.max_open_streams)
         end
 
         id = @stream_ids.allocate
@@ -511,6 +552,11 @@ module HTTP2
           if @state.new?
             raise InvalidStateError.new("connection has not been started")
           end
+          if @pending_settings.size >= @configuration.max_pending_settings
+            raise QueueFullError.new(
+              "pending SETTINGS queue reached its configured limit"
+            )
+          end
 
           updated = @local_settings_state.with_local(materialized)
           if updated.enable_push?
@@ -614,6 +660,28 @@ module HTTP2
       wait_until_stopped
     end
 
+    # Sends GOAWAY(NO_ERROR), refuses new streams, and lets established
+    # streams finish until the deadline. The deadline is shortened, never
+    # extended, by concurrent graceful-close or peer-GOAWAY requests.
+    def graceful_close(
+      timeout : Time::Span = @configuration.drain_timeout,
+    ) : Nil
+      if timeout <= Time::Span.zero
+        raise ArgumentError.new("drain timeout must be positive")
+      end
+      if closed?
+        wait_until_stopped
+        return
+      end
+
+      send_graceful_goaway
+      start_drain_monitor(timeout)
+      wait_closed
+      if error = terminal_error
+        raise error if error.is_a?(DrainTimeoutError)
+      end
+    end
+
     # :nodoc:
     def cancel_stream(
       stream : Stream,
@@ -639,7 +707,10 @@ module HTTP2
           !current.state.closed?
         end
       end
-      return unless send_reset
+      unless send_reset
+        wake_drain_monitor
+        return
+      end
 
       reset = Frame::ResetStream.new(stream.id, error_code)
       send_reset(
@@ -721,6 +792,14 @@ module HTTP2
         raise_terminal_or_state_unlocked! if @state.closed?
         if @state.new?
           raise InvalidStateError.new("connection has not been started")
+        end
+
+        pending_count = 0
+        @pending_pings.each_value do |waiters|
+          pending_count += waiters.size
+        end
+        if pending_count >= @configuration.max_pending_pings
+          raise PingLimitError.new(@configuration.max_pending_pings)
         end
 
         waiters = @pending_pings[waiter.key] ||= [] of PingWaiter
@@ -879,9 +958,13 @@ module HTTP2
 
       begin
         @transport.write(Preface) if command.preface?
-        frames.each(&.write(@transport))
+        frames.each do |frame|
+          frame.write(@transport)
+          emit_frame(frame, Diagnostic::Direction::Outbound)
+        end
         @transport.flush
         command.complete
+        wake_drain_monitor
       rescue error
         command.complete(error)
         terminate(error)
@@ -889,8 +972,12 @@ module HTTP2
     end
 
     private def write_scheduled_frames(frames : Array(Frames)) : Nil
-      frames.each(&.write(@transport))
+      frames.each do |frame|
+        frame.write(@transport)
+        emit_frame(frame, Diagnostic::Direction::Outbound)
+      end
       @transport.flush
+      wake_drain_monitor
     rescue error
       terminate(error)
     end
@@ -1045,7 +1132,9 @@ module HTTP2
       frame : Frame::Data,
     ) : Bool
       frame.write(@transport)
+      emit_frame(frame, Diagnostic::Direction::Outbound)
       @transport.flush
+      wake_drain_monitor
       true
     rescue error
       command.complete(error)
@@ -1144,7 +1233,9 @@ module HTTP2
     end
 
     private def reader_loop : Nil
-      handle_server_preface(read_server_preface)
+      server_preface = read_server_preface
+      observe_inbound_frame(server_preface, rate_limit: false)
+      handle_server_preface(server_preface)
       loop do
         if frame = read_frame
           process_inbound_frame(frame)
@@ -1190,6 +1281,7 @@ module HTTP2
     end
 
     private def process_inbound_frame(frame : Frames) : Nil
+      observe_inbound_frame(frame)
       validate_field_block_opening!(frame)
       event = @field_blocks.process(frame)
       return unless event
@@ -1211,16 +1303,23 @@ module HTTP2
 
     private def decode_field_block(block : FieldBlock) : FieldSection
       fields = [] of DecodedHeaderField
+      decoded_field_count = 0
+      field_count_exceeded = false
       result = @decoder.decode_each(
         block.encoded,
         max_field_section_size: decoded_field_section_limit
       ) do |field|
-        fields << DecodedHeaderField.from_hpack(field)
+        decoded_field_count += 1
+        if decoded_field_count > @configuration.max_decoded_fields
+          field_count_exceeded = true
+        else
+          fields << DecodedHeaderField.from_hpack(field)
+        end
       end
 
-      if result.limit_exceeded
+      if result.limit_exceeded || field_count_exceeded
         raise ProtocolError.new(
-          "decoded field section exceeds the configured limit",
+          "decoded field section exceeds a configured limit",
           ErrorCode::ENHANCE_YOUR_CALM,
           ErrorScope::Stream,
           block.stream_id
@@ -1277,6 +1376,10 @@ module HTTP2
         end
       end
       @handshake_done.close if activated
+      if activated
+        emit_lifecycle("active")
+        start_keepalive
+      end
     end
 
     private def dispatch(event : StreamEvent) : Nil
@@ -1526,6 +1629,7 @@ module HTTP2
         overhead = frame.payload.size - data.size
         release_receive_credit(stream.id, overhead) if overhead > 0
         stream.finish_body if frame.end_stream?
+        wake_drain_monitor if stream.closed?
       rescue error : ProtocolError
         release_discarded_connection_credit(flow_size) if error.stream?
         raise error
@@ -1671,6 +1775,7 @@ module HTTP2
       if section = event.as?(FieldSection)
         stream.finish_body if section.end_stream?
       end
+      wake_drain_monitor if stream.closed?
     end
 
     private def resolve_inbound_transition_unlocked(
@@ -1740,11 +1845,12 @@ module HTTP2
       end
       return if ignored || stream.nil?
 
-      discarded = stream.terminate(
-        StreamResetError.new(frame.stream_id, frame.error_code)
-      )
+      error = StreamResetError.new(frame.stream_id, frame.error_code)
+      emit_error(error, frame.stream_id, frame.error_code)
+      discarded = stream.terminate(error)
       release_discarded_connection_credit(discarded.to_i64)
       wake_flow_control
+      wake_drain_monitor
     end
 
     private def stream_state_unlocked(stream_id : UInt32) : Stream::State
@@ -1838,6 +1944,7 @@ module HTTP2
     end
 
     private def handle_goaway(frame : Frame::GoAway) : Nil
+      unprocessed = [] of UnprocessedStreamError
       @mutex.synchronize do
         if !frame.last_stream_id.zero? && frame.last_stream_id.even?
           raise ProtocolError.new(
@@ -1867,14 +1974,20 @@ module HTTP2
               id,
               ClosedStream::Reason::GoAway
             )
+            error = UnprocessedStreamError.new(id, frame)
             terminate_stream_unlocked(
               stream,
-              UnprocessedStreamError.new(id, frame)
+              error
             )
+            unprocessed << error
           end
         end
       end
+      emit_lifecycle("draining after peer GOAWAY")
+      unprocessed.each { |error| emit_error(error, error.stream_id) }
       wake_flow_control
+      wake_drain_monitor
+      start_drain_monitor(@configuration.drain_timeout)
     end
 
     private def handle_stream_violation(error : ProtocolError) : Nil
@@ -1888,6 +2001,7 @@ module HTTP2
       stream = @mutex.synchronize { @streams[id]? }
       return unless stream
 
+      emit_error(error, id)
       send_reset(
         Frame::ResetStream.new(id, error.error_code),
         error
@@ -1963,15 +2077,19 @@ module HTTP2
       end
       return unless terminated
 
+      emit_error(error)
       @write_queue.close
       @data_queue.close
       @transport_close_signal.close
       @settings_timer_wakeup.close
       @flow_control_wakeup.close
+      @drain_wakeup.close
+      @keepalive_wakeup.close
       @handshake_done.close
       @closed_signal.close
 
       ping_waiters.each(&.complete(error))
+      @diagnostics.close
       close_transport if close_directly
     end
 
@@ -1992,13 +2110,15 @@ module HTTP2
     end
 
     private def wait_until_stopped(timeout : Time::Span? = nil) : Nil
-      writer_started, reader_started, transport_closer_started, settings_timer_started =
+      writer_started, reader_started, transport_closer_started, settings_timer_started, drain_started, keepalive_started =
         @mutex.synchronize do
           {
             @writer_started,
             @reader_started,
             @transport_closer_started,
             @settings_timer_started,
+            @drain_started,
+            @keepalive_started,
           }
         end
 
@@ -2023,12 +2143,312 @@ module HTTP2
           "HTTP/2 SETTINGS timer shutdown"
         )
       end
+      if drain_started
+        wait_for_signal(
+          @drain_done,
+          timeout,
+          "HTTP/2 drain monitor shutdown"
+        )
+      end
+      if keepalive_started
+        wait_for_signal(
+          @keepalive_done,
+          timeout,
+          "HTTP/2 keepalive shutdown"
+        )
+      end
     end
 
     private def close_transport : Nil
       @transport.close
     rescue
       # The connection's stored terminal error remains authoritative.
+    end
+
+    private def send_graceful_goaway : Nil
+      frame = @mutex.synchronize do
+        next if @state.closed? || @last_sent_goaway
+        if @state.new?
+          raise InvalidStateError.new("connection has not been started")
+        end
+
+        Frame::GoAway.new(
+          @last_processed_peer_stream_id,
+          ErrorCode::NO_ERROR
+        )
+      end
+      write_frame(frame) if frame
+    end
+
+    private def start_drain_monitor(duration : Time::Span) : Nil
+      deadline = Time.instant + duration
+      start = @mutex.synchronize do
+        next false if @state.closed?
+
+        if current = @drain_deadline
+          @drain_deadline = deadline if deadline < current
+        else
+          @drain_deadline = deadline
+        end
+
+        if @drain_started
+          false
+        else
+          @drain_started = true
+          true
+        end
+      end
+
+      wake_drain_monitor
+      ::spawn(name: "http2-drain-monitor") { drain_monitor_loop } if start
+    end
+
+    private def drain_monitor_loop : Nil
+      loop do
+        closed, active, peer_draining, quiet_remaining, remaining =
+          @mutex.synchronize do
+            deadline = @drain_deadline || Time.instant
+            now = Time.instant
+            {
+              @state.closed?,
+              @streams.count { |_, stream| stream.state.active? },
+              !@last_goaway.nil?,
+              @last_inbound_activity + DrainQuietPeriod - now,
+              deadline - now,
+            }
+          end
+        break if closed
+
+        if active.zero?
+          next if wait_for_peer_drain_quiet?(
+                    peer_draining,
+                    quiet_remaining,
+                    remaining
+                  )
+          send_graceful_goaway
+          terminate(DrainedError.new("HTTP/2 connection drained")) unless closed?
+          break
+        end
+        if remaining <= Time::Span.zero
+          send_graceful_goaway
+          terminate(
+            DrainTimeoutError.new(
+              "HTTP/2 connection did not drain before its deadline"
+            )
+          ) unless closed?
+          break
+        end
+
+        wait_for_drain_change(remaining)
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown wakes the monitor.
+    rescue error
+      terminate(error) unless closed?
+    ensure
+      @drain_done.close
+    end
+
+    private def wait_for_peer_drain_quiet?(
+      peer_draining : Bool,
+      quiet_remaining : Time::Span,
+      deadline_remaining : Time::Span,
+    ) : Bool
+      return false unless peer_draining
+      return false unless quiet_remaining > Time::Span.zero
+      return false unless deadline_remaining > Time::Span.zero
+
+      wait_for_drain_change(
+        Math.min(quiet_remaining, deadline_remaining)
+      )
+      true
+    end
+
+    private def wait_for_drain_change(duration : Time::Span) : Nil
+      select
+      when @drain_wakeup.receive?
+      when timeout(duration)
+      end
+    end
+
+    private def wake_drain_monitor : Nil
+      return unless @drain_started
+
+      select
+      when @drain_wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown already woke the monitor.
+    end
+
+    private def start_keepalive : Nil
+      interval = @configuration.keepalive_interval
+      return unless interval
+
+      start = @mutex.synchronize do
+        if @state.closed? || @keepalive_started
+          false
+        else
+          @keepalive_started = true
+          true
+        end
+      end
+      return unless start
+
+      ::spawn(name: "http2-keepalive") { keepalive_loop(interval) }
+    end
+
+    private def keepalive_loop(interval : Time::Span) : Nil
+      loop do
+        closed, remaining = @mutex.synchronize do
+          {
+            @state.closed?,
+            @last_inbound_activity + interval - Time.instant,
+          }
+        end
+        break if closed
+
+        if remaining > Time::Span.zero
+          wait_for_keepalive_activity(remaining)
+          next
+        end
+
+        begin
+          ping(next_keepalive_payload, @configuration.keepalive_timeout)
+        rescue PingLimitError
+          wait_for_keepalive_activity(interval)
+        rescue error : TimeoutError
+          terminate(
+            KeepaliveTimeoutError.new(
+              "HTTP/2 keepalive PING timed out",
+              error
+            )
+          )
+          break
+        rescue error
+          terminate(error) unless closed?
+          break
+        end
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown wakes keepalive.
+    ensure
+      @keepalive_done.close
+    end
+
+    private def wait_for_keepalive_activity(duration : Time::Span) : Nil
+      select
+      when @keepalive_wakeup.receive?
+      when timeout(duration)
+      end
+    end
+
+    private def next_keepalive_payload : Bytes
+      sequence = @mutex.synchronize do
+        @keepalive_sequence &+= 1_u32
+      end
+      payload = Bytes[0x68, 0x32, 0x6b, 0x61, 0, 0, 0, 0]
+      IO::ByteFormat::BigEndian.encode(sequence, payload[4, 4])
+      payload
+    end
+
+    private def observe_inbound_frame(
+      frame : Frames,
+      *,
+      rate_limit : Bool = true,
+    ) : Nil
+      @mutex.synchronize do
+        @last_inbound_activity = Time.instant
+      end
+      notify_keepalive_activity
+      emit_frame(frame, Diagnostic::Direction::Inbound)
+      @inbound_frame_rate_limiter.check(frame) if rate_limit
+    end
+
+    private def notify_keepalive_activity : Nil
+      select
+      when @keepalive_wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown already woke keepalive.
+    end
+
+    private def emit_frame(
+      frame : Frames,
+      direction : Diagnostic::Direction,
+    ) : Nil
+      header = frame.header
+      settings = frame.as?(Frame::Settings).try(&.entries.dup)
+      error_code = case frame
+                   when Frame::GoAway
+                     frame.error_code
+                   when Frame::ResetStream
+                     frame.error_code
+                   end
+      emit_diagnostic(
+        Diagnostic.new(
+          Diagnostic::Kind::Frame,
+          direction,
+          frame_type: header.type_code,
+          flags: header.flags,
+          stream_id: header.stream_id,
+          payload_length: header.length,
+          error_code: error_code,
+          settings: settings
+        )
+      )
+    end
+
+    private def emit_lifecycle(message : String) : Nil
+      emit_diagnostic(
+        Diagnostic.new(
+          Diagnostic::Kind::Lifecycle,
+          message: message
+        )
+      )
+    end
+
+    private def emit_error(
+      error : Exception,
+      stream_id : UInt32? = nil,
+      error_code : UInt32? = nil,
+    ) : Nil
+      scope = if protocol_error = error.as?(ProtocolError)
+                stream_id ||= protocol_error.stream_id
+                error_code ||= protocol_error.error_code.to_u32
+                protocol_error.scope
+              elsif stream_id
+                ErrorScope::Stream
+              else
+                ErrorScope::Connection
+              end
+
+      lifecycle = stream_id.nil? &&
+                  (error.is_a?(ClosedError) ||
+                   error.is_a?(DrainedError))
+      emit_diagnostic(
+        Diagnostic.new(
+          lifecycle ? Diagnostic::Kind::Lifecycle : (stream_id ? Diagnostic::Kind::StreamError : Diagnostic::Kind::ConnectionError),
+          stream_id: stream_id,
+          error_code: error_code,
+          error_scope: scope,
+          message: error.message
+        )
+      )
+    end
+
+    private def emit_diagnostic(diagnostic : Diagnostic) : Nil
+      select
+      when @diagnostics.send(diagnostic)
+      else
+        @diagnostic_mutex.synchronize do
+          @dropped_diagnostic_count += 1
+        end
+      end
+    rescue Channel::ClosedError
+      # Diagnostics are best-effort and bounded.
     end
 
     private def start_settings_timer : Nil
@@ -2393,7 +2813,7 @@ module HTTP2
       draining : Bool,
     ) : UInt32
       if draining
-        raise InvalidStateError.new(
+        raise DrainingError.new(
           "cannot open stream #{stream_id} on a draining connection"
         )
       end
@@ -2524,6 +2944,7 @@ module HTTP2
 
       @last_sent_goaway = planned
       @state = State::Draining unless @state.closed?
+      emit_lifecycle("draining after local GOAWAY")
     end
 
     private def retain_closed_stream_unlocked(
