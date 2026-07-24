@@ -83,5 +83,5 @@ input may cause unbounded allocation.
 - Phase 1 changes only the passive frame codec and typed error vocabulary.
 - Phase 2 provides transport lifecycle and SETTINGS/PING handshake mechanics
   without decoding field blocks.
-- Phase 3 integrates the persistent HPACK contexts and complete field blocks
-  after the required HPACK APIs are available.
+- Phase 3 integrates persistent HPACK contexts, complete field blocks, and
+  bounded decoded field sections.

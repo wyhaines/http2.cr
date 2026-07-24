@@ -70,7 +70,7 @@ module HTTP2
       send_headers(materialized, end_stream: end_stream)
     end
 
-    # Waits for the next inbound frame or completed header field block.
+    # Waits for the next inbound frame or decoded field section.
     def receive(timeout : Time::Span? = nil) : StreamEvent
       raise_terminal! if terminal_error
 

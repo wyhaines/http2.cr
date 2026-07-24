@@ -50,4 +50,42 @@ module HTTP2
       end
     end
   end
+
+  # One decoded field and the HPACK representation used on the wire.
+  #
+  # The representation is retained so an intermediary can preserve the
+  # never-indexed marker without exposing HPACK implementation types.
+  record DecodedHeaderField,
+    name : String,
+    value : String,
+    indexing : Indexing do
+    enum Indexing
+      Indexed
+      Incremental
+      None
+      Never
+    end
+
+    # :nodoc:
+    def self.from_hpack(field : HPack::DecodedHeader) : self
+      new(field.name, field.value, indexing_from_hpack(field.indexing))
+    end
+
+    private def self.indexing_from_hpack(
+      indexing : HPack::Indexing,
+    ) : Indexing
+      case indexing
+      when HPack::Indexing::INDEXED
+        Indexing::Indexed
+      when HPack::Indexing::ALWAYS
+        Indexing::Incremental
+      when HPack::Indexing::NONE
+        Indexing::None
+      when HPack::Indexing::NEVER
+        Indexing::Never
+      else
+        raise ArgumentError.new("unsupported decoded indexing marker")
+      end
+    end
+  end
 end

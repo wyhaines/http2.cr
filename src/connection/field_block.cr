@@ -69,7 +69,32 @@ module HTTP2
         )
       end
     end
+
+    # One fully decompressed field section and its opening-frame metadata.
+    struct FieldSection
+      getter kind : FieldBlock::Kind
+      getter stream_id : UInt32
+      getter fields : Array(DecodedHeaderField)
+      getter decoded_size : UInt64
+      getter? end_stream : Bool
+      getter promised_stream_id : UInt32?
+      getter priority : FieldBlock::Priority?
+      getter continuation_count : Int32
+
+      def initialize(
+        block : FieldBlock,
+        @fields : Array(DecodedHeaderField),
+        @decoded_size : UInt64,
+      )
+        @kind = block.kind
+        @stream_id = block.stream_id
+        @end_stream = block.end_stream?
+        @promised_stream_id = block.promised_stream_id
+        @priority = block.priority
+        @continuation_count = block.continuation_count
+      end
+    end
   end
 
-  alias StreamEvent = Frames | Connection::FieldBlock
+  alias StreamEvent = Frames | Connection::FieldSection
 end

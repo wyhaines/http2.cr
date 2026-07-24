@@ -20,4 +20,4 @@ development_dependencies:
 dependencies:
   hpack:
     github: wyhaines/hpack.cr
-    commit: e9371792963c044315da0ba22019f0ff68c94ee8
+    commit: dd3aef145a1b9f7f5193e7266833f1c77d7e297d

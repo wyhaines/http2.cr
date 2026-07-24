@@ -1,17 +1,21 @@
 require "./spec_helper"
 
 describe HTTP2::Connection do
-  it "delivers one complete event for a fragmented field block" do
+  it "delivers one decoded event for a fragmented field block" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         id = stream_id.receive
-        HTTP2::Frame::Headers.new(0_u8, id, Bytes[1, 2]).write(io)
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          id,
+          Bytes[0x00, 0x01]
+        ).write(io)
         HTTP2::Frame::Continuation.new(
           HTTP2::Frame::Continuation::Flags::END_HEADERS,
           id,
-          Bytes[3, 4]
+          Bytes[0x78, 0x01, 0x79]
         ).write(io)
         io.flush
       end
@@ -22,10 +26,67 @@ describe HTTP2::Connection do
         stream = connection.new_stream
         stream_id.send(stream.id)
 
-        block = stream.receive(1.second).as(HTTP2::Connection::FieldBlock)
-        block.stream_id.should eq(stream.id)
-        block.encoded.should eq(Bytes[1, 2, 3, 4])
-        block.continuation_count.should eq(1)
+        section = stream.receive(1.second)
+          .as(HTTP2::Connection::FieldSection)
+        section.stream_id.should eq(stream.id)
+        section.fields.should eq([
+          HTTP2::DecodedHeaderField.new(
+            "x",
+            "y",
+            HTTP2::DecodedHeaderField::Indexing::None
+          ),
+        ])
+        section.decoded_size.should eq(34_u64)
+        section.end_stream?.should be_true
+        section.continuation_count.should eq(1)
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "decodes a fragmented field block at every split boundary" do
+    encoded = Bytes[
+      0x00,
+      0x06, 0x78, 0x2d, 0x74, 0x65, 0x73, 0x74,
+      0x02, 0x6f, 0x6b,
+    ]
+
+    UNIXSocket.pair do |client, peer|
+      stream_ids = Channel(Array(UInt32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        ids = stream_ids.receive
+
+        ids.each_with_index do |id, split|
+          HTTP2::Frame::Headers.new(
+            0_u8,
+            id,
+            encoded[0, split]
+          ).write(io)
+          HTTP2::Frame::Continuation.new(
+            HTTP2::Frame::Continuation::Flags::END_HEADERS,
+            id,
+            encoded[split, encoded.size - split]
+          ).write(io)
+        end
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        streams = (0..encoded.size).map { connection.new_stream }
+        stream_ids.send(streams.map(&.id))
+
+        streams.each do |stream|
+          section = stream.receive(1.second)
+            .as(HTTP2::Connection::FieldSection)
+          section.fields.map { |field| {field.name, field.value} }.should eq([
+            {"x-test", "ok"},
+          ])
+        end
         wait_for_peer(peer_result)
       ensure
         connection.close

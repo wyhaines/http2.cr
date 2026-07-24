@@ -1,13 +1,12 @@
-# HPACK Additions Needed by HTTP/2
+# HPACK Additions Used by HTTP/2
 
-These are independent work items for the adjacent `hpack.cr` repository. They
-should preserve existing APIs and wire output unless a caller opts into the new
-behavior. The HTTP/2 implementation can complete phases 0–2 of its roadmap
-while this work is in progress, but both additions should land before phase 3.
+These independent work items were implemented in the adjacent `hpack.cr`
+repository and are now consumed by HTTP/2 Phase 3. The requirements remain here
+as integration and regression criteria.
 
 ## 1. Encoder Dynamic-Table Size Updates
 
-**Status:** available in `hpack.cr` 1.2.0.
+**Status:** available since `hpack.cr` 1.2.0 and used from 1.3.0.
 
 ### Goal
 
@@ -61,8 +60,9 @@ pass.
 
 ## 2. Bounded, Incremental Decoder Output
 
-**Status:** still required; `hpack.cr` 1.2.0 does not provide `decode_each`,
-decoded field-section accounting, or a hard decoded-string cap.
+**Status:** available and integrated from `hpack.cr` 1.3.0 as
+`Decoder#decode_each`, `DecodeResult`, `ResourceLimitError`, and
+`max_decoded_string_size`.
 
 ### Goal
 

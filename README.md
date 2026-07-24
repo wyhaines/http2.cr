@@ -10,10 +10,9 @@ a reusable protocol core.
 ## Status
 
 The current code is not ready for production use. Its frame codec, transport
-runtime, SETTINGS state, outbound HPACK, and bounded field-block assembly are
-covered. Inbound field blocks are not decoded yet because the HPACK dependency
-still lacks bounded incremental output. The stream state machine, flow control,
-and HTTP client API also remain unfinished.
+runtime, SETTINGS state, persistent inbound and outbound HPACK contexts, and
+bounded field-block processing are covered. The stream state machine, flow
+control, and HTTP client API remain unfinished.
 
 Development is organized in ordered phases:
 

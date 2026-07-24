@@ -45,8 +45,8 @@ module HTTP2
     @stream_ids = StreamIDAllocator.new
     @pending_settings = [] of SettingsAcknowledgement
     @field_blocks : FieldBlockAssembler
-    @encoder = HPack::Encoder.new
-    @decoder = HPack::Decoder.new
+    @encoder : HPack::Encoder
+    @decoder : HPack::Decoder
 
     def initialize(
       @transport : IO,
@@ -64,6 +64,10 @@ module HTTP2
       @field_blocks = FieldBlockAssembler.new(
         @configuration.max_compressed_field_section_size,
         @configuration.max_continuation_frames
+      )
+      @encoder = HPack::Encoder.new
+      @decoder = HPack::Decoder.new(
+        max_decoded_string_size: @configuration.max_decoded_string_size
       )
       initial_encoder_size = Math.min(
         SettingsState::DEFAULT_HEADER_TABLE_SIZE.to_i32,
@@ -355,6 +359,15 @@ module HTTP2
               "SETTINGS_HEADER_TABLE_SIZE exceeds the configured decoder limit"
             )
           end
+          if max_header_list_size = updated.max_header_list_size
+            if max_header_list_size >
+                 @configuration.max_decoded_field_section_size
+              raise ArgumentError.new(
+                "SETTINGS_MAX_HEADER_LIST_SIZE exceeds the configured " \
+                "decoded field-section limit"
+              )
+            end
+          end
 
           @local_settings_state = updated
           pending_update = SettingsAcknowledgement.new(updated)
@@ -473,9 +486,7 @@ module HTTP2
       handle_server_preface(read_server_preface)
       loop do
         if frame = read_frame
-          if event = @field_blocks.process(frame)
-            dispatch(event)
-          end
+          process_inbound_frame(frame)
         end
       end
     rescue error : ProtocolError
@@ -515,6 +526,63 @@ module HTTP2
 
       handle_stream_violation(error)
       nil
+    end
+
+    private def process_inbound_frame(frame : Frames) : Nil
+      event = @field_blocks.process(frame)
+      return unless event
+
+      case event
+      when FieldBlock
+        begin
+          dispatch(decode_field_block(event))
+        rescue error : ProtocolError
+          raise error unless error.stream?
+
+          handle_stream_violation(error)
+        end
+      else
+        dispatch(event)
+      end
+    end
+
+    private def decode_field_block(block : FieldBlock) : FieldSection
+      fields = [] of DecodedHeaderField
+      result = @decoder.decode_each(
+        block.encoded,
+        max_field_section_size: decoded_field_section_limit
+      ) do |field|
+        fields << DecodedHeaderField.from_hpack(field)
+      end
+
+      if result.limit_exceeded
+        raise ProtocolError.new(
+          "decoded field section exceeds the configured limit",
+          ErrorCode::ENHANCE_YOUR_CALM,
+          ErrorScope::Stream,
+          block.stream_id
+        )
+      end
+
+      FieldSection.new(block, fields, result.decoded_size)
+    rescue error : HPack::ResourceLimitError
+      raise ResourceLimitError.new(
+        "HPACK decoder resource limit exceeded: #{error.message}"
+      )
+    rescue error : HPack::Error
+      raise ProtocolError.new(
+        "invalid HPACK field block: #{error.message}",
+        ErrorCode::COMPRESSION_ERROR
+      )
+    end
+
+    private def decoded_field_section_limit : UInt64
+      configured = @configuration.max_decoded_field_section_size.to_u64
+      if advertised = effective_local_settings_state.max_header_list_size
+        Math.min(configured, advertised.to_u64)
+      else
+        configured
+      end
     end
 
     private def handle_reader_eof(error : IO::EOFError) : Nil

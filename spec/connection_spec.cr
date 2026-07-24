@@ -15,12 +15,16 @@ describe HTTP2::Connection::Configuration do
     configuration.initial_settings.map(&.identifier).should eq([
       HTTP2::Frame::Settings::Identifier::ENABLE_PUSH.to_u16,
       HTTP2::Frame::Settings::Identifier::MAX_FRAME_SIZE.to_u16,
+      HTTP2::Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE.to_u16,
     ])
-    configuration.initial_settings.last.value.should eq(32_768_u32)
+    frame_size = configuration.initial_settings.find do |setting|
+      setting.known_identifier.try(&.max_frame_size?)
+    end
+    frame_size.try(&.value).should eq(32_768_u32)
 
     settings = configuration.initial_settings
     settings.clear
-    configuration.initial_settings.size.should eq(2)
+    configuration.initial_settings.size.should eq(3)
   end
 
   it "rejects invalid limits and contradictory local settings" do
@@ -38,6 +42,20 @@ describe HTTP2::Connection::Configuration do
     expect_raises(ArgumentError) do
       HTTP2::Connection::Configuration.new(
         max_compressed_field_section_size: -1
+      )
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_decoded_field_section_size: -1
+      )
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(max_decoded_string_size: -1)
+    end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_decoded_field_section_size: 1_024,
+        max_decoded_string_size: 2_048
       )
     end
     expect_raises(ArgumentError) do
@@ -71,6 +89,17 @@ describe HTTP2::Connection::Configuration do
         ]
       )
     end
+    expect_raises(ArgumentError) do
+      HTTP2::Connection::Configuration.new(
+        max_decoded_field_section_size: 1_024,
+        initial_settings: [
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE,
+            2_048_u32
+          ),
+        ]
+      )
+    end
   end
 
   it "advertises a decoder table cap below the protocol default" do
@@ -82,6 +111,18 @@ describe HTTP2::Connection::Configuration do
     end
 
     header_table_size.try(&.value).should eq(1_024_u32)
+  end
+
+  it "advertises and hard-caps the decoded field-section budget" do
+    configuration = HTTP2::Connection::Configuration.new(
+      max_decoded_field_section_size: 1_024
+    )
+    max_header_list_size = configuration.initial_settings.find do |setting|
+      setting.known_identifier.try(&.max_header_list_size?)
+    end
+
+    max_header_list_size.try(&.value).should eq(1_024_u32)
+    configuration.max_decoded_string_size.should eq(1_024)
   end
 end
 
@@ -434,11 +475,17 @@ describe HTTP2::Connection do
   end
 
   it "propagates writer failures and closes the runtime" do
-    transport = FailingWriteIO.new(42)
-    connection = HTTP2::Connection.start(transport)
+    configuration = HTTP2::Connection::Configuration.new
+    allowed_write_bytes = (
+      HTTP2::Connection::Preface.size +
+      HTTP2::Frame::Settings.new(configuration.initial_settings).to_slice.size +
+      HTTP2::Frame::Settings.ack.to_slice.size
+    ).to_i32
+    transport = FailingWriteIO.new(allowed_write_bytes)
+    connection = HTTP2::Connection.start(transport, configuration)
     connection.wait_until_active(1.second)
     stream = connection.new_stream
-    transport.written_bytes.should eq(42)
+    transport.written_bytes.should eq(allowed_write_bytes)
 
     expect_raises(IO::Error, "injected write failure") do
       connection.write_frame(HTTP2::Frame::Ping.new(0_u8, 0_u32))

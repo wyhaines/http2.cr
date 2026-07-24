@@ -213,6 +213,37 @@ describe HTTP2::Connection do
     end
   end
 
+  it "rejects an advertised field-section size above the decoder budget" do
+    UNIXSocket.pair do |client, peer|
+      configuration = HTTP2::Connection::Configuration.new(
+        max_decoded_field_section_size: 1_024
+      )
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+      end
+
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        eventually { connection.pending_settings_count.zero? }
+
+        expect_raises(ArgumentError, /decoded field-section limit/) do
+          connection.send_settings([
+            HTTP2::Frame::Settings::Setting.new(
+              HTTP2::Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE,
+              2_048_u32
+            ),
+          ])
+        end
+        connection.local_settings_state
+          .max_header_list_size.should eq(1_024_u32)
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "rejects a SETTINGS ACK with no outstanding update" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|

@@ -9,7 +9,7 @@ Last updated: 2026-07-23
 | 0 — Baseline and architecture | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 1 — Frame codec and errors | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 2 — Connection and handshake | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
-| 3 — SETTINGS, HPACK, field blocks | In progress; inbound HPACK API pending | Verified checkpoint; final gate pending |
+| 3 — SETTINGS, HPACK, field blocks | Complete | Gate passed on Crystal 1.20.0 and 1.21.0 |
 | 4–8 | Not started | — |
 
 ## Phase 0 Baseline
@@ -23,7 +23,8 @@ debug calls and duplicate methods.
 
 Phase 0 has:
 
-- pinned improved HPACK commit `a909c58ab40bf03d321777820ff64543d345768d`;
+- initially pinned an improved HPACK commit, superseded by HPACK 1.3.0 in
+  Phase 3;
 - pinned the Crystal 1.21-compatible Ameba 1.7 development snapshot;
 - selected Crystal 1.20.0 as the minimum supported compiler and added a
   1.20/1.21 CI matrix;
@@ -75,11 +76,11 @@ Local scripted peers and a checked-in certificate fixture cover cleartext and
 TLS handshakes, ALPN and hostname failures, concurrent writers, stream routing,
 GOAWAY, malformed frames, EOF, and failure propagation.
 
-## Phase 3 Progress
+## Phase 3 SETTINGS, HPACK, and Field Blocks
 
-The completed Phase 3 work:
+Phase 3 now:
 
-- pins `hpack.cr` 1.2.0 and keeps one encoder and decoder per connection;
+- pins `hpack.cr` 1.3.0 and keeps one encoder and decoder per connection;
 - validates the six RFC 9113 settings, preserves ordered duplicate handling,
   ignores unsupported identifiers, and keeps peer, advertised-local, and
   acknowledged-local values separate;
@@ -91,15 +92,16 @@ The completed Phase 3 work:
   compressed-size and continuation-count bounds;
 - encodes ordered outbound fields once on the writer, retains dynamic-table
   state across blocks, fragments at the peer frame-size setting, and writes the
-  complete sequence atomically.
-
-Inbound field blocks deliberately remain compressed stream events. HPACK 1.2.0
-does not yet expose the requested bounded incremental decoder, result
-accounting, or hard literal cap. Using `decode_with_metadata` here would allocate
-unbounded retained output and defeat the Phase 3 resource invariant. Once that
-API lands, the reader must decode every complete block, preserve dynamic state
-after a rejected field section, and map malformed HPACK separately from local
-resource exhaustion.
+  complete sequence atomically;
+- incrementally decodes inbound blocks into ordered `FieldSection` events,
+  preserving indexing metadata without exposing HPACK types;
+- advertises and enforces a decoded field-section budget plus a hard
+  decoded-string cap while keeping retained output bounded;
+- fully decompresses over-budget sections before resetting their streams, so
+  later blocks can reference dynamic entries inserted by discarded sections;
+- maps malformed HPACK to connection `COMPRESSION_ERROR`, aggregate decoded
+  limits to stream `ENHANCE_YOUR_CALM`, and hard decoder resource limits to
+  connection shutdown.
 
 ## Current Verification
 
@@ -111,17 +113,17 @@ bin/ameba
 crystal spec -t -s
 crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
+crystal docs
 ```
 
-The Phase 3 checkpoint passes formatting, Ameba, compilation, documentation,
-and 106 deterministic examples in normal and `preview_mt` modes in the
-official Crystal 1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its
-expected deprecation warning on Crystal 1.21.
+The Phase 3 gate passes formatting, Ameba, compilation, documentation, and 114
+deterministic examples in normal and `preview_mt` modes in the official Crystal
+1.20.0 and 1.21.0 containers. The `preview_mt` flag emits its expected
+deprecation warning on Crystal 1.21.
 
 ## Next Work
 
-Finish the second addition in
-[hpack-additions.md](./hpack-additions.md), update the dependency pin, and
-integrate its incremental decoder into the existing complete-field-block path.
-Then add cross-block inbound dynamic-reference, decoded-budget, malformed
-remainder, and hard literal-cap tests to close the Phase 3 gate.
+Begin Phase 4 by implementing the explicit stream transition table, enforcing
+frame legality against stream state, and applying peer
+`MAX_CONCURRENT_STREAMS`. Then complete reset, cancellation, GOAWAY, and
+push-disabled behavior before beginning flow control.

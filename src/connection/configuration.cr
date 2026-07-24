@@ -9,6 +9,8 @@ module HTTP2
       getter stream_event_capacity : Int32
       getter settings_ack_timeout : Time::Span
       getter max_compressed_field_section_size : Int32
+      getter max_decoded_field_section_size : Int32
+      getter max_decoded_string_size : Int32
       getter max_continuation_frames : Int32
       getter max_encoder_table_size : Int32
       getter max_decoder_table_size : Int32
@@ -19,11 +21,31 @@ module HTTP2
         @stream_event_capacity : Int32 = 32,
         @settings_ack_timeout : Time::Span = 10.seconds,
         @max_compressed_field_section_size : Int32 = 64 * 1024,
+        @max_decoded_field_section_size : Int32 = 64 * 1024,
+        max_decoded_string_size : Int32? = nil,
         @max_continuation_frames : Int32 = 16,
         @max_encoder_table_size : Int32 = 64 * 1024,
         @max_decoder_table_size : Int32 = 64 * 1024,
         initial_settings : Enumerable(Frame::Settings::Setting) = [] of Frame::Settings::Setting,
       )
+        @max_decoded_string_size =
+          max_decoded_string_size || @max_decoded_field_section_size
+        validate_runtime_limits!
+        validate_field_section_limits!
+        validate_table_limits!
+
+        @initial_settings = initial_settings.map { |setting| setting }
+        synchronize_advertised_frame_size!
+        synchronize_advertised_header_table_size!
+        synchronize_advertised_field_section_size!
+        SettingsState.client_defaults.with_local(@initial_settings)
+      end
+
+      def initial_settings : Array(Frame::Settings::Setting)
+        @initial_settings.dup
+      end
+
+      private def validate_runtime_limits! : Nil
         unless FrameHeader::DEFAULT_MAX_PAYLOAD <= @inbound_max_frame_size <= FrameHeader::MAX_PAYLOAD
           raise ArgumentError.new(
             "inbound maximum frame size must be between " \
@@ -41,9 +63,28 @@ module HTTP2
             "SETTINGS acknowledgement timeout must be positive"
           )
         end
+      end
+
+      private def validate_field_section_limits! : Nil
         if @max_compressed_field_section_size < 0
           raise ArgumentError.new(
             "maximum compressed field-section size cannot be negative"
+          )
+        end
+        if @max_decoded_field_section_size < 0
+          raise ArgumentError.new(
+            "maximum decoded field-section size cannot be negative"
+          )
+        end
+        if @max_decoded_string_size < 0
+          raise ArgumentError.new(
+            "maximum decoded string size cannot be negative"
+          )
+        end
+        if @max_decoded_string_size > @max_decoded_field_section_size
+          raise ArgumentError.new(
+            "maximum decoded string size cannot exceed the decoded " \
+            "field-section limit"
           )
         end
         if @max_continuation_frames < 0
@@ -51,6 +92,9 @@ module HTTP2
             "maximum CONTINUATION frame count cannot be negative"
           )
         end
+      end
+
+      private def validate_table_limits! : Nil
         if @max_encoder_table_size < 0
           raise ArgumentError.new(
             "maximum encoder table size cannot be negative"
@@ -61,15 +105,6 @@ module HTTP2
             "maximum decoder table size cannot be negative"
           )
         end
-
-        @initial_settings = initial_settings.map { |setting| setting }
-        synchronize_advertised_frame_size!
-        synchronize_advertised_header_table_size!
-        SettingsState.client_defaults.with_local(@initial_settings)
-      end
-
-      def initial_settings : Array(Frame::Settings::Setting)
-        @initial_settings.dup
       end
 
       private def synchronize_advertised_frame_size!
@@ -109,6 +144,27 @@ module HTTP2
           @initial_settings << Frame::Settings::Setting.new(
             Frame::Settings::Identifier::HEADER_TABLE_SIZE,
             @max_decoder_table_size.to_u32
+          )
+        end
+      end
+
+      private def synchronize_advertised_field_section_size!
+        identifier = Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE.to_u16
+        advertised = @initial_settings.reverse_each.find do |setting|
+          setting.identifier == identifier
+        end
+
+        if advertised
+          if advertised.value > @max_decoded_field_section_size
+            raise ArgumentError.new(
+              "SETTINGS_MAX_HEADER_LIST_SIZE exceeds " \
+              "max_decoded_field_section_size"
+            )
+          end
+        else
+          @initial_settings << Frame::Settings::Setting.new(
+            Frame::Settings::Identifier::MAX_HEADER_LIST_SIZE,
+            @max_decoded_field_section_size.to_u32
           )
         end
       end
