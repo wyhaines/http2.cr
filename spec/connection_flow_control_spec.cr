@@ -83,6 +83,116 @@ describe HTTP2::Connection do
     end
   end
 
+  it "does not emit a receive-credit WINDOW_UPDATE for a partial read " \
+     "below the watermark" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      data_sent = Channel(Nil).new(1)
+      read_done = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        HTTP2::Frame::Data.new(0_u8, id, Bytes.new(8, 0x61_u8)).write(io)
+        io.flush
+        data_sent.send(nil)
+        read_done.receive
+
+        # Below-watermark credit must stay queued rather than flush on its
+        # own; the PING round trip proves nothing arrived ahead of its
+        # acknowledgement (a hard cast fails loudly if it did).
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "watermrk")
+        ping.write(io)
+        io.flush
+        acknowledgement = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        acknowledgement.ack?.should be_true
+        acknowledgement.payload.should eq(ping.payload)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream)
+        stream_id.send(stream.id)
+        data_sent.receive
+
+        eventually { stream.body.buffered_bytes == 8 }
+        buffer = Bytes.new(4)
+        stream.body.read_fully(buffer)
+        read_done.send(nil)
+
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "flushes stream and connection receive credit once consumption " \
+     "crosses the watermark" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      first_chunk_sent = Channel(Nil).new(1)
+      first_chunk_read = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        # First chunk (20_000 bytes, two DATA frames) stays below the
+        # 32_767 stream watermark (65_535 // 2 at the library default).
+        HTTP2::Frame::Data.new(
+          0_u8,
+          id,
+          Bytes.new(HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD, 0x61_u8)
+        ).write(io)
+        HTTP2::Frame::Data.new(0_u8, id, Bytes.new(3_616, 0x61_u8)).write(io)
+        io.flush
+        first_chunk_sent.send(nil)
+        first_chunk_read.receive
+
+        # Second chunk (13_000 bytes, one DATA frame, one read) pushes
+        # cumulative consumption to 33_000 — past the watermark in a
+        # single atomic credit release.
+        HTTP2::Frame::Data.new(0_u8, id, Bytes.new(13_000, 0x62_u8)).write(io)
+        io.flush
+
+        connection_update = HTTP2::Frame.read(io)
+          .as(HTTP2::Frame::WindowUpdate)
+        connection_update.stream_id.should eq(0_u32)
+        connection_update.window_size_increment.should eq(33_000_u32)
+        stream_update = HTTP2::Frame.read(io)
+          .as(HTTP2::Frame::WindowUpdate)
+        stream_update.stream_id.should eq(id)
+        stream_update.window_size_increment.should eq(33_000_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream)
+        stream_id.send(stream.id)
+        first_chunk_sent.receive
+
+        eventually { stream.body.buffered_bytes == 20_000 }
+        first_buffer = Bytes.new(20_000)
+        stream.body.read_fully(first_buffer)
+        first_chunk_read.send(nil)
+
+        eventually { stream.body.buffered_bytes == 13_000 }
+        second_buffer = Bytes.new(13_000)
+        stream.body.read_fully(second_buffer)
+
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "schedules concurrent uploads fairly and keeps control frames moving" do
     UNIXSocket.pair do |client, peer|
       stream_ids = Channel(Tuple(UInt32, UInt32)).new(1)

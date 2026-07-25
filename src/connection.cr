@@ -759,12 +759,19 @@ module HTTP2
     # stream body. Connection credit is always restored; stream credit is
     # omitted once the peer has ended that stream.
     #
+    # Credit always accumulates, but the writer is only woken once pending
+    # credit reaches a half-window watermark (connection or stream scope) —
+    # coalescing what would otherwise be a WINDOW_UPDATE pair on every body
+    # read. A writer woken for any OTHER reason still flushes all pending
+    # credit unconditionally (see `take_pending_window_updates`); this is by
+    # design, not a bug — the watermark only gates the wake, not the send.
+    #
     # :nodoc:
     def release_receive_credit(stream_id : UInt32, amount : Int32) : Nil
       return if amount <= 0
 
-      wake = @mutex.synchronize do
-        next false if @state.closed?
+      wake, replenished = @mutex.synchronize do
+        next {false, false} if @state.closed?
 
         queue_connection_credit_unlocked(amount.to_i64)
         if stream = @streams[stream_id]?
@@ -774,9 +781,9 @@ module HTTP2
               (@pending_stream_window_updates[stream_id]? || 0_i64) + amount
           end
         end
-        true
+        {true, replenishment_due_unlocked?(stream_id)}
       end
-      wake_flow_control if wake
+      wake_flow_control if wake && replenished
     end
 
     private def submit(command : WriteCommand) : Nil
@@ -810,6 +817,23 @@ module HTTP2
       return if amount <= 0
 
       @pending_connection_window_update += amount
+    end
+
+    # Whether pending receive credit has reached a half-window watermark and
+    # the writer should be woken to flush it. Crossing either scope's
+    # watermark wakes the writer, which then flushes ALL pending credit
+    # (connection and every stream) — not just the scope that crossed.
+    private def replenishment_due_unlocked?(stream_id : UInt32) : Bool
+      connection_watermark =
+        @configuration.connection_receive_window.to_i64 // 2
+      return true if @pending_connection_window_update >= connection_watermark
+
+      if pending = @pending_stream_window_updates[stream_id]?
+        stream_watermark =
+          @effective_local_settings_state.initial_window_size.to_i64 // 2
+        return true if pending >= stream_watermark
+      end
+      false
     end
 
     private def wake_flow_control : Nil
@@ -1671,7 +1695,15 @@ module HTTP2
 
         overhead = frame.payload.size - data.size
         release_receive_credit(stream.id, overhead) if overhead > 0
-        stream.finish_body if frame.end_stream?
+        if frame.end_stream?
+          stream.finish_body
+          # The peer will send no more DATA on this stream, so whatever
+          # credit is still pending (this stream's, and any connection
+          # credit accumulated alongside it) has no further reads left to
+          # coalesce with — flush it now instead of waiting on a watermark
+          # that this stream can no longer help cross.
+          wake_flow_control
+        end
         wake_drain_monitor if stream.closed?
       rescue error : ProtocolError
         release_discarded_connection_credit(flow_size) if error.stream?
@@ -1816,7 +1848,13 @@ module HTTP2
         )
       end
       if section = event.as?(FieldSection)
-        stream.finish_body if section.end_stream?
+        if section.end_stream?
+          stream.finish_body
+          # See the matching comment in `handle_inbound_data`: no more DATA
+          # can follow END_STREAM on this stream, so flush now rather than
+          # waiting on a watermark this stream can no longer help cross.
+          wake_flow_control
+        end
       end
       wake_drain_monitor if stream.closed?
     end
