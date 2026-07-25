@@ -170,10 +170,14 @@ module HTTP2
     # `tls_context`, whether supplied or defaulted, is used for every
     # `https` dial this client makes (`#dial`'s single `Connection.connect_tls`
     # call reuses the SAME `@tls_context` for the client's whole
-    # lifetime) and is configured for ALPN "h2" in place, at most once —
-    # see `Connection.start_tls`'s and `.ensure_alpn_h2`'s doc comments for
-    # the full contract. Do not share one `tls_context` between two
-    # `Client`s that need it configured differently.
+    # lifetime) and is configured for ALPN "h2" in place, unconditionally,
+    # on every dial — see `Connection.start_tls`'s doc comment for the
+    # full contract, including why this is self-healing against anything
+    # else that changes it between dials. The symmetric caveat: do not
+    # share one `tls_context` with a different consumer (another
+    # `Client` configured differently, or anything outside this library)
+    # that needs a different, stable ALPN protocol on it — every dial
+    # through this `Client` overwrites `alpn_protocol` back to "h2".
     def initialize(
       origin : String | URI,
       *,

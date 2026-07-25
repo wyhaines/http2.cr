@@ -184,26 +184,6 @@ module HTTP2
       end
     end
 
-    # :nodoc:
-    #
-    # http2.cr tags a caller-supplied `OpenSSL::SSL::Context::Client` with
-    # whether `.start_tls`/`.connect_tls` have already configured ALPN on
-    # it, so a context reused across many dials — the common case:
-    # `HTTP2::Client` keeps one `tls_context` for its whole lifetime,
-    # reused on every redial — is mutated at most once instead of on
-    # every call. This lives on the stdlib type itself, rather than
-    # tracked http2.cr-side keyed by the context, because OpenSSL exposes
-    # no way to read back what `SSL_CTX_set_alpn_protos` previously
-    # configured (there is no `SSL_CTX_get0_alpn_protos`; the only
-    # OpenSSL getter, `SSL_get0_alpn_selected`, reads the NEGOTIATED
-    # protocol off a post-handshake `SSL*`, not the offer list configured
-    # on an `SSL_CTX*`), and duplicating the context first — to mutate a
-    # copy instead of the caller's original — is not a safe alternative
-    # either; see `.ensure_alpn_h2`'s doc comment below for why.
-    class ::OpenSSL::SSL::Context::Client
-      property? alpn_h2_configured : Bool = false
-    end
-
     # Builds the TLS client context used when a caller does not supply
     # one: `connect_tls`'s and `start_tls`'s default `context:` argument,
     # and `HTTP2::Client`'s default `tls_context`, all call this, so
@@ -230,47 +210,6 @@ module HTTP2
       context
     end
 
-    # Configures ALPN "h2" on `context`, in place, at most once.
-    #
-    # `context` is never given a private copy to mutate instead of the
-    # caller's original: `OpenSSL::SSL::Context::Client` wraps a bare
-    # `SSL_CTX*` behind `@handle`, and Crystal's default `#dup` only
-    # shallow-copies instance variables, so a `dup`'d context would share
-    # that SAME `@handle` with the original (verified while investigating
-    # this task: both report an identical `to_unsafe` pointer address).
-    # Mutating the "copy" would mutate the original's underlying C state
-    # too, buying no isolation — and BOTH Crystal objects would
-    # independently call `LibSSL.ssl_ctx_free(@handle)` from their own
-    # `#finalize`, freeing the same handle twice. `SSL_CTX` also has no
-    # deep-copy operation in OpenSSL itself, so a safe copy is not
-    # available by any route; this library therefore configures the
-    # caller's context in place instead, per the documented fallback for
-    # this situation.
-    #
-    # Because there is no copy, and no OpenSSL getter for a context's
-    # already-configured ALPN offer list (see `alpn_h2_configured?`'s doc
-    # comment above), "in place" would otherwise mean re-mutating a
-    # caller-supplied context on every single dial — most concretely,
-    # `HTTP2::Client` reuses one `tls_context` for every redial over its
-    # whole lifetime. `alpn_h2_configured?` makes this idempotent instead:
-    # the first call configures ALPN and flags the context; every
-    # subsequent call against the SAME object is a no-op.
-    #
-    # **Caller-visible consequence**: do not share one context across two
-    # different `HTTP2::Client`/`connect_tls`/`start_tls` callers that
-    # need it configured differently — the first one to dial wins,
-    # permanently, for the life of that context object. This has no
-    # practical effect on ALPN itself (this library only ever needs
-    # "h2"), but it applies to anything else a caller configures on a
-    # shared context before passing it in: the context is being mutated
-    # in place and reused, not copied.
-    private def self.ensure_alpn_h2(context : OpenSSL::SSL::Context::Client) : Nil
-      return if context.alpn_h2_configured?
-
-      context.alpn_protocol = "h2"
-      context.alpn_h2_configured = true
-    end
-
     # Opens a verified TLS connection that requires ALPN to select `h2`.
     #
     # `read_timeout` and `write_timeout` default to `nil` (no transport
@@ -286,9 +225,10 @@ module HTTP2
     # default to detect a silent peer once active.
     #
     # `context`, whether supplied or defaulted, is configured for ALPN
-    # "h2" IN PLACE, at most once — see `start_tls`'s doc comment and
-    # `.ensure_alpn_h2`'s doc comment for the full contract and why a
-    # private copy is not made instead.
+    # "h2" IN PLACE, unconditionally, on every call — see `start_tls`'s
+    # doc comment for the full contract, why no private copy is made
+    # instead, and the caller-visible consequence of configuring in
+    # place.
     def self.connect_tls(
       host : String,
       port : Int = 443,
@@ -341,13 +281,34 @@ module HTTP2
     # cleartext dial path never blocks on a read before `wait_until_active`
     # is already covering the wait.
     #
-    # `context` is never mutated on a private copy — `.ensure_alpn_h2`
-    # configures ALPN "h2" on the object the caller passed in, in place,
-    # the first time it sees that particular context, and is a no-op on
-    # every later call with the SAME context object (see `.ensure_alpn_h2`'s
-    # doc comment for why no copy is made, and the caller-visible
-    # consequence of configuring in place: do not share one context
-    # across two callers that need it configured differently).
+    # `context` is configured for ALPN "h2" IN PLACE, unconditionally, on
+    # every call — never on a private copy.
+    # `OpenSSL::SSL::Context::Client` wraps a bare `SSL_CTX*` behind
+    # `@handle`, and Crystal's default `#dup` only shallow-copies
+    # instance variables, so a `dup`'d context would share that SAME
+    # `@handle` with the original (verified while investigating this:
+    # both report an identical `to_unsafe` pointer address). Mutating
+    # the "copy" would mutate the original's underlying C state too,
+    # buying no isolation — and BOTH Crystal objects would independently
+    # call `LibSSL.ssl_ctx_free(@handle)` from their own `#finalize`,
+    # freeing the same handle twice. `SSL_CTX` also has no deep-copy
+    # operation in OpenSSL itself, so a safe copy is not available by
+    # any route; ALPN "h2" is mandatory for this library regardless, so
+    # the mutation cannot be avoided either way.
+    # `#alpn_protocol=` internally frees its previous protos buffer and
+    # mem-dups the new one (`SSL_CTX_set_alpn_protos`), so setting it
+    # again on every dial is cheap and safe, not merely tolerated.
+    #
+    # Setting it unconditionally, every dial, is deliberate, not an
+    # oversight: it is SELF-HEALING against anything else that changes
+    # `context.alpn_protocol` between dials — the next dial through this
+    # library re-asserts "h2" regardless of what it finds. The
+    # symmetric, caller-visible consequence: do not share one context
+    # between an `HTTP2::Client`/`connect_tls`/`start_tls` caller and a
+    # DIFFERENT consumer that needs a different, stable ALPN protocol on
+    # it — every dial through this library overwrites `alpn_protocol`
+    # back to "h2" unconditionally, even if that other consumer set it
+    # to something else in between.
     def self.start_tls(
       transport : IO,
       server_name : String,
@@ -356,7 +317,10 @@ module HTTP2
       configuration : Configuration = Configuration.new,
       handshake_read_timeout : Time::Span? = nil,
     ) : self
-      ensure_alpn_h2(context)
+      # In place, unconditionally, every call — see the doc comment
+      # above for why no copy is made and why "every call" (not "once
+      # per context") is the deliberately chosen, self-healing behavior.
+      context.alpn_protocol = "h2"
 
       previous_read_timeout = nil
       if handshake_read_timeout

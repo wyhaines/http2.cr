@@ -291,44 +291,81 @@ describe HTTP2::Connection do
     context.options.includes?(OpenSSL::SSL::Options::NO_TLS_V1_1).should be_true
   end
 
-  it "does not reconfigure ALPN on a context http2.cr already marked as configured" do
-    server = TCPServer.new("127.0.0.1", 0)
-    server_context = tls_server_context
-    peer_result = scripted_peer(server) do |listener|
+  it "self-heals ALPN back to h2 on a context an external party changed " \
+     "between dials" do
+    context = tls_client_context
+
+    server_one = TCPServer.new("127.0.0.1", 0)
+    server_one_context = tls_server_context
+    peer_one_result = scripted_peer(server_one) do |listener|
       socket = listener.as(TCPServer).accept
       tls = OpenSSL::SSL::Socket::Server.new(
         socket,
-        server_context,
+        server_one_context,
         sync_close: true
       )
       begin
-        tls.alpn_protocol.should be_nil
+        tls.alpn_protocol.should eq("h2")
+        complete_server_handshake(tls)
       ensure
         tls.close
       end
     end
 
-    context = tls_client_context
-    # Simulate "http2.cr already configured ALPN on this context" WITHOUT
-    # actually configuring it, proving `start_tls` really does skip
-    # `context.alpn_protocol = "h2"` when this flag is already set rather
-    # than setting it redundantly. This is the only way to observe the
-    # skip: OpenSSL exposes no getter for a context's already-configured
-    # ALPN offer list (see `OpenSSL::SSL::Context::Client#alpn_h2_configured?`'s
-    # doc comment for why). If the guard were missing or inverted, the
-    # client would still offer "h2" here and this would raise nothing.
-    context.alpn_h2_configured = true
-
-    expect_raises(HTTP2::Connection::TLSNegotiationError) do
-      HTTP2::Connection.connect_tls(
-        "127.0.0.1",
-        server.local_address.port,
-        server_name: "example.com",
-        context: context
-      )
+    connection_one = HTTP2::Connection.connect_tls(
+      "127.0.0.1",
+      server_one.local_address.port,
+      server_name: "example.com",
+      context: context
+    )
+    begin
+      connection_one.wait_until_active(2.seconds)
+      connection_one.active?.should be_true
+    ensure
+      connection_one.close
+      wait_for_peer(peer_one_result)
+      server_one.close
     end
-    wait_for_peer(peer_result)
-    server.close
+
+    # Simulate a third party sharing this context (or the caller's own
+    # code) changing ALPN on the SAME context object between dials.
+    # `start_tls` configures ALPN unconditionally, every dial, precisely
+    # so this heals instead of sticking -- see `start_tls`'s doc comment.
+    context.alpn_protocol = "http/1.1"
+
+    server_two = TCPServer.new("127.0.0.1", 0)
+    server_two_context = tls_server_context
+    peer_two_result = scripted_peer(server_two) do |listener|
+      socket = listener.as(TCPServer).accept
+      tls = OpenSSL::SSL::Socket::Server.new(
+        socket,
+        server_two_context,
+        sync_close: true
+      )
+      begin
+        # Proves this dial re-asserted "h2" rather than trusting
+        # whatever the shared context already had configured.
+        tls.alpn_protocol.should eq("h2")
+        complete_server_handshake(tls)
+      ensure
+        tls.close
+      end
+    end
+
+    connection_two = HTTP2::Connection.connect_tls(
+      "127.0.0.1",
+      server_two.local_address.port,
+      server_name: "example.com",
+      context: context
+    )
+    begin
+      connection_two.wait_until_active(2.seconds)
+      connection_two.active?.should be_true
+    ensure
+      connection_two.close
+      wait_for_peer(peer_two_result)
+      server_two.close
+    end
   end
 
   it "keeps negotiating ALPN h2 when a context is reused across dials" do
@@ -367,8 +404,6 @@ describe HTTP2::Connection do
         server.close
       end
     end
-
-    context.alpn_h2_configured?.should be_true
   end
 
   it "scopes the OpenSSL::SSL::Error rescue in start_tls to the handshake " \
@@ -402,10 +437,20 @@ describe HTTP2::Connection do
     # `OpenSSL::SSL::Error`.
     source = File.read(File.join(__DIR__, "..", "src", "connection.cr"))
     start_tls_start = source.index!("def self.start_tls")
+    # End-of-region delimiter: the literal text of the NEXT method
+    # (`start`, the instance method right after `start_tls` today). This
+    # is a source-position heuristic, not a real method boundary -- if a
+    # new method is ever inserted between `start_tls` and `start`, this
+    # slice silently grows to include it too (it would still find "def
+    # start : self" correctly, just further down), which would not
+    # necessarily fail the assertions below but WOULD mean they are no
+    # longer checking only `start_tls`'s own body. Re-pick a delimiter
+    # immediately after `start_tls` if that ever happens.
     method_end = source.index!("def start : self", start_tls_start)
     body = source[start_tls_start...method_end]
 
     handshake_call = body.index!("OpenSSL::SSL::Socket::Client.new(")
+    alpn_check = body.index!("unless tls.alpn_protocol")
     connection_start_call = body.index!("connection.start")
 
     typed_rescue_occurrences =
@@ -414,6 +459,10 @@ describe HTTP2::Connection do
 
     typed_rescue_index = body.index!("rescue error : OpenSSL::SSL::Error")
     typed_rescue_index.should be > handshake_call
+    # The narrow rescue's scope must close before EVEN the ALPN check --
+    # not just before `connection.start` -- since the intended scope is
+    # "the handshake construction call, and nothing else."
+    typed_rescue_index.should be < alpn_check
     typed_rescue_index.should be < connection_start_call
 
     bare_rescue_index =
