@@ -72,4 +72,30 @@ describe HTTP2::Headers do
       HTTP2::Header.new("x-value", "Two"),
     ])
   end
+
+  it "selects the never-index wire marker for sensitive fields by their downcased interop name" do
+    # RFC 7541 §6.2.3: a literal never-indexed representation is a wire
+    # marker forwarding intermediaries must preserve and must never promote
+    # to an indexed form; RFC 7541 §6.2.2 (`Indexing::None`) carries no such
+    # guarantee. This pins that *selection* surviving interop casing, not
+    # dynamic-table insertion — `to_header_fields` never emits
+    # `Indexing::Incremental`, so nothing reaches the HPACK dynamic table
+    # either way today. The distinction becomes a real confidentiality
+    # boundary once a future policy adds incremental indexing for
+    # non-sensitive fields.
+    sensitive = HTTP2::Headers.new(HTTP::Headers{
+      "Authorization"       => "secret",
+      "Proxy-Authorization" => "also-secret",
+      "Cookie"              => "session=abc",
+    }).to_header_fields
+    sensitive.map(&.indexing).should eq([
+      HTTP2::HeaderField::Indexing::Never,
+      HTTP2::HeaderField::Indexing::Never,
+      HTTP2::HeaderField::Indexing::Never,
+    ])
+
+    ordinary = HTTP2::Headers.new(HTTP::Headers{"Content-Type" => "text/plain"})
+      .to_header_fields.first
+    ordinary.indexing.should eq(HTTP2::HeaderField::Indexing::None)
+  end
 end
