@@ -332,7 +332,14 @@ class StallingBufferedWriteIO < IO
 
   private def unbuffered_write(slice : Bytes) : Nil
     if @stalled
-      @entered_write.send(nil)
+      # Best-effort, non-blocking signal: `@entered_write` has capacity 1,
+      # so a second stalled write with no consumer in between must not
+      # block here (that would be the double itself deadlocking, not the
+      # simulated stall this class exists to reproduce).
+      select
+      when @entered_write.send(nil)
+      else
+      end
       @stall.receive?
       raise IO::Error.new("transport closed while a write was stalled")
     end
@@ -351,5 +358,9 @@ class StallingBufferedWriteIO < IO
 
   private def unbuffered_rewind : Nil
     raise IO::Error.new("can't rewind")
+  end
+
+  def closed? : Bool
+    @closed
   end
 end

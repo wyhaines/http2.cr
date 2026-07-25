@@ -21,6 +21,15 @@ module HTTP2
     getter configuration : Configuration
     getter local_settings : Frame::Settings
 
+    # :nodoc:
+    #
+    # The raw (pre-TLS-wrapping) transport `.start_tls` dialed, when this
+    # connection is a TLS one; `nil` for every other constructor (cleartext,
+    # or a caller-supplied `@transport` via `.start`). `#close_transport`
+    # closes this directly instead of routing a force-close through the TLS
+    # wrapper's own `#close` — see `#close_transport` for why.
+    property tls_raw_transport : IO?
+
     @state = State::New
     @terminal_error : Exception?
     @peer_settings : Frame::Settings?
@@ -273,7 +282,9 @@ module HTTP2
         end
       end
 
-      new(tls, configuration).start
+      connection = new(tls, configuration)
+      connection.tls_raw_transport = transport
+      connection.start
     rescue error : OpenSSL::SSL::Error
       transport.close unless transport.closed?
       raise TLSVerificationError.new(server_name, error)
@@ -2331,26 +2342,60 @@ module HTTP2
       end
     end
 
-    # Closes without flushing whatever the write buffer still holds. Plain
-    # `IO::Buffered#close` flushes first, which can deadlock against a
-    # stalled peer once write buffering is enabled — see
-    # `close_discarding_buffer` (src/connection/buffered_close.cr) for the
-    # full trace. `@transport` is typed as the untyped `IO`, so this
-    # narrows via `#as?(IO::Buffered)` (a plain `responds_to?` guard does
-    # not narrow an ivar typed as the fully open `IO` hierarchy the way it
-    # does a closed union — `crystal build` rejects it): the buffer-discarding
-    # path applies whenever `@transport` is `IO::Buffered` (every real
-    # `TCPSocket`/`OpenSSL::SSL::Socket` transport this class constructs,
-    # for both h2c and TLS) and falls back to a plain `#close` for any
-    # other caller-supplied `IO`.
+    # Force-closes the transport promptly, without flushing whatever the
+    # write buffer still holds. Plain `IO::Buffered#close` flushes first,
+    # which can deadlock against a stalled peer once write buffering is
+    # enabled — see `close_discarding_buffer`
+    # (src/connection/buffered_close.cr) for the h2c trace. `@transport` is
+    # typed as the untyped `IO`, so `#close_io_discarding_buffer` narrows
+    # via `#as?(IO::Buffered)` (a plain `responds_to?` guard does not
+    # narrow an ivar typed as the fully open `IO` hierarchy the way it does
+    # a closed union — `crystal build` rejects it).
+    #
+    # **TLS is not covered by the h2c mechanism above.** For a TLS
+    # connection, `@transport` is an `OpenSSL::SSL::Socket`, and its own
+    # `#unbuffered_close` unconditionally calls `SSL_shutdown` — which
+    # WRITES a close_notify alert through the underlying socket regardless
+    # of `close_discarding_buffer`'s `@out_count` zeroing (that only
+    # short-circuits the TLS *wrapper's own* buffered-frame flush; it has
+    # no effect on `SSL_shutdown`'s independent write). Against a stalled
+    # peer with no `write_timeout` — the documented default — that write
+    # can block indefinitely, with nothing else in the process positioned
+    # to force it to return (unlike the h2c case, there is no second fiber
+    # contending for a lock here to reason about — see the P1.8 task
+    # report's review-round-2 fix section for the full trace and the
+    # reentrant-`SSL_shutdown` case this does NOT cover). So for TLS this
+    # method instead closes `@tls_raw_transport` (the raw socket
+    # `.start_tls` dialed, before TLS wrapping) directly, forcing the
+    # underlying `send(2)`/`close(2)` to unwind promptly, and deliberately
+    # does **not** additionally invoke anything on the TLS wrapper
+    # (`@transport`) itself: once the raw socket is closed,
+    # `SSL_shutdown`'s write would hit the wrapper's BIO callback
+    # (`openssl/bio.cr`'s `write_ex`/`write`, which call `bio.io.write`
+    # with no rescue at all), which would raise on the now-closed IO from
+    # inside a callback invoked by OpenSSL's C code — unsafe to attempt
+    # deliberately. The TLS wrapper's own `@ssl` handle is still freed
+    # (via `OpenSSL::SSL::Socket#finalize`, `LibSSL.ssl_free`, the same
+    # backstop Crystal's own `Socket#finalize` relies on) once this
+    # `Connection` is garbage-collected; skipping the close_notify
+    # handshake matches `#close`'s own documented, forceful semantics
+    # ("idempotently terminates the runtime"), not `#graceful_close`'s.
     private def close_transport : Nil
-      if buffered = @transport.as?(IO::Buffered)
-        buffered.close_discarding_buffer
+      if raw = @tls_raw_transport
+        close_io_discarding_buffer(raw)
       else
-        @transport.close
+        close_io_discarding_buffer(@transport)
       end
     rescue
       # The connection's stored terminal error remains authoritative.
+    end
+
+    private def close_io_discarding_buffer(io : IO) : Nil
+      if buffered = io.as?(IO::Buffered)
+        buffered.close_discarding_buffer
+      else
+        io.close
+      end
     end
 
     private def send_graceful_goaway : Nil

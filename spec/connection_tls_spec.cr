@@ -171,6 +171,76 @@ describe HTTP2::Connection do
     server.close
   end
 
+  it "closes promptly against a TLS peer with a backed-up socket and " \
+     "no write timeout" do
+    server = TCPServer.new("127.0.0.1", 0)
+    server_context = tls_server_context
+    release = Channel(Nil).new(1)
+    peer_result = scripted_peer(server) do |listener|
+      socket = listener.as(TCPServer).accept
+      socket.recv_buffer_size = 2048
+      tls = OpenSSL::SSL::Socket::Server.new(
+        socket,
+        server_context,
+        sync_close: true
+      )
+      begin
+        complete_server_handshake(tls)
+        # Never read again: the peer has stopped draining, so the
+        # client's kernel send buffer backs up and stays backed up.
+        release.receive
+      ensure
+        tls.close
+      end
+    end
+
+    transport = TCPSocket.new("127.0.0.1", server.local_address.port)
+    transport.send_buffer_size = 4096
+    connection = HTTP2::Connection.start_tls(
+      transport,
+      "example.com",
+      context: tls_client_context
+    )
+    connection.wait_until_active(2.seconds)
+
+    # Back up the kernel send buffer by writing directly on the raw
+    # transport, bypassing HTTP2::Connection's own writer entirely, so
+    # the connection's writer fiber stays genuinely idle throughout. This
+    # reproduces "writer idle, socket backed up" -- the interleaving
+    # OpenSSL's SSL_shutdown reentrancy guard does NOT protect against
+    # (unlike a write caught mid SSL_write, which fails fast instead of
+    # blocking -- see close_transport's comment in src/connection.cr).
+    # A bounded write_timeout here is a probe, not a fix: it only proves
+    # the buffer is now full, then gets cleared so the close attempt
+    # below runs under the documented dangerous default (`nil`).
+    transport.write_timeout = 500.milliseconds
+    expect_raises(IO::TimeoutError) do
+      transport.write(Bytes.new(1_000_000))
+    end
+    transport.write_timeout = nil
+
+    closed = Channel(Nil).new(1)
+    spawn(name: "closer") do
+      connection.close
+      closed.send(nil)
+    end
+
+    select
+    when closed.receive
+    when timeout(6.seconds)
+      fail(
+        "Connection#close hung against a TLS peer with a backed-up " \
+        "socket and no write timeout"
+      )
+    end
+
+    connection.closed?.should be_true
+
+    release.send(nil)
+    wait_for_peer(peer_result)
+    server.close
+  end
+
   it "restores a caller's persistent read_timeout after the TLS handshake" do
     server = TCPServer.new("127.0.0.1", 0)
     release = Channel(Nil).new(1)
