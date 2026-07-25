@@ -193,8 +193,16 @@ class StallingWriteIO < IO
   @closed_signal = Channel(Nil).new
   @stall = Channel(Nil).new
   @stalled = false
+  @gated_data : Bytes
+  @gate = Channel(Nil).new
 
-  def initialize
+  # `gated_data` is served to readers only after `#release_gated_reads!` is
+  # called, not from construction. This lets a caller open streams (so the
+  # connection has registered state to react to) before the reader fiber can
+  # observe frames that depend on that state, avoiding a race between "the
+  # reader consumes the gated bytes" and "the test finishes registering the
+  # stream those bytes target."
+  def initialize(@gated_data : Bytes = Bytes.empty)
     handshake = IO::Memory.new
     HTTP2::Frame::Settings
       .new([] of HTTP2::Frame::Settings::Setting)
@@ -208,17 +216,36 @@ class StallingWriteIO < IO
     @stalled = true
   end
 
+  # Appends the bytes supplied to the constructor to the readable stream and
+  # wakes a reader parked past the previously available data. `@gate` is
+  # unbuffered, so this blocks until a reader is parked in `#read` to receive
+  # the signal — safe as long as the reader fiber is alive and eventually
+  # reaches that point (it does not need to be parked there yet).
+  def release_gated_reads! : Nil
+    combined = IO::Memory.new
+    combined.write(@read_data)
+    combined.write(@gated_data)
+    @read_data = combined.to_slice
+    @gate.send(nil)
+  end
+
   def read(slice : Bytes) : Int32
     return 0 if @closed
 
-    if @read_offset < @read_data.size
-      count = Math.min(slice.size, @read_data.size - @read_offset)
-      slice[0, count].copy_from(@read_data[@read_offset, count])
-      @read_offset += count
-      count
-    else
-      @closed_signal.receive?
-      0
+    loop do
+      if @read_offset < @read_data.size
+        count = Math.min(slice.size, @read_data.size - @read_offset)
+        slice[0, count].copy_from(@read_data[@read_offset, count])
+        @read_offset += count
+        return count
+      end
+
+      select
+      when @closed_signal.receive?
+        return 0
+      when @gate.receive?
+        # `@read_data` grew (or the gate channel closed); loop and re-check.
+      end
     end
   end
 

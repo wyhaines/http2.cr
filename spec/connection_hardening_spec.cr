@@ -1,5 +1,19 @@
 require "./spec_helper"
 
+private def encode_headers_frame(
+  encoder : HPack::Encoder,
+  stream_id : UInt32,
+  fields : Array(Tuple(String, String)),
+  *,
+  end_stream : Bool = false,
+) : Bytes
+  flags = HTTP2::Frame::Headers::Flags::END_HEADERS
+  flags |= HTTP2::Frame::Headers::Flags::END_STREAM if end_stream
+  io = IO::Memory.new
+  HTTP2::Frame::Headers.new(flags, stream_id, encoder.encode(fields)).write(io)
+  io.to_slice
+end
+
 describe HTTP2::Connection::Configuration do
   it "validates Phase 7 lifecycle and resource limits" do
     expect_raises(ArgumentError, /open-stream/) do
@@ -290,6 +304,72 @@ describe HTTP2::Connection do
       ) { connection.closed? }
       connection.terminal_error
         .should be_a(HTTP2::Connection::KeepaliveTimeoutError)
+    ensure
+      connection.close
+    end
+  end
+
+  it "keeps the reader processing after a stream violation against a " \
+     "stalled transport, with keepalive disabled" do
+    encoder = HPack::Encoder.new
+    violation = encode_headers_frame(
+      encoder,
+      1_u32,
+      [{":status", "099"}]
+    )
+    healthy = encode_headers_frame(
+      encoder,
+      3_u32,
+      [{":status", "200"}],
+      end_stream: true
+    )
+    extra = IO::Memory.new
+    extra.write(violation)
+    extra.write(healthy)
+
+    # Default configuration: keepalive_interval is nil, so no keepalive
+    # safety net can rescue a parked reader. This isolates the behavior
+    # under test to the reader's own handling of the violation reset.
+    transport = StallingWriteIO.new(extra.to_slice)
+    connection = HTTP2::Connection.start(transport)
+    begin
+      connection.wait_until_active(1.second)
+
+      violated = connection.new_stream
+      violated.inbound_validator =
+        HTTP2::ResponseValidator.new(violated.id, "GET")
+      open_client_stream(violated)
+
+      healthy_stream = connection.new_stream
+      healthy_stream.inbound_validator =
+        HTTP2::ResponseValidator.new(healthy_stream.id, "GET")
+      open_client_stream(healthy_stream)
+
+      # Stall the transport, then release the gated response bytes. Both
+      # streams are registered before either frame becomes readable, so the
+      # reader cannot observe the malformed section before the violated
+      # stream exists.
+      transport.stall!
+      transport.release_gated_reads!
+
+      # The discriminator: a frame for an unrelated, healthy stream sits
+      # right behind the violation in the read buffer. Delivering it to the
+      # application requires no transport write at all, so it only arrives
+      # if the reader fiber returns from handling the violation and loops
+      # back to read the next frame — i.e. it proves the reader did not
+      # park inside the violation reset's write-completion wait.
+      healthy_stream.receive(1.second).should be_a(
+        HTTP2::Connection::FieldSection
+      )
+
+      # The violated stream still terminates locally with its protocol
+      # error even though the RST_STREAM frame itself can never reach the
+      # (permanently stalled) wire.
+      expect_raises(HTTP2::MalformedResponseError) do
+        violated.receive(1.second)
+      end
+
+      connection.closed?.should be_false
     ensure
       connection.close
     end

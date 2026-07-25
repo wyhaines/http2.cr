@@ -890,6 +890,30 @@ module HTTP2
       submit(WriteCommand.reset(frame, error))
     end
 
+    # Reader-fiber counterpart of #send_reset. Builds the identical
+    # WriteCommand and enqueues it under the identical @submission_mutex —
+    # the planning/state-transition work (see #prepare_outbound and the
+    # plan_outbound_* family) always runs later on the writer fiber
+    # regardless of which variant submitted the command, so nothing about
+    # that path changes here. The only difference is #submit_nowait in
+    # place of #submit: this returns as soon as the command is queued
+    # instead of waiting for the writer to flush it, so the reader can never
+    # block on transport flush while reacting to a stream violation. The
+    # reader may still block briefly on @write_queue's bounded capacity
+    # (drained by the writer, or by connection termination) — that is the
+    # same accepted tradeoff #submit_nowait already carries for PING/SETTINGS
+    # ACKs.
+    #
+    # Used only by reader-loop callers (stream-violation and rejected-promise
+    # handling); user-triggered resets (cancel/close) keep #send_reset so the
+    # caller still observes the outcome of its own request.
+    private def send_reset_nowait(
+      frame : Frame::ResetStream,
+      error : Exception,
+    ) : Nil
+      submit_nowait(WriteCommand.reset(frame, error))
+    end
+
     private def register_ping(waiter : PingWaiter) : Nil
       @mutex.synchronize do
         raise_terminal_or_state_unlocked! if @state.closed?
@@ -1614,7 +1638,7 @@ module HTTP2
       return unless stream
 
       reset = Frame::ResetStream.new(promised_id, ErrorCode::CANCEL)
-      send_reset(
+      send_reset_nowait(
         reset,
         CanceledError.new(promised_id, ErrorCode::CANCEL)
       )
@@ -1628,7 +1652,7 @@ module HTTP2
       return unless stream && stream.state.reserved_remote?
 
       reset = Frame::ResetStream.new(promised_id, ErrorCode::CANCEL)
-      send_reset(
+      send_reset_nowait(
         reset,
         CanceledError.new(promised_id, ErrorCode::CANCEL)
       )
@@ -2108,7 +2132,7 @@ module HTTP2
       return unless stream
 
       emit_error(error, id)
-      send_reset(
+      send_reset_nowait(
         Frame::ResetStream.new(id, error.error_code),
         error
       )
