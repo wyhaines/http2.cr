@@ -269,3 +269,87 @@ class StallingWriteIO < IO
     @closed
   end
 end
+
+# Buffered counterpart to `StallingWriteIO`: a real `IO::Buffered` type
+# (like `TCPSocket`/`OpenSSL::SSL::Socket`, and unlike `StallingWriteIO`,
+# which is a plain `IO`) whose `#unbuffered_write` blocks once stalled. This
+# lets specs exercise `Connection#close_transport`'s buffered-close path
+# (P1.8 review finding: `IO::Buffered#close` flushes pending output before
+# closing, which can deadlock against a stalled peer) deterministically,
+# without a real socket or kernel-send-buffer-exhaustion timing.
+class StallingBufferedWriteIO < IO
+  include IO::Buffered
+
+  @read_data : Bytes
+  @read_offset = 0
+  @closed = false
+  @closed_signal = Channel(Nil).new
+  @stall = Channel(Nil).new
+  @stalled = false
+  @entered_write = Channel(Nil).new(1)
+
+  def initialize
+    handshake = IO::Memory.new
+    HTTP2::Frame::Settings
+      .new([] of HTTP2::Frame::Settings::Setting)
+      .write(handshake)
+    HTTP2::Frame::Settings.ack.write(handshake)
+    @read_data = handshake.to_slice
+  end
+
+  # After this call, any write that reaches `#unbuffered_write` blocks
+  # until the transport is force-closed (mirroring `StallingWriteIO#stall!`).
+  def stall! : Nil
+    @stalled = true
+  end
+
+  # Blocks until a write has actually entered the stalled
+  # `#unbuffered_write` call — i.e., there really is buffered output
+  # pending behind a blocked write — so a spec can deterministically
+  # synchronize before exercising `Connection#close` against it, instead
+  # of racing an arbitrary sleep.
+  def wait_until_write_stalled(timeout : Time::Span) : Nil
+    select
+    when @entered_write.receive?
+    when timeout(timeout)
+      raise "no write ever reached the stalled transport"
+    end
+  end
+
+  private def unbuffered_read(slice : Bytes) : Int32
+    return 0 if @closed
+
+    if @read_offset < @read_data.size
+      count = Math.min(slice.size, @read_data.size - @read_offset)
+      slice[0, count].copy_from(@read_data[@read_offset, count])
+      @read_offset += count
+      count
+    else
+      @closed_signal.receive?
+      0
+    end
+  end
+
+  private def unbuffered_write(slice : Bytes) : Nil
+    if @stalled
+      @entered_write.send(nil)
+      @stall.receive?
+      raise IO::Error.new("transport closed while a write was stalled")
+    end
+  end
+
+  private def unbuffered_flush : Nil
+  end
+
+  private def unbuffered_close : Nil
+    return if @closed
+
+    @closed = true
+    @stall.close
+    @closed_signal.close
+  end
+
+  private def unbuffered_rewind : Nil
+    raise IO::Error.new("can't rewind")
+  end
+end

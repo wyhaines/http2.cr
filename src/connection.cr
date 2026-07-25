@@ -2331,8 +2331,24 @@ module HTTP2
       end
     end
 
+    # Closes without flushing whatever the write buffer still holds. Plain
+    # `IO::Buffered#close` flushes first, which can deadlock against a
+    # stalled peer once write buffering is enabled — see
+    # `close_discarding_buffer` (src/connection/buffered_close.cr) for the
+    # full trace. `@transport` is typed as the untyped `IO`, so this
+    # narrows via `#as?(IO::Buffered)` (a plain `responds_to?` guard does
+    # not narrow an ivar typed as the fully open `IO` hierarchy the way it
+    # does a closed union — `crystal build` rejects it): the buffer-discarding
+    # path applies whenever `@transport` is `IO::Buffered` (every real
+    # `TCPSocket`/`OpenSSL::SSL::Socket` transport this class constructs,
+    # for both h2c and TLS) and falls back to a plain `#close` for any
+    # other caller-supplied `IO`.
     private def close_transport : Nil
-      @transport.close
+      if buffered = @transport.as?(IO::Buffered)
+        buffered.close_discarding_buffer
+      else
+        @transport.close
+      end
     rescue
       # The connection's stored terminal error remains authoritative.
     end

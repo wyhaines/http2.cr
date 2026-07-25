@@ -309,6 +309,39 @@ describe HTTP2::Connection do
     end
   end
 
+  it "closes promptly against a stalled peer with buffered output " \
+     "pending and no write timeout" do
+    transport = StallingBufferedWriteIO.new
+    connection = HTTP2::Connection.start(transport)
+    connection.wait_until_active(1.second)
+    transport.stall!
+
+    spawn(name: "stalled-ping") do
+      connection.write_frame(HTTP2::Frame::Ping.new(0_u8, 0_u32, "12345678"))
+    rescue
+      # Expected: the write fails once #close force-closes the transport
+      # out from under it.
+    end
+    transport.wait_until_write_stalled(1.second)
+
+    closed = Channel(Nil).new(1)
+    spawn(name: "closer") do
+      connection.close
+      closed.send(nil)
+    end
+
+    select
+    when closed.receive
+    when timeout(2.seconds)
+      fail(
+        "Connection#close hung against a stalled peer with buffered " \
+        "output pending"
+      )
+    end
+
+    connection.closed?.should be_true
+  end
+
   it "keeps the reader processing after a stream violation against a " \
      "stalled transport, with keepalive disabled" do
     encoder = HPack::Encoder.new
