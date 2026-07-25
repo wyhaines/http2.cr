@@ -155,6 +155,18 @@ module HTTP2
       )
       transport.read_timeout = read_timeout
       transport.write_timeout = write_timeout
+
+      # Cleartext TCP defaults to `sync = true` (every write is its own
+      # `send(2)`); buffering lets the writer coalesce a frame's header and
+      # payload, and multi-frame batches, into fewer syscalls. This is safe
+      # only because every writer code path that writes to `@transport`
+      # (`process_write_command`, `write_scheduled_frames`,
+      # `write_scheduled_data`) calls `@transport.flush` immediately
+      # afterward, before the writer fiber can next block waiting for work —
+      # see the flush audit in the P1.8 task report. The TLS path is left
+      # untouched: `OpenSSL::SSL::Socket` already buffers internally.
+      transport.sync = false
+
       begin
         new(transport, configuration).start
       rescue error

@@ -1,5 +1,26 @@
 require "./spec_helper"
 
+# Wraps `IO::Memory` and counts `#write` invocations, so specs can assert how
+# many underlying writes (one `send(2)` syscall apiece on a real socket) a
+# higher-level `#write` method issues.
+class CountingWriteIO < IO
+  getter write_calls = 0
+  @memory = IO::Memory.new
+
+  def write(slice : Bytes) : Nil
+    @write_calls += 1
+    @memory.write(slice)
+  end
+
+  def read(slice : Bytes) : Int32
+    @memory.read(slice)
+  end
+
+  def to_slice : Bytes
+    @memory.to_slice
+  end
+end
+
 describe HTTP2::Frame do
   it "round-trips every standard frame type" do
     frames = [] of HTTP2::Frames
@@ -128,6 +149,16 @@ describe HTTP2::Frame do
     ).write(io)
     io.rewind
     expect_raises(HTTP2::FrameSizeError) { HTTP2::Frame.read(io) }
+  end
+
+  it "writes a frame in exactly two underlying writes: header, then payload" do
+    frame = HTTP2::Frame::Data.new(0x01_u8, 1_u32, "hello world")
+    io = CountingWriteIO.new
+
+    frame.write(io)
+
+    io.write_calls.should eq(2)
+    io.to_slice.should eq(frame.to_slice)
   end
 
   it "rejects truncated payloads" do

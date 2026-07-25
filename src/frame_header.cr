@@ -43,12 +43,18 @@ module HTTP2
     end
 
     def write(io : IO) : Nil
-      io.write_byte(((length >> 16) & 0xff).to_u8)
-      io.write_byte(((length >> 8) & 0xff).to_u8)
-      io.write_byte((length & 0xff).to_u8)
-      io.write_byte(type_code)
-      io.write_byte(flags)
-      io.write_bytes(stream_id & RESERVED_STREAM_MASK, IO::ByteFormat::BigEndian)
+      masked_stream_id = stream_id & RESERVED_STREAM_MASK
+      bytes = uninitialized UInt8[SIZE]
+      bytes[0] = ((length >> 16) & 0xff).to_u8
+      bytes[1] = ((length >> 8) & 0xff).to_u8
+      bytes[2] = (length & 0xff).to_u8
+      bytes[3] = type_code
+      bytes[4] = flags
+      bytes[5] = ((masked_stream_id >> 24) & 0xff).to_u8
+      bytes[6] = ((masked_stream_id >> 16) & 0xff).to_u8
+      bytes[7] = ((masked_stream_id >> 8) & 0xff).to_u8
+      bytes[8] = (masked_stream_id & 0xff).to_u8
+      io.write(bytes.to_slice)
     end
   end
 end
