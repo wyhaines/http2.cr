@@ -48,6 +48,7 @@ module HTTP2
     @drain_done = Channel(Nil).new
     @keepalive_wakeup = Channel(Nil).new(1)
     @keepalive_done = Channel(Nil).new
+    @stream_slot_wakeup = Channel(Nil).new(1)
     @writer_started = false
     @preface_sent = false
     @reader_started = false
@@ -431,6 +432,34 @@ module HTTP2
           @configuration.max_buffered_body_bytes
         )
         @streams[id] = stream
+      end
+    end
+
+    # Waits for a peer-imposed concurrent-stream slot to possibly have
+    # freed up, for `cancellation` to fire, or for `timeout` to elapse —
+    # whichever happens first. Returns in all three cases without
+    # raising: the caller is expected to retry the `#send_headers` call
+    # that raised `ConcurrentStreamLimitError` (and to check its own
+    # cancellation/deadline), so a stale or spurious wakeup here is
+    # harmless — it costs at most one extra retry. Used by `HTTP2::Client`
+    # to implement `Timeouts#stream_slot`.
+    #
+    # :nodoc:
+    def wait_for_stream_slot(
+      timeout : Time::Span,
+      cancellation : Channel(Nil)? = nil,
+    ) : Nil
+      if cancellation
+        select
+        when @stream_slot_wakeup.receive?
+        when cancellation.receive?
+        when timeout(timeout)
+        end
+      else
+        select
+        when @stream_slot_wakeup.receive?
+        when timeout(timeout)
+        end
       end
     end
 
@@ -2215,6 +2244,7 @@ module HTTP2
       @flow_control_wakeup.close
       @drain_wakeup.close
       @keepalive_wakeup.close
+      @stream_slot_wakeup.close
       @handshake_done.close
       @closed_signal.close
 
@@ -2401,7 +2431,14 @@ module HTTP2
       end
     end
 
+    # Wakes the drain monitor (if running) and, unconditionally, any
+    # caller parked in `#wait_for_stream_slot` — both care about the same
+    # underlying event (a stream leaving the active state), so this is
+    # called from every site that already pokes the drain monitor after
+    # such a transition, instead of duplicating those call sites.
     private def wake_drain_monitor : Nil
+      wake_stream_slot_waiters
+
       return unless @drain_started
 
       select
@@ -2410,6 +2447,15 @@ module HTTP2
       end
     rescue Channel::ClosedError
       # Connection shutdown already woke the monitor.
+    end
+
+    private def wake_stream_slot_waiters : Nil
+      select
+      when @stream_slot_wakeup.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Connection shutdown already woke any waiters.
     end
 
     private def start_keepalive : Nil

@@ -271,6 +271,28 @@ private def read_until_reset(io : IO) : HTTP2::Frame::ResetStream
   end
 end
 
+# Reads frames until both a RST_STREAM and a connection-level (stream 0)
+# WINDOW_UPDATE have been observed, in either order, and returns both.
+private def read_reset_and_connection_credit(
+  io : IO,
+) : Tuple(HTTP2::Frame::ResetStream, HTTP2::Frame::WindowUpdate)
+  reset = nil
+  credit = nil
+  loop do
+    frame = HTTP2::Frame.read(io)
+    case frame
+    when HTTP2::Frame::ResetStream
+      reset = frame
+    when HTTP2::Frame::WindowUpdate
+      credit = frame if frame.stream_id.zero?
+    end
+
+    if (found_reset = reset) && (found_credit = credit)
+      return {found_reset, found_credit}
+    end
+  end
+end
+
 private def read_client_data(io : IO) : HTTP2::Frame::Data
   loop do
     frame = HTTP2::Frame.read(io)
@@ -633,6 +655,125 @@ describe HTTP2::Client do
         )
         observed.each(&.body.gets_to_end.should(be_empty))
         wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "raises the peer concurrent-stream limit immediately without a configured stream_slot wait" do
+    UNIXSocket.pair do |client_io, peer|
+      first_seen = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        settings = HTTP2::Frame::Settings.new([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::MAX_CONCURRENT_STREAMS,
+            1_u32
+          ),
+        ])
+        complete_server_handshake(io, settings)
+        read_client_headers(io)
+        first_seen.send(nil)
+        # The first stream is left open (no response); the second
+        # attempt below must not reach the peer at all.
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      first_result = Channel(Exception?).new(1)
+      begin
+        spawn do
+          begin
+            http.get("/first")
+            first_result.send(nil)
+          rescue error
+            first_result.send(error)
+          end
+        end
+
+        first_seen.receive
+        expect_raises(HTTP2::Connection::ConcurrentStreamLimitError) do
+          http.get("/second")
+        end
+      ensure
+        http.close
+        first_result.receive
+        wait_for_peer(peer_result)
+      end
+    end
+  end
+
+  it "waits for a peer concurrent-stream slot to free when stream_slot is configured" do
+    UNIXSocket.pair do |client_io, peer|
+      first_seen = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        settings = HTTP2::Frame::Settings.new([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::MAX_CONCURRENT_STREAMS,
+            1_u32
+          ),
+        ])
+        complete_server_handshake(io, settings)
+        decoder = HPack::Decoder.new
+        encoder = HPack::Encoder.new
+        first = client_read_field_section(io, decoder)
+        first_seen.send(nil)
+
+        # Hold the only slot for a while so the second request's HEADERS
+        # genuinely have to wait for `stream_slot`'s wakeup instead of
+        # racing a slot that happened to already be free.
+        quiet = Channel(Nil).new
+        select
+        when quiet.receive
+        when timeout(150.milliseconds)
+        end
+
+        write_server_fields(
+          io,
+          encoder,
+          first[:stream_id],
+          [{":status", "200"}],
+          end_stream: true
+        )
+
+        second = client_read_field_section(io, decoder)
+        write_server_fields(
+          io,
+          encoder,
+          second[:stream_id],
+          [{":status", "200"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(stream_slot: 1.second)
+      )
+      begin
+        first_result = Channel(Exception?).new(1)
+        spawn do
+          begin
+            http.get("/first")
+            first_result.send(nil)
+          rescue error
+            first_result.send(error)
+          end
+        end
+
+        first_seen.receive
+        before = Time.instant
+        response = http.get("/second")
+        response.status.should eq(200)
+        (Time.instant - before).should be >= 100.milliseconds
+
+        wait_for_peer(peer_result)
+        first_result.receive.should be_nil
       ensure
         http.close
       end
@@ -1200,6 +1341,116 @@ describe HTTP2::Client do
     end
   end
 
+  it "cancels an abandoned response's stream and returns its window credit within a bounded wait" do
+    UNIXSocket.pair do |client_io, peer|
+      payload = "unread payload"
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::None,
+          request[:stream_id],
+          payload
+        ).write(io)
+        io.flush
+
+        reset, credit = read_reset_and_connection_credit(io)
+        reset.stream_id.should eq(request[:stream_id])
+        reset.error_code.should eq(HTTP2::ErrorCode::CANCEL.to_u32)
+        credit.window_size_increment.should eq(payload.bytesize)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(idle: 60.milliseconds)
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+        # Deliberately never read `response.body` and never close it —
+        # this is the abandonment the idle deadline exists to recover.
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "does not cancel a response whose reader keeps consuming within each idle period" do
+    UNIXSocket.pair do |client_io, peer|
+      payload = "abcdefghij"
+      finish = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::None,
+          request[:stream_id],
+          payload
+        ).write(io)
+        io.flush
+
+        finish.receive
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          request[:stream_id],
+          Bytes.empty
+        ).write(io)
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(idle: 80.milliseconds)
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+
+        buffer = Bytes.new(1)
+        read = IO::Memory.new
+        payload.bytesize.times do
+          count = response.body.read(buffer)
+          count.should eq(1)
+          read.write(buffer[0, count])
+
+          pause = Channel(Nil).new
+          select
+          when pause.receive
+          when timeout(20.milliseconds)
+          end
+        end
+        read.to_s.should eq(payload)
+
+        # The reads above spanned ~200ms, more than two 80ms idle
+        # periods, but each period saw at least one byte consumed — the
+        # monitor must have re-armed every time instead of canceling.
+        finish.send(nil)
+        response.body.gets_to_end.should eq("")
+        response.trailers.should be_empty
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "keeps a supplied connection's quiet stream alive past the read timeout via keepalive" do
     UNIXSocket.pair do |client_io, peer|
       keepalive_interval = 100.milliseconds
@@ -1393,12 +1644,19 @@ describe HTTP2::Client do
     expect_raises(ArgumentError, /connect timeout/) do
       HTTP2::Client::Timeouts.new(connect: Time::Span.zero)
     end
+    expect_raises(ArgumentError, /stream_slot timeout/) do
+      HTTP2::Client::Timeouts.new(stream_slot: Time::Span.zero)
+    end
     HTTP2::Client::Timeouts.new(
       connect: nil,
       read: nil,
       write: nil,
       idle: nil
     ).idle.should be_nil
+    HTTP2::Client::Timeouts.new.stream_slot.should be_nil
+    HTTP2::Client::Timeouts.new(
+      stream_slot: 1.second
+    ).stream_slot.should eq(1.second)
   end
 
   it "enables keepalive by default in the connection configuration" do

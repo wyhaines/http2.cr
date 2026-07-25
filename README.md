@@ -115,7 +115,8 @@ Timeouts apply independently:
 | `connect` | DNS lookup and TCP connection |
 | `read` | The TLS and HTTP/2 handshakes (for `https`, the TLS handshake itself; then, for both schemes, waiting for the peer's SETTINGS after dialing) and each response-header wait |
 | `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
-| `idle` | A blocked response-body read or trailer wait |
+| `idle` | A blocked response-body read or trailer wait, and (see below) an abandoned response |
+| `stream_slot` | How long `request` waits for a peer concurrent-stream slot (nil by default; see below) |
 
 Nil disables one timeout. A request `Cancellation` remains active after
 response headers arrive, so it can interrupt body and trailer waits.
@@ -127,6 +128,22 @@ connection is keepalive's job instead: `HTTP2::Client` enables it by
 default (`Connection::Configuration#keepalive_interval` 30 seconds,
 `#keepalive_timeout` 10 seconds); pass a `connection_configuration:` with
 `keepalive_interval: nil` to disable it.
+
+If the peer's MAX_CONCURRENT_STREAMS limit is already reached, `request`
+raises `Connection::ConcurrentStreamLimitError` immediately — unless
+`stream_slot` is set, in which case it waits up to that long for some
+other stream on the connection to close (waking promptly rather than
+polling) before raising the same error.
+
+A `Response` the caller abandons — never reads, never closes — would
+otherwise hold its stream and connection-window credit open forever,
+which can stall every other request on the connection. `idle` doubles as
+that safety net: each time it elapses with no bytes read from
+`Response#body` since the previous check, the response's stream is
+canceled exactly as `Response#close` would (credit returned, RST_STREAM
+sent). Any consumption in that window re-arms the deadline instead, so a
+reader that is merely slow is never killed. Set `idle: nil` to disable
+both this and the per-read/trailer timeout.
 
 Cleartext `http` origins use direct HTTP/2 prior knowledge; HTTP/1.1 `Upgrade`
 is not attempted. HTTPS verifies the certificate and hostname, sends SNI, and

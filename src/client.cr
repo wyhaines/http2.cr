@@ -42,23 +42,48 @@ module HTTP2
     # default for `HTTP2::Client`) periodically PINGs the peer and fails
     # the connection if it stops answering; supply a configuration with
     # `keepalive_interval: nil` to disable it.
+    #
+    # `idle` also bounds a `Response` that the caller abandons — never
+    # reads, never closes. Its stream would otherwise sit open forever,
+    # holding its monitor fiber and connection-window credit hostage and
+    # potentially stalling every other request on the connection. Each
+    # time `idle` elapses with no bytes consumed from `Response#body`
+    # since the previous check, the response's stream is canceled exactly
+    # as `Response#close` would (flow-control credit returned, RST_STREAM
+    # sent); if any bytes WERE consumed in that window, the deadline
+    # simply re-arms, so a slow-but-active reader is never killed. Set
+    # `idle: nil` to disable this safety net along with the per-read/
+    # trailer timeout it shares the setting with.
+    #
+    # `stream_slot` governs `request`'s reaction to the peer's
+    # MAX_CONCURRENT_STREAMS limit. `nil` (the default) preserves
+    # `Connection#new_stream`'s existing contract: hitting the limit
+    # raises `Connection::ConcurrentStreamLimitError` immediately, with no
+    # wait. A span instead waits up to that long for a slot — waking
+    # promptly when some other stream on the connection closes, not just
+    # polling — retrying until either a slot opens up (the request
+    # proceeds normally) or the span elapses, at which point the same
+    # `Connection::ConcurrentStreamLimitError` is raised.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
       getter write : Time::Span?
       getter idle : Time::Span?
+      getter stream_slot : Time::Span?
 
       def initialize(
         @connect : Time::Span? = 10.seconds,
         @read : Time::Span? = 30.seconds,
         @write : Time::Span? = 30.seconds,
         @idle : Time::Span? = 30.seconds,
+        @stream_slot : Time::Span? = nil,
       )
         {
-          "connect" => @connect,
-          "read"    => @read,
-          "write"   => @write,
-          "idle"    => @idle,
+          "connect"     => @connect,
+          "read"        => @read,
+          "write"       => @write,
+          "idle"        => @idle,
+          "stream_slot" => @stream_slot,
         }.each do |name, duration|
           if duration && duration <= Time::Span.zero
             raise ArgumentError.new("#{name} timeout must be positive")
@@ -324,7 +349,13 @@ module HTTP2
             stream.id,
             request_method
           )
-          stream.send_headers(fields, end_stream: end_stream)
+          send_headers_awaiting_slot(
+            connection,
+            stream,
+            fields,
+            end_stream,
+            cancellation
+          )
           check_cancellation!(cancellation)
           stream
         rescue error : Connection::TimeoutError
@@ -344,6 +375,44 @@ module HTTP2
         rescue error
           abort_stream(stream, error) unless stream.terminal_error
           raise error
+        end
+      end
+    end
+
+    # Sends `stream`'s request HEADERS, waiting for a peer-imposed
+    # concurrent-stream slot when `Timeouts#stream_slot` is set. The
+    # default (`nil`) preserves `Connection#new_stream`'s immediate
+    # `Connection::ConcurrentStreamLimitError` raise. A span retries
+    # `#send_headers` on the SAME (still-idle) stream each time the
+    # connection signals that some stream may have closed, or the wait
+    # times out, until either it succeeds or the span elapses — at which
+    # point the limit error from the final attempt propagates. Reusing
+    # `stream` rather than allocating a new one on each attempt keeps the
+    # stream's reserved ID (and its place in line) stable across retries.
+    private def send_headers_awaiting_slot(
+      connection : Connection,
+      stream : Stream,
+      fields : Array(HeaderField),
+      end_stream : Bool,
+      cancellation : Cancellation?,
+    ) : Nil
+      deadline = @timeouts.stream_slot.try { |span| Time.instant + span }
+      loop do
+        begin
+          stream.send_headers(fields, end_stream: end_stream)
+          return
+        rescue error : Connection::ConcurrentStreamLimitError
+          raise error unless deadline
+
+          remaining = deadline - Time.instant
+          raise error if remaining <= Time::Span.zero
+
+          check_cancellation!(cancellation)
+          connection.wait_for_stream_slot(
+            remaining,
+            cancellation.try(&.signal)
+          )
+          check_cancellation!(cancellation)
         end
       end
     end
@@ -931,6 +1000,16 @@ module HTTP2
       end
     end
 
+    # Drains response metadata (trailers, or the bare remote end) after
+    # response headers arrive. While `@timeouts.idle` is set, each wait
+    # also carries that deadline: on expiry, a `Response` that has had no
+    # bytes read from its body since the previous check is treated as
+    # abandoned and its stream is canceled exactly as `Response#close`
+    # would (flow-control credit returned, RST_STREAM sent) — otherwise
+    # this fiber, and the window credit its stream holds, would leak for
+    # as long as the connection lives. Any consumption between checks
+    # re-arms the deadline instead, so a reader that is merely slow is
+    # never killed (see `Client::Timeouts#idle`'s doc comment).
     private def monitor_response(
       stream : Stream,
       metadata : ResponseMetadata,
@@ -939,12 +1018,33 @@ module HTTP2
       *,
       stop_upload_on_end : Bool,
     ) : Nil
+      idle = @timeouts.idle
       spawn do
         begin
+          consumed_at_last_check = stream.body.consumed_bytes
           loop do
-            event = stream.receive_until_remote_end(
-              cancellation.try(&.signal)
-            )
+            begin
+              event = stream.receive_until_remote_end(
+                cancellation.try(&.signal),
+                idle
+              )
+            rescue Connection::TimeoutError
+              consumed_now = stream.body.consumed_bytes
+              if consumed_now != consumed_at_last_check
+                consumed_at_last_check = consumed_now
+                next
+              end
+
+              stream.body.close
+              metadata.fail(
+                RequestTimeoutError.new(
+                  "response was abandoned (never read, never closed) " \
+                  "and its stream was canceled after being idle"
+                )
+              )
+              break
+            end
+
             unless event
               metadata.complete
               stop_early_upload(stream, upload) if stop_upload_on_end

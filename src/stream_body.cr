@@ -15,6 +15,7 @@ module HTTP2
     @chunks = Deque(Bytes).new
     @chunk_offset = 0
     @buffered_bytes = 0
+    @consumed_bytes = 0_i64
     @finished = false
     @closed = false
     @terminal_error : Exception?
@@ -58,6 +59,7 @@ module HTTP2
               slice[0, count].copy_from(chunk[@chunk_offset, count])
               @chunk_offset += count
               @buffered_bytes -= count
+              @consumed_bytes += count
 
               if @chunk_offset == chunk.size
                 @chunks.shift
@@ -125,6 +127,20 @@ module HTTP2
 
     def buffered_bytes : Int32
       @mutex.synchronize { @buffered_bytes }
+    end
+
+    # Cumulative count of bytes a caller has read out of this body via
+    # `#read`/`#read_with_timeout`, regardless of how those reads were
+    # split. Monotonically increasing for the body's lifetime; unaffected
+    # by bytes discarded on `#close` or `#terminate`. Comparing two
+    # snapshots taken across a wait tells whether a reader consumed
+    # anything during that window — used to detect an abandoned response
+    # without disturbing a reader that is merely slow (see
+    # `HTTP2::Client#monitor_response`).
+    #
+    # :nodoc:
+    def consumed_bytes : Int64
+      @mutex.synchronize { @consumed_bytes }
     end
 
     # :nodoc:

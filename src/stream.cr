@@ -317,11 +317,17 @@ module HTTP2
       end
     end
 
-    # Waits for one metadata event, returning nil when the remote message ends.
+    # Waits for one metadata event, returning nil when the remote message
+    # ends. When `timeout` is given, raises `Connection::TimeoutError`
+    # instead of continuing to block once it elapses, without otherwise
+    # disturbing the stream — used by the response monitor to detect an
+    # abandoned response (see `HTTP2::Client#monitor_response`) while
+    # leaving a reader that is still actively draining the body alone.
     #
     # :nodoc:
     def receive_until_remote_end(
       cancellation : Channel(Nil)? = nil,
+      timeout : Time::Span? = nil,
     ) : StreamEvent?
       if @body.completed?
         select
@@ -333,26 +339,17 @@ module HTTP2
         end
       end
 
-      if cancellation
-        select
-        when event = @events.receive
-          event
-        when @body.completion_signal.receive?
-          receive_after_body_completion
-        when @terminal_signal.receive?
-          raise_terminal!
-        when cancellation.receive?
-          raise WaitCanceledError.new("waiting for stream #{id} was canceled")
-        end
+      if timeout && cancellation
+        receive_until_remote_end_with_timeout_and_cancellation(
+          timeout,
+          cancellation
+        )
+      elsif timeout
+        receive_until_remote_end_with_timeout(timeout)
+      elsif cancellation
+        receive_until_remote_end_with_cancellation(cancellation)
       else
-        select
-        when event = @events.receive
-          event
-        when @body.completion_signal.receive?
-          receive_after_body_completion
-        when @terminal_signal.receive?
-          raise_terminal!
-        end
+        receive_until_remote_end_without_deadline
       end
     end
 
@@ -506,6 +503,69 @@ module HTTP2
         event
       else
         return if @body.finished?
+        raise_terminal!
+      end
+    end
+
+    private def receive_until_remote_end_with_timeout_and_cancellation(
+      duration : Time::Span,
+      cancellation : Channel(Nil),
+    ) : StreamEvent?
+      select
+      when event = @events.receive
+        event
+      when @body.completion_signal.receive?
+        receive_after_body_completion
+      when @terminal_signal.receive?
+        raise_terminal!
+      when cancellation.receive?
+        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+      when timeout(duration)
+        raise Connection::TimeoutError.new(
+          "waiting for stream #{id} response metadata timed out"
+        )
+      end
+    end
+
+    private def receive_until_remote_end_with_timeout(
+      duration : Time::Span,
+    ) : StreamEvent?
+      select
+      when event = @events.receive
+        event
+      when @body.completion_signal.receive?
+        receive_after_body_completion
+      when @terminal_signal.receive?
+        raise_terminal!
+      when timeout(duration)
+        raise Connection::TimeoutError.new(
+          "waiting for stream #{id} response metadata timed out"
+        )
+      end
+    end
+
+    private def receive_until_remote_end_with_cancellation(
+      cancellation : Channel(Nil),
+    ) : StreamEvent?
+      select
+      when event = @events.receive
+        event
+      when @body.completion_signal.receive?
+        receive_after_body_completion
+      when @terminal_signal.receive?
+        raise_terminal!
+      when cancellation.receive?
+        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+      end
+    end
+
+    private def receive_until_remote_end_without_deadline : StreamEvent?
+      select
+      when event = @events.receive
+        event
+      when @body.completion_signal.receive?
+        receive_after_body_completion
+      when @terminal_signal.receive?
         raise_terminal!
       end
     end
