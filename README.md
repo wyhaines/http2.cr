@@ -165,6 +165,8 @@ The initial stable target is an HTTP/2 client. It does not provide:
   proven-unprocessed replay modes.
 
 A gRPC adapter belongs in a separate shard above the streaming API.
+See [Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope
+and suggested priority of possible follow-up protocol work.
 
 ## Development
 

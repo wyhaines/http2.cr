@@ -236,3 +236,6 @@ push consumption, ALTSVC/ORIGIN, extended CONNECT, and a server role. A gRPC
 adapter should remain a separate layer, but the core must already expose the
 streaming request/response bodies, trailers, cancellation, PING, RST_STREAM,
 and GOAWAY behavior it needs.
+
+See [deferred-extensions.md](./deferred-extensions.md) for the scope,
+dependencies, and suggested priority of each follow-up project.
