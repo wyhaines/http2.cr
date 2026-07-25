@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: crystallang/install-crystal@v1
+      - uses: crystal-lang/install-crystal@v1
         with:
           crystal: ${{ matrix.crystal }}
 
