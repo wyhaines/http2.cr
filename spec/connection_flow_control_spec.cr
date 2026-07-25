@@ -833,10 +833,21 @@ describe HTTP2::Connection do
     end
   end
 
-  it "sends no startup WINDOW_UPDATE at the default connection receive window" do
+  it "sends no startup WINDOW_UPDATE at the minimum connection receive window" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|
-        complete_server_handshake(io)
+        read_client_preface(io)
+        HTTP2::Frame::Settings
+          .new([] of HTTP2::Frame::Settings::Setting)
+          .write(io)
+        HTTP2::Frame::Settings.ack.write(io)
+        io.flush
+
+        # Deliberately NOT skip_startup_window_update: this example exists
+        # to catch a regression that sends a grant here, so the peer's next
+        # read must hard-fail (rather than tolerate) if one arrives.
+        acknowledgement = HTTP2::Frame.read(io).as(HTTP2::Frame::Settings)
+        acknowledgement.ack?.should be_true
 
         ping = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
         ping.ack?.should be_false

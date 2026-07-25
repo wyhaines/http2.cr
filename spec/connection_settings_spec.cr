@@ -143,12 +143,20 @@ describe HTTP2::Connection do
         end
         updates_received.send(nil)
 
-        acknowledge_first.receive
+        select
+        when acknowledge_first.receive
+        when timeout(2.seconds)
+          fail("peer did not receive the acknowledge_first signal")
+        end
         HTTP2::Frame::Settings.ack.write(io)
         io.flush
         first_ack_sent.send(nil)
 
-        acknowledge_second.receive
+        select
+        when acknowledge_second.receive
+        when timeout(2.seconds)
+          fail("peer did not receive the acknowledge_second signal")
+        end
         HTTP2::Frame::Settings.ack.write(io)
         io.flush
       end
@@ -171,10 +179,18 @@ describe HTTP2::Connection do
           ),
         ])
 
-        updates_received.receive
+        select
+        when updates_received.receive
+        when timeout(2.seconds)
+          fail("did not receive the updates_received signal")
+        end
         connection.pending_settings_count.should eq(2)
         acknowledge_first.send(nil)
-        first_ack_sent.receive
+        select
+        when first_ack_sent.receive
+        when timeout(2.seconds)
+          fail("did not receive the first_ack_sent signal")
+        end
         eventually { connection.pending_settings_count == 1 }
         connection.effective_local_settings_state
           .header_table_size.should eq(1_024_u32)
