@@ -49,6 +49,7 @@ module HTTP2
     @keepalive_wakeup = Channel(Nil).new(1)
     @keepalive_done = Channel(Nil).new
     @writer_started = false
+    @preface_sent = false
     @reader_started = false
     @transport_closer_started = false
     @settings_timer_started = false
@@ -254,6 +255,14 @@ module HTTP2
           transport_closer_loop
         end
       end
+
+      delta = @configuration.connection_receive_window.to_i64 -
+              SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
+      if delta > 0
+        @mutex.synchronize { queue_connection_credit_unlocked(delta) }
+        wake_flow_control
+      end
+
       emit_lifecycle("handshaking")
 
       begin
@@ -996,6 +1005,7 @@ module HTTP2
         end
         @transport.flush
         command.complete
+        @mutex.synchronize { @preface_sent = true } if command.preface?
         wake_drain_monitor
       rescue error
         command.complete(error)
@@ -1214,6 +1224,7 @@ module HTTP2
 
     private def take_pending_window_updates : Array(Frames)?
       @mutex.synchronize do
+        return unless @preface_sent
         return if @pending_connection_window_update.zero? &&
                   @pending_stream_window_updates.empty?
 

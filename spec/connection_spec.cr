@@ -295,7 +295,7 @@ describe HTTP2::Connection do
         peer_result = scripted_peer(peer) do |io|
           read_client_preface(io)
           invalid.write(io)
-          goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+          goaway = skip_startup_window_update(io).as(HTTP2::Frame::GoAway)
           goaway.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR.to_u32)
         end
 
@@ -559,7 +559,12 @@ describe HTTP2::Connection do
   end
 
   it "propagates writer failures and closes the runtime" do
-    configuration = HTTP2::Connection::Configuration.new
+    # connection_receive_window stays at the RFC default (65_535) so no
+    # startup WINDOW_UPDATE grant competes with allowed_write_bytes below;
+    # this test targets the explicit Ping write failure, not the grant.
+    configuration = HTTP2::Connection::Configuration.new(
+      connection_receive_window: 65_535
+    )
     allowed_write_bytes = (
       HTTP2::Connection::Preface.size +
       HTTP2::Frame::Settings.new(configuration.initial_settings).to_slice.size +

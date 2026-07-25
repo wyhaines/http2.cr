@@ -23,6 +23,7 @@ module HTTP2
       getter max_decoder_table_size : Int32
       getter max_retained_closed_streams : Int32
       getter max_buffered_body_bytes : Int32
+      getter connection_receive_window : Int32
       getter outbound_data_chunk_size : Int32
       getter inbound_frame_rate_window : Time::Span
       getter max_control_frames_per_window : Int32
@@ -49,6 +50,7 @@ module HTTP2
         @max_decoder_table_size : Int32 = 64 * 1024,
         @max_retained_closed_streams : Int32 = 256,
         @max_buffered_body_bytes : Int32 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i32,
+        @connection_receive_window : Int32 = 1_048_576,
         @outbound_data_chunk_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
         @inbound_frame_rate_window : Time::Span = 1.second,
         @max_control_frames_per_window : Int32 = 1_000,
@@ -149,6 +151,11 @@ module HTTP2
           raise ArgumentError.new(
             "outbound DATA chunk size must be between 1 and " \
             "#{FrameHeader::MAX_PAYLOAD}"
+          )
+        end
+        unless 65_535 <= @connection_receive_window <= 0x7fff_ffff
+          raise ArgumentError.new(
+            "connection receive window must be between 65_535 and 2^31-1"
           )
         end
       end

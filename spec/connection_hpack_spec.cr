@@ -107,7 +107,7 @@ describe HTTP2::Connection do
         ]).write(io)
         HTTP2::Frame::Settings.ack.write(io)
         io.flush
-        HTTP2::Frame.read(io).as(HTTP2::Frame::Settings).ack?.should be_true
+        skip_startup_window_update(io).as(HTTP2::Frame::Settings).ack?.should be_true
 
         HTTP2::Frame::Settings.new([
           HTTP2::Frame::Settings::Setting.new(

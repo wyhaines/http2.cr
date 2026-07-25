@@ -680,7 +680,13 @@ describe HTTP2::Connection do
         )
       end
 
-      connection = HTTP2::Connection.start(client)
+      # Pinned to the RFC-default window: with the library's larger default
+      # connection_receive_window, 4 full-size DATA frames no longer overrun
+      # the connection credit this example needs to exhaust.
+      configuration = HTTP2::Connection::Configuration.new(
+        connection_receive_window: 65_535
+      )
+      connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
       stream = connection.new_stream
       open_client_stream(stream)
@@ -795,6 +801,61 @@ describe HTTP2::Connection do
         .as(HTTP2::ProtocolError)
         .error_code.should eq(HTTP2::ErrorCode::FLOW_CONTROL_ERROR)
       wait_for_peer(peer_result)
+    end
+  end
+
+  it "announces the configured connection receive window after the preface" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        client_settings = read_client_preface(io)
+        HTTP2::Frame::Settings
+          .new([] of HTTP2::Frame::Settings::Setting)
+          .write(io)
+        HTTP2::Frame::Settings.ack.write(io)
+        io.flush
+
+        update = nil
+        until update
+          frame = HTTP2::Frame.read(io)
+          update = frame.as?(HTTP2::Frame::WindowUpdate)
+        end
+        update.stream_id.should eq(0_u32)
+        update.window_size_increment.should eq(1_048_576_u32 - 65_535)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "sends no startup WINDOW_UPDATE at the default connection receive window" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+
+        ping = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        ping.ack?.should be_false
+        ping.payload.should eq("no-grant".to_slice)
+        ping.ack.write(io)
+        io.flush
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        connection_receive_window: 65_535
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        connection.ping("no-grant", 1.second)
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
     end
   end
 end

@@ -221,7 +221,7 @@ describe HTTP2::Connection do
           read_client_preface(io)
           HTTP2::Frame::Settings.new([setting]).write(io)
           io.flush
-          goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+          goaway = skip_startup_window_update(io).as(HTTP2::Frame::GoAway)
           goaway.error_code.should eq(error_code.to_u32)
         end
 
@@ -247,7 +247,7 @@ describe HTTP2::Connection do
           [] of HTTP2::Frame::Settings::Setting
         ).write(io)
         io.flush
-        HTTP2::Frame.read(io).as(HTTP2::Frame::Settings).ack?.should be_true
+        skip_startup_window_update(io).as(HTTP2::Frame::Settings).ack?.should be_true
 
         goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
         goaway.error_code.should eq(HTTP2::ErrorCode::SETTINGS_TIMEOUT.to_u32)
@@ -312,6 +312,17 @@ describe HTTP2::Connection do
       error = connection.terminal_error.as(HTTP2::ProtocolError)
       error.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR)
       wait_for_peer(peer_result)
+    end
+  end
+
+  it "validates the connection receive window" do
+    HTTP2::Connection::Configuration.new(connection_receive_window: 65_535)
+    HTTP2::Connection::Configuration
+      .new(connection_receive_window: 1 << 20)
+    HTTP2::Connection::Configuration
+      .new(connection_receive_window: 0x7fff_ffff)
+    expect_raises(ArgumentError, /connection receive window/) do
+      HTTP2::Connection::Configuration.new(connection_receive_window: 65_534)
     end
   end
 end

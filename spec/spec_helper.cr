@@ -81,6 +81,21 @@ def read_client_preface(io : IO) : HTTP2::Frame::Settings
   settings
 end
 
+# With the default `Configuration#connection_receive_window` (1 MiB), the
+# client announces its startup connection-window grant via an unsolicited
+# WINDOW_UPDATE(stream 0) immediately after the preface — before it has
+# received anything from the peer, so it always precedes whatever frame the
+# client sends in reaction to the peer's own handshake response. Scripted
+# peers that read "the client's next frame" right after the handshake must
+# tolerate that leading grant; this skips at most the one startup frame.
+def skip_startup_window_update(io : IO) : HTTP2::Frames
+  frame = HTTP2::Frame.read(io)
+  if frame.is_a?(HTTP2::Frame::WindowUpdate) && frame.stream_id.zero?
+    frame = HTTP2::Frame.read(io)
+  end
+  frame
+end
+
 def complete_server_handshake(
   io : IO,
   settings : HTTP2::Frame::Settings = HTTP2::Frame::Settings.new([] of HTTP2::Frame::Settings::Setting),
@@ -90,7 +105,7 @@ def complete_server_handshake(
   HTTP2::Frame::Settings.ack.write(io)
   io.flush
 
-  acknowledgement = HTTP2::Frame.read(io)
+  acknowledgement = skip_startup_window_update(io)
   acknowledgement.should be_a(HTTP2::Frame::Settings)
   acknowledgement.as(HTTP2::Frame::Settings).ack?.should be_true
   client_settings

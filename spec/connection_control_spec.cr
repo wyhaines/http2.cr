@@ -15,7 +15,7 @@ describe HTTP2::Connection do
           [] of HTTP2::Frame::Settings::Setting
         ).write(io)
         io.flush
-        HTTP2::Frame.read(io)
+        skip_startup_window_update(io)
           .as(HTTP2::Frame::Settings)
           .ack?
           .should be_true
