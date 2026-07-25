@@ -89,8 +89,8 @@ upload = File.open("events.ndjson")
 begin
   response = client.post(
     "/events",
-    upload,
     HTTP2::Headers{"content-type" => "application/x-ndjson"},
+    upload,
     trailers: HTTP2::Headers{"x-upload-complete" => "true"},
     cancellation: cancellation
   )

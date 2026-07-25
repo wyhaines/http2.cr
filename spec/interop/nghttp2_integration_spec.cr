@@ -101,7 +101,7 @@ if NGHTTP2_INTEROP_ENABLED
         connection_configuration: interop_configuration
       )
       begin
-        response = client.post("/upload", payload)
+        response = client.post("/upload", body: payload)
 
         response.status.should eq(200)
         response.body.gets_to_end.to_slice.should eq(payload)

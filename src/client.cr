@@ -157,8 +157,8 @@ module HTTP2
     # Sends a POST request. IO bodies stream from their current position.
     def post(
       target : String,
-      body : Request::Body = nil,
       headers : Headers = Headers.new,
+      body : Request::Body = nil,
       *,
       trailers : Headers = Headers.new,
       cancellation : Cancellation? = nil,

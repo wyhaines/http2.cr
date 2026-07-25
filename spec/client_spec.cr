@@ -94,7 +94,7 @@ describe "HTTP2::Client recovery" do
       )
     )
     begin
-      response = http.post("/", "repeatable")
+      response = http.post("/", body: "repeatable")
       response.status.should eq(204)
       response.stream_id.should eq(1_u32)
       wait_for_peer(peer_result)
@@ -206,7 +206,7 @@ describe "HTTP2::Client recovery" do
     )
     begin
       expect_raises(HTTP2::Connection::UnprocessedStreamError) do
-        http.post("/", IO::Memory.new("one-shot"))
+        http.post("/", body: IO::Memory.new("one-shot"))
       end
       wait_for_peer(peer_result)
     ensure
@@ -439,8 +439,8 @@ describe HTTP2::Client do
       begin
         response = http.post(
           "/upload",
-          IO::Memory.new("payload"),
           HTTP2::Headers{"content-length" => "7"},
+          IO::Memory.new("payload"),
           trailers: HTTP2::Headers{"upload-checksum" => "ok"}
         )
         response.status.should eq(201)
@@ -448,6 +448,60 @@ describe HTTP2::Client do
         response.trailers.to_a.should eq([
           HTTP2::Header.new("result-checksum", "ok"),
         ])
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "sends a POST with positional headers and body plus keyword trailers" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+        request = client_read_field_section(io, decoder)
+        request[:end_stream].should be_false
+        field_pairs(request[:fields]).should eq([
+          {":method", "POST"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/orders"},
+          {"content-length", "6"},
+        ])
+
+        data = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        data.data.should eq("order!".to_slice)
+        data.end_stream?.should be_false
+        request_trailers = client_read_field_section(io, decoder)
+        request_trailers[:stream_id].should eq(request[:stream_id])
+        request_trailers[:end_stream].should be_true
+        field_pairs(request_trailers[:fields]).should eq([
+          {"order-checksum", "ok"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "201"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.post(
+          "/orders",
+          HTTP2::Headers{"content-length" => "6"},
+          IO::Memory.new("order!"),
+          trailers: HTTP2::Headers{"order-checksum" => "ok"}
+        )
+        response.status.should eq(201)
         wait_for_peer(peer_result)
       ensure
         http.close
@@ -494,7 +548,7 @@ describe HTTP2::Client do
       response_result = Channel(HTTP2::Response | Exception).new(1)
       spawn do
         begin
-          response_result.send(http.post("/stream", source))
+          response_result.send(http.post("/stream", body: source))
         rescue error
           response_result.send(error)
         end
@@ -899,8 +953,8 @@ describe HTTP2::Client do
       expect_raises(HTTP2::InvalidRequestError, /does not match/) do
         http.post(
           "/",
-          "body",
-          HTTP2::Headers{"content-length" => "3"}
+          HTTP2::Headers{"content-length" => "3"},
+          "body"
         )
       end
     ensure
@@ -1295,7 +1349,7 @@ describe HTTP2::Client do
         connection: connection
       )
       begin
-        response = http.post("/", "blocked")
+        response = http.post("/", body: "blocked")
         response.status.should eq(413)
         response.body.gets_to_end.should eq("rejected")
         wait_for_peer(peer_result)
@@ -1324,8 +1378,8 @@ describe HTTP2::Client do
         expect_raises(HTTP2::InvalidRequestError, /streamed request/) do
           http.post(
             "/",
-            IO::Memory.new("abc"),
-            HTTP2::Headers{"content-length" => "5"}
+            HTTP2::Headers{"content-length" => "5"},
+            IO::Memory.new("abc")
           )
         end
         wait_for_peer(peer_result)
