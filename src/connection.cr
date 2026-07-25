@@ -964,10 +964,8 @@ module HTTP2
           next
         end
 
-        if can_accept_pending_data?
-          if command = poll_data_command
-            enqueue_pending_data(command)
-          end
+        if command = poll_data_command
+          enqueue_pending_data(command)
         end
 
         if scheduled = next_scheduled_data_frame
@@ -1013,25 +1011,17 @@ module HTTP2
     end
 
     private def wait_for_writer_work : Nil
-      if can_accept_pending_data?
-        select
-        when command = @write_queue.receive?
-          process_write_command(command) if command
-        when command = @data_queue.receive?
-          enqueue_pending_data(command) if command
-        when @flow_control_wakeup.receive?
-        end
-      else
-        select
-        when command = @write_queue.receive?
-          process_write_command(command) if command
-        when @flow_control_wakeup.receive?
-        end
+      # Data commands are admitted unconditionally: each sender fiber blocks
+      # on its command, so parked commands are bounded by sending fibers,
+      # not by writer_queue_capacity. A window-0 stream therefore cannot
+      # starve streams that still have credit.
+      select
+      when command = @write_queue.receive?
+        process_write_command(command) if command
+      when command = @data_queue.receive?
+        enqueue_pending_data(command) if command
+      when @flow_control_wakeup.receive?
       end
-    end
-
-    private def can_accept_pending_data? : Bool
-      @pending_data_count < @configuration.writer_queue_capacity
     end
 
     private def process_write_command(command : WriteCommand) : Nil

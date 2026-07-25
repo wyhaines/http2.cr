@@ -979,4 +979,161 @@ describe HTTP2::Connection do
       end
     end
   end
+
+  it "admits a stream's DATA even when the writer's slot cap is already " \
+     "full of window-blocked streams" do
+    UNIXSocket.pair do |client, peer|
+      filler_stream_ids = Channel(Array(UInt32)).new(1)
+      settings_applied = Channel(Nil).new(1)
+      target_stream_id = Channel(UInt32).new(1)
+      target_received = Channel(Nil).new(1)
+
+      # Every new stream starts with exactly one byte of send window. Each
+      # of the 32 fillers below spends that byte immediately, which is
+      # wire-provable proof the writer admitted its command into
+      # @pending_data -- only admitted commands are ever scheduled. That
+      # lets this example establish "all 32 admission slots are taken"
+      # without depending on fiber-scheduling order, so the later target
+      # stream is deterministically the 33rd stream competing for a slot.
+      round_one_settings = HTTP2::Frame::Settings.new([
+        HTTP2::Frame::Settings::Setting.new(
+          HTTP2::Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+          1_u32
+        ),
+      ])
+
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io, round_one_settings)
+
+        filler_ids = filler_stream_ids.receive
+        filler_ids.each { |id| read_client_headers(io, id) }
+
+        # Each filler spends its one byte of window and parks with one
+        # byte still unsent, so its command stays admitted without ever
+        # completing (and so never vacates its slot).
+        received_ids = Array(UInt32).new(32)
+        32.times do
+          frame = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+          received_ids << frame.stream_id
+          frame.data.size.should eq(1)
+          frame.end_stream?.should be_false
+        end
+        received_ids.sort.should eq(filler_ids.sort)
+
+        # Drop new-stream window to zero, matching the bug report. The
+        # client's SETTINGS ACK proves it applied this before the target
+        # stream (opened only after this round-trip) exists, so the
+        # target starts at send_window == 0 -- like the fillers, but
+        # arriving strictly after all 32 admission slots are occupied.
+        HTTP2::Frame::Settings.new([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::INITIAL_WINDOW_SIZE,
+            0_u32
+          ),
+        ]).write(io)
+        io.flush
+        HTTP2::Frame.read(io).as(HTTP2::Frame::Settings).ack?.should be_true
+        settings_applied.send(nil)
+
+        target_id = target_stream_id.receive
+        read_client_headers(io, target_id)
+
+        # The target is the 33rd stream wanting to send. Every admission
+        # slot is already occupied and none is ever vacated (fillers
+        # never complete), so this single byte of credit is the only
+        # thing standing between the target and the peer.
+        HTTP2::Frame::WindowUpdate.new(target_id, 1_u32).write(io)
+        io.flush
+
+        target_frame = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        target_frame.stream_id.should eq(target_id)
+        target_frame.data.size.should eq(1)
+        target_frame.end_stream?.should be_true
+        target_received.send(nil)
+
+        filler_ids.each do |id|
+          HTTP2::Frame::ResetStream.new(id, HTTP2::ErrorCode::CANCEL).write(io)
+        end
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+
+        filler_streams = Array(HTTP2::Stream).new(32)
+        32.times do
+          stream = connection.new_stream
+          open_client_stream(stream, end_stream: false)
+          filler_streams << stream
+        end
+        filler_stream_ids.send(filler_streams.map(&.id))
+
+        filler_results = Array(Channel(Exception?)).new(32) do
+          Channel(Exception?).new(1)
+        end
+        filler_streams.each_with_index do |stream, index|
+          result = filler_results[index]
+          spawn do
+            begin
+              stream.send_data(Bytes[0x11, 0x22], end_stream: true)
+              result.send(nil)
+            rescue error
+              result.send(error)
+            end
+          end
+        end
+
+        select
+        when settings_applied.receive
+        when timeout(2.seconds)
+          fail(
+            "server's INITIAL_WINDOW_SIZE=0 SETTINGS was not acknowledged"
+          )
+        end
+
+        target = connection.new_stream
+        open_client_stream(target, end_stream: false)
+        target_stream_id.send(target.id)
+
+        target_result = Channel(Exception?).new(1)
+        spawn do
+          begin
+            target.send_data(Bytes[0x2a], end_stream: true)
+            target_result.send(nil)
+          rescue error
+            target_result.send(error)
+          end
+        end
+
+        # This is the regression under test: pre-fix, admission stalls at
+        # 32 parked commands, so the target's command never enters
+        # @data_schedule and this window update can never wake it.
+        select
+        when target_received.receive
+        when timeout(2.seconds)
+          fail(
+            "stream #{target.id}'s DATA was starved by the writer's " \
+            "admission gate even though it holds flow-control credit"
+          )
+        end
+        wait_for_peer(target_result)
+        wait_for_peer(peer_result)
+
+        filler_streams.each_with_index do |stream, index|
+          error = select
+          when observed = filler_results[index].receive
+            observed
+          when timeout(2.seconds)
+            fail("filler stream #{stream.id} was not unblocked by RST")
+          end
+          error.should be_a(HTTP2::Connection::StreamResetError)
+        end
+
+        connection.active?.should be_true
+      ensure
+        connection.close
+      end
+    end
+  end
 end
