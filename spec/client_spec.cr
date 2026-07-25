@@ -780,6 +780,64 @@ describe HTTP2::Client do
     end
   end
 
+  it "does not retry a stream_slot wait into a connection the peer is draining" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        settings = HTTP2::Frame::Settings.new([
+          HTTP2::Frame::Settings::Setting.new(
+            HTTP2::Frame::Settings::Identifier::MAX_CONCURRENT_STREAMS,
+            1_u32
+          ),
+        ])
+        complete_server_handshake(io, settings)
+        read_client_headers(io) # the occupying stream's request
+
+        # "/second" is now reserved (stream 3, still idle) and parked
+        # waiting for a slot. GOAWAY implicitly closes every still-idle
+        # local stream (RFC 9113 §6.8) without ever freeing a usable
+        # slot — the retry this triggers must recognize the connection
+        # is now draining and give up instead of trying to reallocate
+        # and spin against it.
+        HTTP2::Frame::GoAway.new(0_u32, HTTP2::ErrorCode::NO_ERROR).write(io)
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      connection.wait_until_active(1.second)
+
+      occupying = connection.new_stream
+      open_client_stream(occupying, end_stream: true)
+
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(stream_slot: 2.seconds)
+      )
+      begin
+        result = Channel(Exception?).new(1)
+        spawn do
+          begin
+            http.get("/second")
+            result.send(nil)
+          rescue error
+            result.send(error)
+          end
+        end
+
+        outcome = select
+        when value = result.receive
+          value
+        when timeout(1.second)
+          fail("\"/second\" did not fail promptly after the peer GOAWAY")
+        end
+        outcome.should_not be_nil
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "dials once and reuses an owned cleartext origin connection" do
     server = TCPServer.new("127.0.0.1", 0)
     peer_result = scripted_peer(server) do |listener|
@@ -1378,6 +1436,72 @@ describe HTTP2::Client do
         # Deliberately never read `response.body` and never close it —
         # this is the abandonment the idle deadline exists to recover.
         wait_for_peer(peer_result)
+
+        # A later read must RAISE, not return a silent EOF — this is a
+        # library-initiated reclamation, distinguishable from the
+        # caller's own (deliberately silent) Response#close.
+        expect_raises(HTTP2::RequestTimeoutError, /abandoned/) do
+          response.body.read(Bytes.new(1))
+        end
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "does not cancel a response with an empty buffer merely for going quiet (SSE / long-poll / a quiet CONNECT tunnel)" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+
+        # Send nothing at all across several idle periods, exactly like
+        # an SSE/long-poll response waiting between events, or a
+        # successful CONNECT tunnel sitting quiet while the app
+        # uploads. The buffer stays empty throughout, so nothing is
+        # pinning connection-window credit.
+        quiet = Channel(Nil).new
+        select
+        when quiet.receive
+        when timeout(200.milliseconds)
+        end
+
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          request[:stream_id],
+          "done"
+        ).write(io)
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(idle: 50.milliseconds)
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+        # Nobody reads response.body during the quiet window, matching a
+        # real SSE/long-poll consumer between events (deliberately not
+        # calling #read here — doing so would hit the OTHER, per-read
+        # idle timeout instead of exercising the abandonment monitor).
+        wait_for_peer(peer_result)
+
+        # 200ms of peer silence against a 50ms idle spans four full
+        # idle windows with nothing ever buffered. If Finding 1's fix
+        # regressed (cancels regardless of buffered_bytes), the stream
+        # would already be terminal here and this read would raise
+        # instead of returning the peer's eventual data.
+        response.body.gets_to_end.should eq("done")
+        response.trailers.should be_empty
       ensure
         http.close
       end

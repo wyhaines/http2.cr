@@ -133,17 +133,28 @@ If the peer's MAX_CONCURRENT_STREAMS limit is already reached, `request`
 raises `Connection::ConcurrentStreamLimitError` immediately — unless
 `stream_slot` is set, in which case it waits up to that long for some
 other stream on the connection to close (waking promptly rather than
-polling) before raising the same error.
+polling) before raising the same error. A configured wait holds this
+`Client`'s internal stream-open serialization for its full span: every
+other `request` call on the SAME `Client` — even one that will dial or is
+bound to a different connection — queues behind it until the wait
+resolves.
 
 A `Response` the caller abandons — never reads, never closes — would
 otherwise hold its stream and connection-window credit open forever,
 which can stall every other request on the connection. `idle` doubles as
-that safety net: each time it elapses with no bytes read from
-`Response#body` since the previous check, the response's stream is
-canceled exactly as `Response#close` would (credit returned, RST_STREAM
-sent). Any consumption in that window re-arms the deadline instead, so a
-reader that is merely slow is never killed. Set `idle: nil` to disable
-both this and the per-read/trailer timeout.
+that safety net, but only once the body is actually pinning credit: each
+time `idle` elapses with unread buffered data present and no bytes read
+since the previous check, the response's stream is canceled — credit for
+that buffered data returned, RST_STREAM sent, and the body left with a
+terminal error so a later read raises instead of silently returning EOF
+(unlike a caller's own `Response#close`, which stays silent). Any
+consumption in that window re-arms the deadline instead, so a reader
+that is merely slow is never killed. A quiet stream with an EMPTY buffer
+— an SSE or long-poll response between events, a successful CONNECT
+tunnel sitting quiet while the app uploads — pins no credit and keeps
+running indefinitely, matching the "never killed merely for going quiet"
+promise above. Set `idle: nil` to disable both this and the per-read/
+trailer timeout.
 
 Cleartext `http` origins use direct HTTP/2 prior knowledge; HTTP/1.1 `Upgrade`
 is not attempted. HTTPS verifies the certificate and hostname, sends SNI, and

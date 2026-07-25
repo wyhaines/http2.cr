@@ -44,16 +44,24 @@ module HTTP2
     # `keepalive_interval: nil` to disable it.
     #
     # `idle` also bounds a `Response` that the caller abandons — never
-    # reads, never closes. Its stream would otherwise sit open forever,
-    # holding its monitor fiber and connection-window credit hostage and
-    # potentially stalling every other request on the connection. Each
-    # time `idle` elapses with no bytes consumed from `Response#body`
-    # since the previous check, the response's stream is canceled exactly
-    # as `Response#close` would (flow-control credit returned, RST_STREAM
-    # sent); if any bytes WERE consumed in that window, the deadline
-    # simply re-arms, so a slow-but-active reader is never killed. Set
-    # `idle: nil` to disable this safety net along with the per-read/
-    # trailer timeout it shares the setting with.
+    # reads, never closes — but ONLY while its body is actually pinning
+    # connection-window credit (unread buffered bytes sitting in it).
+    # Each time `idle` elapses with unread buffered data present and no
+    # bytes consumed since the previous check, the response's stream is
+    # canceled: flow-control credit for that buffered data is returned,
+    # RST_STREAM is sent, and the body is left with a terminal error, so
+    # a later read raises rather than returning a silent EOF — a
+    # deliberate difference from the caller's own `Response#close`, which
+    # stays silent, so a library-initiated reclamation is distinguishable
+    # from a caller's own graceful stop. If any bytes WERE consumed in
+    # that window, the deadline simply re-arms, so a slow-but-active
+    # reader is never killed. A quiet stream with an EMPTY buffer — an
+    # SSE or long-poll response waiting between events, a successful
+    # CONNECT tunnel sitting quiet while the app uploads — pins no credit
+    # and keeps running indefinitely: the "never killed merely for going
+    # quiet" contract above still holds for it. Set `idle: nil` to
+    # disable this safety net along with the per-read/trailer timeout it
+    # shares the setting with.
     #
     # `stream_slot` governs `request`'s reaction to the peer's
     # MAX_CONCURRENT_STREAMS limit. `nil` (the default) preserves
@@ -63,7 +71,11 @@ module HTTP2
     # promptly when some other stream on the connection closes, not just
     # polling — retrying until either a slot opens up (the request
     # proceeds normally) or the span elapses, at which point the same
-    # `Connection::ConcurrentStreamLimitError` is raised.
+    # `Connection::ConcurrentStreamLimitError` is raised. A configured
+    # wait holds this `Client`'s internal stream-open serialization for
+    # its full span: every other `request` call on the SAME `Client` —
+    # even one that will dial or is bound to a different connection —
+    # queues behind it until the wait resolves.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
@@ -349,9 +361,10 @@ module HTTP2
             stream.id,
             request_method
           )
-          send_headers_awaiting_slot(
+          stream = send_headers_awaiting_slot(
             connection,
             stream,
+            request_method,
             fields,
             end_stream,
             cancellation
@@ -380,41 +393,120 @@ module HTTP2
     end
 
     # Sends `stream`'s request HEADERS, waiting for a peer-imposed
-    # concurrent-stream slot when `Timeouts#stream_slot` is set. The
-    # default (`nil`) preserves `Connection#new_stream`'s immediate
+    # concurrent-stream slot when `Timeouts#stream_slot` is set, and
+    # returns the stream HEADERS were actually sent on (see below — it
+    # may differ from the `stream` argument). The default (`nil`)
+    # preserves `Connection#new_stream`'s immediate
     # `Connection::ConcurrentStreamLimitError` raise. A span retries
-    # `#send_headers` on the SAME (still-idle) stream each time the
-    # connection signals that some stream may have closed, or the wait
-    # times out, until either it succeeds or the span elapses — at which
-    # point the limit error from the final attempt propagates. Reusing
-    # `stream` rather than allocating a new one on each attempt keeps the
-    # stream's reserved ID (and its place in line) stable across retries.
+    # `#send_headers` each time the connection signals that some stream
+    # may have closed, or the wait times out, until either it succeeds or
+    # the span elapses — at which point the limit error from the final
+    # attempt propagates.
+    #
+    # Normally the retry reuses the SAME (still-idle) stream, keeping its
+    # reserved ID and place in line stable. But when a `Connection` is
+    # shared by more than one opener (more than one `Client`, or raw
+    # `Connection` use alongside a `Client`), a DIFFERENT opener can win a
+    # freed slot first with a higher stream ID — RFC 9113 requires locally
+    # opened stream IDs to increase, so opening that higher ID implicitly
+    # closes ("skips") this method's still-idle lower one out from under
+    # it (`Connection#new_stream`'s doc; the skip itself is
+    # `plan_skipped_local_streams_unlocked`). The next retry then sees
+    # `Connection::InvalidStateError` ("stream N is not registered"), not
+    # `ConcurrentStreamLimitError` — allocating a fresh stream and
+    # retrying on it (within the same remaining budget) recovers instead
+    # of surfacing a hard, non-replayable error for what is, from the
+    # caller's perspective, still just "waiting for a slot."
     private def send_headers_awaiting_slot(
       connection : Connection,
       stream : Stream,
+      request_method : String,
       fields : Array(HeaderField),
       end_stream : Bool,
       cancellation : Cancellation?,
-    ) : Nil
+    ) : Stream
+      current = stream
       deadline = @timeouts.stream_slot.try { |span| Time.instant + span }
       loop do
         begin
-          stream.send_headers(fields, end_stream: end_stream)
-          return
+          current.send_headers(fields, end_stream: end_stream)
+          return current
         rescue error : Connection::ConcurrentStreamLimitError
-          raise error unless deadline
-
-          remaining = deadline - Time.instant
-          raise error if remaining <= Time::Span.zero
-
+          remaining = remaining_stream_slot_budget(deadline, error)
           check_cancellation!(cancellation)
           connection.wait_for_stream_slot(
             remaining,
             cancellation.try(&.signal)
           )
           check_cancellation!(cancellation)
+        rescue error : Connection::InvalidStateError
+          raise error unless recoverable_stream_skip?(
+                               connection,
+                               current,
+                               deadline,
+                               error
+                             )
+          remaining_stream_slot_budget(deadline, error)
+
+          check_cancellation!(cancellation)
+          current = connection.new_stream
+          current.inbound_validator = ResponseValidator.new(
+            current.id,
+            request_method
+          )
         end
       end
+    rescue error
+      abort_leftover_stream_slot_attempt(current, stream, error)
+      raise error
+    end
+
+    # Whether `current`'s HEADERS attempt was refused not because the
+    # peer's concurrent-stream limit is still exhausted, but because a
+    # DIFFERENT opener on a `Connection` shared by more than one (more
+    # than one `Client`, or raw `Connection` use alongside a `Client`)
+    # already won a freed slot with a higher stream ID — implicitly
+    # skipping `current` out from under this wait (RFC 9113 requires
+    # locally opened stream IDs to increase;
+    # `Connection#plan_skipped_local_streams_unlocked` is the mechanism).
+    # A `DrainingError`, or any error observed once the connection has
+    # actually closed or is draining, is never recoverable — reallocating
+    # into a connection that will accept no further streams would just
+    # spin.
+    private def recoverable_stream_skip?(
+      connection : Connection,
+      current : Stream,
+      deadline : Time::Instant?,
+      error : Connection::InvalidStateError,
+    ) : Bool
+      return false if error.is_a?(Connection::DrainingError)
+      return false unless deadline
+      return false if connection.closed? || connection.draining?
+
+      connection.stream?(current.id).nil?
+    end
+
+    private def remaining_stream_slot_budget(
+      deadline : Time::Instant?,
+      error : Exception,
+    ) : Time::Span
+      raise error unless deadline
+
+      remaining = deadline - Time.instant
+      raise error if remaining <= Time::Span.zero
+
+      remaining
+    end
+
+    private def abort_leftover_stream_slot_attempt(
+      current : Stream?,
+      original : Stream,
+      error : Exception,
+    ) : Nil
+      return unless leftover = current
+      return if leftover.same?(original) || leftover.terminal_error
+
+      abort_stream(leftover, error)
     end
 
     private def connection_for_request : Connection
@@ -1002,14 +1094,20 @@ module HTTP2
 
     # Drains response metadata (trailers, or the bare remote end) after
     # response headers arrive. While `@timeouts.idle` is set, each wait
-    # also carries that deadline: on expiry, a `Response` that has had no
-    # bytes read from its body since the previous check is treated as
-    # abandoned and its stream is canceled exactly as `Response#close`
-    # would (flow-control credit returned, RST_STREAM sent) — otherwise
-    # this fiber, and the window credit its stream holds, would leak for
-    # as long as the connection lives. Any consumption between checks
-    # re-arms the deadline instead, so a reader that is merely slow is
-    # never killed (see `Client::Timeouts#idle`'s doc comment).
+    # also carries that deadline: on expiry, if the body currently holds
+    # unread buffered bytes AND none were read since the previous check,
+    # the response is treated as abandoned and its stream is canceled —
+    # credit for those buffered bytes returned, RST_STREAM sent, and the
+    # body given a terminal error so a later read raises instead of
+    # returning a silent EOF (distinguishing library-initiated
+    # reclamation from the caller's own `Response#close`, which is
+    # deliberately silent). A quiet stream with an EMPTY buffer — an SSE
+    # or long-poll response between events, a quiet CONNECT tunnel while
+    # the app uploads — pins no credit and is left running indefinitely,
+    # matching `Timeouts`' documented "never killed merely for going
+    # quiet" contract. Any consumption between checks re-arms the
+    # deadline instead, so a reader that is merely slow is never killed
+    # (see `Client::Timeouts#idle`'s doc comment).
     private def monitor_response(
       stream : Stream,
       metadata : ResponseMetadata,
@@ -1034,14 +1132,15 @@ module HTTP2
                 consumed_at_last_check = consumed_now
                 next
               end
+              next if stream.body.buffered_bytes.zero?
 
-              stream.body.close
-              metadata.fail(
-                RequestTimeoutError.new(
-                  "response was abandoned (never read, never closed) " \
-                  "and its stream was canceled after being idle"
-                )
+              abandoned = RequestTimeoutError.new(
+                "response was abandoned (never read, never closed) " \
+                "and its stream was canceled after being idle with " \
+                "unread buffered data"
               )
+              metadata.fail(abandoned)
+              abort_stream(stream, abandoned)
               break
             end
 

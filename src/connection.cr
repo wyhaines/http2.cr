@@ -2432,10 +2432,13 @@ module HTTP2
     end
 
     # Wakes the drain monitor (if running) and, unconditionally, any
-    # caller parked in `#wait_for_stream_slot` — both care about the same
-    # underlying event (a stream leaving the active state), so this is
-    # called from every site that already pokes the drain monitor after
-    # such a transition, instead of duplicating those call sites.
+    # caller parked in `#wait_for_stream_slot`. Called from every
+    # successful writer flush (not only when a stream closes — the drain
+    # monitor needs to recheck after ANY frame in case that write was
+    # what closed one), so a `#wait_for_stream_slot` waiter retries at
+    # most once per flush, bounded by write activity on the connection,
+    # never a busy spin; a spurious wake (nothing actually freed a slot)
+    # just costs the waiter one extra, cheap retry.
     private def wake_drain_monitor : Nil
       wake_stream_slot_waiters
 
