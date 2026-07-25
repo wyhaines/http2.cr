@@ -22,6 +22,7 @@ module HTTP2
       getter max_encoder_table_size : Int32
       getter max_decoder_table_size : Int32
       getter max_retained_closed_streams : Int32
+      getter closed_stream_retention : Time::Span
       getter max_buffered_body_bytes : Int32
       getter connection_receive_window : Int32
       getter outbound_data_chunk_size : Int32
@@ -49,6 +50,7 @@ module HTTP2
         @max_encoder_table_size : Int32 = 64 * 1024,
         @max_decoder_table_size : Int32 = 64 * 1024,
         @max_retained_closed_streams : Int32 = 256,
+        @closed_stream_retention : Time::Span = 30.seconds,
         @max_buffered_body_bytes : Int32 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i32,
         @connection_receive_window : Int32 = 1_048_576,
         @outbound_data_chunk_size : Int32 = FrameHeader::DEFAULT_MAX_PAYLOAD,
@@ -133,6 +135,11 @@ module HTTP2
         end
         if @keepalive_timeout <= Time::Span.zero
           raise ArgumentError.new("keepalive timeout must be positive")
+        end
+        if @closed_stream_retention <= Time::Span.zero
+          raise ArgumentError.new(
+            "closed-stream retention must be positive"
+          )
         end
       end
 

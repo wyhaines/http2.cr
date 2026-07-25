@@ -414,7 +414,7 @@ describe HTTP2::Connection do
     end
   end
 
-  it "bounds recently closed stream metadata" do
+  it "bounds recently closed stream metadata by the hard cap" do
     UNIXSocket.pair do |client, peer|
       stream_ids = Channel(Array(UInt32)).new(1)
       peer_result = scripted_peer(peer) do |io|
@@ -427,13 +427,18 @@ describe HTTP2::Connection do
         end
       end
 
+      # Cancellation is a reset-tolerant closure (LocalReset), so age-aware
+      # retention protects each young entry past the soft
+      # max_retained_closed_streams limit — eviction only resumes once the
+      # hard cap (4x the limit) is reached. 9 cancellations against a limit
+      # of 2 (hard cap 8) forces exactly one eviction, from the FIFO head.
       configuration = HTTP2::Connection::Configuration.new(
         max_retained_closed_streams: 2
       )
       connection = HTTP2::Connection.start(client, configuration)
       begin
         connection.wait_until_active(1.second)
-        streams = (0...3).map do
+        streams = (0...9).map do
           stream = connection.new_stream
           open_client_stream(stream, end_stream: false)
           stream
@@ -441,8 +446,125 @@ describe HTTP2::Connection do
         stream_ids.send(streams.map(&.id))
         streams.each(&.cancel)
 
-        connection.retained_closed_stream_count.should eq(2)
+        connection.retained_closed_stream_count.should eq(8)
         wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "retains a reset-tolerant closed stream past the count limit for " \
+     "late DATA" do
+    UNIXSocket.pair do |client, peer|
+      canceled_id = Channel(UInt32).new(1)
+      churn_ids = Channel(Array(UInt32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = canceled_id.receive
+        read_client_headers(io, id)
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(id)
+
+        ids = churn_ids.receive
+        ids.each do |churn_id|
+          read_client_headers(io, churn_id)
+          HTTP2::Frame::Headers.new(
+            HTTP2::Frame::Headers::Flags::END_HEADERS |
+            HTTP2::Frame::Headers::Flags::END_STREAM,
+            churn_id,
+            Bytes.empty
+          ).write(io)
+        end
+        io.flush
+
+        # The canceled stream's still-in-flight DATA arrives after enough
+        # churn to push retained metadata past max_retained_closed_streams.
+        HTTP2::Frame::Data.new(0_u8, id, "late").write(io)
+        io.flush
+
+        connection_update = HTTP2::Frame.read(io)
+          .as(HTTP2::Frame::WindowUpdate)
+        connection_update.stream_id.should eq(0_u32)
+        connection_update.window_size_increment.should eq(4_u32)
+
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
+        ping.write(io)
+        io.flush
+        HTTP2::Frame.read(io).as(HTTP2::Frame::Ping).ack?.should be_true
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        max_retained_closed_streams: 8
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        canceled = connection.new_stream
+        open_client_stream(canceled, end_stream: false)
+        canceled_id.send(canceled.id)
+        canceled.cancel
+
+        churn = (0...8).map do
+          stream = connection.new_stream
+          open_client_stream(stream)
+          stream
+        end
+        churn_ids.send(churn.map(&.id))
+
+        wait_for_peer(peer_result)
+        connection.active?.should be_true
+        connection.retained_closed_stream_count.should eq(9)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "tolerates DATA that arrives after a peer RST_STREAM (RFC 9113 " \
+     "5.1)" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        HTTP2::Frame::ResetStream.new(
+          id,
+          HTTP2::ErrorCode::CANCEL
+        ).write(io)
+        io.flush
+
+        HTTP2::Frame::Data.new(0_u8, id, "late").write(io)
+        io.flush
+
+        connection_update = HTTP2::Frame.read(io)
+          .as(HTTP2::Frame::WindowUpdate)
+        connection_update.stream_id.should eq(0_u32)
+        connection_update.window_size_increment.should eq(4_u32)
+
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
+        ping.write(io)
+        io.flush
+        HTTP2::Frame.read(io).as(HTTP2::Frame::Ping).ack?.should be_true
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream, end_stream: false)
+        stream_id.send(stream.id)
+
+        error = expect_raises(HTTP2::Connection::StreamResetError) do
+          stream.receive(1.second)
+        end
+        error.stream_id.should eq(stream.id)
+        error.error_code.should eq(HTTP2::ErrorCode::CANCEL.to_u32)
+
+        wait_for_peer(peer_result)
+        connection.active?.should be_true
       ensure
         connection.close
       end

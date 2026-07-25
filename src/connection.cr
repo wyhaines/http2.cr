@@ -1528,7 +1528,7 @@ module HTTP2
       @mutex.synchronize do
         state = stream_state_unlocked(stream_id)
         closed = @closed_streams[stream_id]?
-        return if closed.try(&.tolerate_late_frames?)
+        return if closed.try(&.tolerates_late_frames?)
 
         if state.idle?
           raise ProtocolError.new(
@@ -1558,7 +1558,7 @@ module HTTP2
 
         parent_state = stream_state_unlocked(frame.stream_id)
         closed = @closed_streams[frame.stream_id]?
-        unless closed.try(&.tolerate_late_frames?)
+        unless closed.try(&.tolerates_late_frames?)
           transition = Stream::StateMachine.transition(
             parent_state,
             Stream::Event::ReceivePushPromise
@@ -1893,7 +1893,7 @@ module HTTP2
     ) : Tuple(Stream::State, Stream::StateMachine::Transition)?
       state = stream_state_unlocked(stream_id)
       closed = @closed_streams[stream_id]?
-      return if closed.try(&.tolerate_late_frames?)
+      return if closed.try(&.tolerates_late_frames?)
 
       transition = Stream::StateMachine.transition(state, event)
       case transition.action
@@ -2129,7 +2129,7 @@ module HTTP2
 
       state, tolerate = @mutex.synchronize do
         closed = @closed_streams[id]?
-        {stream_state_unlocked(id), closed.try(&.tolerate_late_frames?) || false}
+        {stream_state_unlocked(id), closed.try(&.tolerates_late_frames?) || false}
       end
       return if tolerate
 
@@ -3077,6 +3077,19 @@ module HTTP2
       emit_lifecycle("draining after local GOAWAY")
     end
 
+    # Evicts from the FIFO head once retained metadata exceeds
+    # `max_retained_closed_streams`, but a reset-tolerant entry (see
+    # `ClosedStream#tolerates_late_frames?`) younger than
+    # `closed_stream_retention` is protected: churn from ordinary stream
+    # completions must not evict the bookkeeping a still-in-flight late
+    # frame (from a canceled or peer-reset stream) needs to be absorbed
+    # instead of escalating to a connection error. A protected entry stops
+    # eviction entirely for this call — since eviction only ever inspects
+    # the FIFO head, a protected head leaves everything behind it in place
+    # too, so the order can sit above the soft limit for a while. That
+    # overage is intentional, not a leak: it is bounded by `hard_cap`, a
+    # flat memory backstop that evicts the oldest entry regardless of
+    # reason or age once retained metadata would otherwise grow past it.
     private def retain_closed_stream_unlocked(
       stream_id : UInt32,
       reason : ClosedStream::Reason,
@@ -3089,10 +3102,24 @@ module HTTP2
       end
       @closed_streams[stream_id] = ClosedStream.new(stream_id, reason)
 
+      hard_cap = limit * 4
       while @closed_stream_order.size > limit
-        if evicted_id = @closed_stream_order.shift?
-          @closed_streams.delete(evicted_id)
+        candidate_id = @closed_stream_order.first?
+        break unless candidate_id
+
+        entry = @closed_streams[candidate_id]?
+        unless entry
+          @closed_stream_order.shift
+          next
         end
+
+        protected_entry =
+          entry.tolerates_late_frames? &&
+            entry.retained_at.elapsed < @configuration.closed_stream_retention
+        break if protected_entry && @closed_stream_order.size <= hard_cap
+
+        @closed_stream_order.shift
+        @closed_streams.delete(candidate_id)
       end
     end
 
