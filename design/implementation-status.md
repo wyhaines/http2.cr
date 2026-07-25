@@ -1,6 +1,6 @@
 # HTTP/2 Implementation Status
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 ## Phase Progress
 
@@ -259,7 +259,18 @@ review-fix pass — the 1xx response cap, the bounded keepalive probe with
 fire-and-forget reader acknowledgements, the WINDOW_UPDATE/SETTINGS-ACK
 write guards, and the dead `EventBus`/`Cookies` removal — re-ran the
 deterministic gate (214 examples) on Crystal 1.22.0-dev locally; container
-and CI verification of this branch is still pending.
+and CI verification of this branch is still pending. A 2026-07-25
+connection-behavior pass (Plan 2: P1.1-P1.5 and P1.10) — a configurable
+connection receive window defaulting to 1 MiB, half-window WINDOW_UPDATE
+coalescing for both connection and stream credit, a redesigned client
+timeout model (no persistent socket read timeout, handshake reads bounded
+separately, keepalive on by default at a 30s interval / 10s timeout),
+per-stream outbound DATA admission in place of the global 32-slot writer
+gate, age-aware closed-stream retention (30s, hard-capped at 4x the count
+limit) with tolerance for late frames after a peer reset, and fire-and-forget
+reader-side RST_STREAM sends — re-ran the deterministic gate (229 examples)
+in normal and `preview_mt` modes on Crystal 1.22.0-dev locally; container and
+CI verification of this branch is still pending.
 
 ## Next Work
 
