@@ -626,6 +626,47 @@ describe HTTP2::Client do
     end
   end
 
+  it "resets a stream that floods informational responses" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        encoder = HPack::Encoder.new
+        (HTTP2::ResponseValidator::DEFAULT_MAX_INFORMATIONAL_RESPONSES + 1)
+          .times do
+            write_server_fields(
+              io,
+              encoder,
+              request[:stream_id],
+              [{":status", "103"}]
+            )
+          end
+
+        reset = nil
+        until reset
+          frame = HTTP2::Frame.read(io)
+          reset = frame.as?(HTTP2::Frame::ResetStream)
+        end
+        reset.stream_id.should eq(request[:stream_id])
+        reset.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        expect_raises(HTTP2::MalformedResponseError, /informational/) do
+          http.get("/")
+        end
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "constructs ordinary CONNECT pseudo-fields" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|

@@ -207,4 +207,34 @@ describe HTTP2::Connection do
       end
     end
   end
+
+  it "rejects caller-built WINDOW_UPDATE and SETTINGS ACK frames" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        wait_for_peer(peer_result)
+
+        expect_raises(ArgumentError, /WINDOW_UPDATE/) do
+          connection.write_frame(
+            HTTP2::Frame::WindowUpdate.new(0_u32, 1024_u32)
+          )
+        end
+        expect_raises(ArgumentError, /WINDOW_UPDATE/) do
+          connection.write_batch(
+            [HTTP2::Frame::WindowUpdate.new(0_u32, 1024_u32)] of HTTP2::Frames
+          )
+        end
+        expect_raises(ArgumentError, /SETTINGS acknowledgements/) do
+          connection.write_frame(HTTP2::Frame::Settings.ack)
+        end
+      ensure
+        connection.close
+      end
+    end
+  end
 end

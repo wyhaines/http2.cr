@@ -188,6 +188,26 @@ describe HTTP2::ResponseValidator do
     end
   end
 
+  it "rejects more informational responses than the configured limit" do
+    validator = HTTP2::ResponseValidator.new(1_u32, "GET")
+    HTTP2::ResponseValidator::DEFAULT_MAX_INFORMATIONAL_RESPONSES.times do
+      validator.validate(semantic_section([{":status", "103"}]))
+    end
+    expect_raises(HTTP2::MalformedResponseError, /informational/) do
+      validator.validate(semantic_section([{":status", "103"}]))
+    end
+
+    low = HTTP2::ResponseValidator.new(
+      1_u32,
+      "GET",
+      max_informational_responses: 1
+    )
+    low.validate(semantic_section([{":status", "103"}]))
+    expect_raises(HTTP2::MalformedResponseError, /informational/) do
+      low.validate(semantic_section([{":status", "103"}]))
+    end
+  end
+
   it "rejects DATA before final response fields" do
     validator = HTTP2::ResponseValidator.new(1_u32, "GET")
     expect_raises(HTTP2::MalformedResponseError, /before a final/) do

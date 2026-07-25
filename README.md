@@ -114,7 +114,7 @@ Timeouts apply independently:
 | --- | --- |
 | `connect` | DNS lookup and TCP connection |
 | `read` | Transport reads, handshake, and response headers |
-| `write` | Transport writes and blocked upload progress |
+| `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
 | `idle` | A blocked response-body read or trailer wait |
 
 Nil disables one timeout. A request `Cancellation` remains active after
@@ -163,6 +163,11 @@ The initial stable target is an HTTP/2 client. It does not provide:
 - extended CONNECT, ALTSVC/ORIGIN handling, or cross-origin coalescing;
 - redirect, cookie, proxy, decompression, or retry policy beyond the explicit
   proven-unprocessed replay modes.
+- Raw `Connection.connect_*`/`Connection.start` default to no transport
+  timeouts and no keepalive; set `read_timeout:`/`write_timeout:` or
+  `Configuration#keepalive_interval` when talking to untrusted peers.
+  `HTTP2::Client` sets read and write timeouts by default; keepalive
+  remains opt-in.
 
 A gRPC adapter belongs in a separate shard above the streaming API.
 See [Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope
