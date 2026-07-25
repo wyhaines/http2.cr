@@ -29,9 +29,10 @@ All notable changes are recorded here. This project follows
 ### Fixed
 
 - Made closed-stream retention age-aware (`closed_stream_retention`, default
-  30s, hard-capped at 4x the count limit) and stopped escalating late frames
-  after a peer's RST_STREAM to a connection error, restoring their
-  flow-control credit and tolerating them at stream scope per RFC 9113 §5.1.
+  30s, hard-capped at 4x the count limit); late frames after a peer's
+  RST_STREAM are now absorbed silently with flow-control credit restored —
+  applying the tolerance RFC 9113 §5.1 prescribes for sent resets uniformly
+  to peer-reset streams, instead of the previous connection-level error.
 - Made reader-side RST_STREAM sends fire-and-forget (`send_reset_nowait`), so
   a write-stalled transport can no longer park the reader mid-violation.
 

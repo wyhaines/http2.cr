@@ -154,9 +154,13 @@ caller-owned streaming `IO` is never replayed.
 `Connection::Configuration#drain_timeout`; `#close` remains an immediate,
 idempotent cancellation. Connection configuration also bounds open streams,
 queued work, field sections, buffered bodies, control/empty-frame rates, and
-retained closed-stream state. `HTTP2::Client` enables keepalive by default
-(`keepalive_interval` 30 seconds, `keepalive_timeout` 10 seconds); supply a
-`connection_configuration:` with `keepalive_interval: nil` to disable it.
+retained closed-stream state. The connection-level receive window
+(`Connection::Configuration#connection_receive_window`, default 1 MiB)
+governs aggregate download throughput per round trip; per-stream windows
+remain bounded separately by `max_buffered_body_bytes`. `HTTP2::Client`
+enables keepalive by default (`keepalive_interval` 30 seconds,
+`keepalive_timeout` 10 seconds); supply a `connection_configuration:` with
+`keepalive_interval: nil` to disable it.
 
 Advanced users can consume `Connection#diagnostics`, a bounded channel of
 frame metadata, settings, lifecycle changes, and typed errors. Diagnostics
