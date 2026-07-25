@@ -166,12 +166,20 @@ module HTTP2
 
     # Creates a client bound to one `http` or `https` origin. A supplied
     # connection is used as-is and is owned by this client.
+    #
+    # `tls_context`, whether supplied or defaulted, is used for every
+    # `https` dial this client makes (`#dial`'s single `Connection.connect_tls`
+    # call reuses the SAME `@tls_context` for the client's whole
+    # lifetime) and is configured for ALPN "h2" in place, at most once —
+    # see `Connection.start_tls`'s and `.ensure_alpn_h2`'s doc comments for
+    # the full contract. Do not share one `tls_context` between two
+    # `Client`s that need it configured differently.
     def initialize(
       origin : String | URI,
       *,
       @timeouts : Timeouts = Timeouts.new,
       @connection_configuration : Connection::Configuration = DEFAULT_CONNECTION_CONFIGURATION,
-      @tls_context : OpenSSL::SSL::Context::Client = OpenSSL::SSL::Context::Client.new,
+      @tls_context : OpenSSL::SSL::Context::Client = Connection.default_tls_context,
       @replay_policy : ReplayPolicy = ReplayPolicy::Never,
       @max_replay_attempts : Int32 = 1,
       connection : Connection? = nil,
