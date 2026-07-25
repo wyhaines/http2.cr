@@ -28,9 +28,18 @@ module HTTP2
 
     # Per-operation deadlines. Nil disables the corresponding timeout.
     #
-    # `connect` covers DNS and TCP dialing, `read` covers transport reads and
-    # response-header waits, `write` covers transport writes, and `idle`
-    # covers a blocked response-body read or trailer wait.
+    # `connect` covers DNS and TCP dialing, `read` covers the HTTP/2
+    # handshake (the wait for the peer's SETTINGS after dialing) and each
+    # response-header wait, `write` covers transport writes, and `idle`
+    # covers a blocked response-body read or trailer wait. There is no
+    # persistent socket-level read timeout, so a quiet-but-healthy
+    # connection (an idle pooled connection, a long-lived SSE or long-poll
+    # stream) is never killed merely for going quiet between waits.
+    # Liveness on an established connection is keepalive's job instead:
+    # `connection_configuration`'s `keepalive_interval`/`keepalive_timeout`
+    # (30 seconds / 10 seconds by default for `HTTP2::Client`) periodically
+    # PINGs the peer and fails the connection if it stops answering; supply
+    # a configuration with `keepalive_interval: nil` to disable it.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
@@ -55,6 +64,16 @@ module HTTP2
         end
       end
     end
+
+    # Default connection configuration for clients: keepalive on, so an
+    # active connection detects a silent peer without a socket-level read
+    # timeout tearing down idle or quiet-but-healthy streams. Used only as
+    # the constructor default for `connection_configuration` — a
+    # caller-supplied configuration is used exactly as given, never merged
+    # with or overridden by this default.
+    DEFAULT_CONNECTION_CONFIGURATION = Connection::Configuration.new(
+      keepalive_interval: 30.seconds
+    )
 
     private record Origin,
       scheme : String,
@@ -90,7 +109,7 @@ module HTTP2
       origin : String | URI,
       *,
       @timeouts : Timeouts = Timeouts.new,
-      @connection_configuration : Connection::Configuration = Connection::Configuration.new,
+      @connection_configuration : Connection::Configuration = DEFAULT_CONNECTION_CONFIGURATION,
       @tls_context : OpenSSL::SSL::Context::Client = OpenSSL::SSL::Context::Client.new,
       @replay_policy : ReplayPolicy = ReplayPolicy::Never,
       @max_replay_attempts : Int32 = 1,
@@ -366,6 +385,14 @@ module HTTP2
       )
     end
 
+    # Dials a new connection. Neither branch passes `read_timeout:`: a
+    # persistent socket-level read deadline would kill idle pooled
+    # connections and quiet long-lived streams once active. The handshake
+    # wait is instead bounded by `ready_connection`'s
+    # `wait_until_active(@timeouts.read)` call above, and liveness after
+    # that is keepalive's job, not a transport read timeout.
+    # `write_timeout:` still bounds transport writes throughout the
+    # connection's life.
     private def dial : Connection
       case @origin.scheme
       when "http"
@@ -374,7 +401,6 @@ module HTTP2
           @origin.port,
           @connection_configuration,
           connect_timeout: @timeouts.connect,
-          read_timeout: @timeouts.read,
           write_timeout: @timeouts.write
         )
       when "https"
@@ -385,7 +411,6 @@ module HTTP2
           context: @tls_context,
           configuration: @connection_configuration,
           connect_timeout: @timeouts.connect,
-          read_timeout: @timeouts.read,
           write_timeout: @timeouts.write
         )
       else

@@ -113,12 +113,20 @@ Timeouts apply independently:
 | Setting | Covers |
 | --- | --- |
 | `connect` | DNS lookup and TCP connection |
-| `read` | Transport reads, handshake, and response headers |
+| `read` | The HTTP/2 handshake (waiting for the peer's SETTINGS after dialing) and each response-header wait |
 | `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
 | `idle` | A blocked response-body read or trailer wait |
 
 Nil disables one timeout. A request `Cancellation` remains active after
 response headers arrive, so it can interrupt body and trailer waits.
+
+There is no persistent socket-level read timeout, so an idle pooled
+connection or a quiet long-lived stream (SSE, long-poll) is never killed
+merely for going quiet between waits. Liveness on an already-established
+connection is keepalive's job instead: `HTTP2::Client` enables it by
+default (`Connection::Configuration#keepalive_interval` 30 seconds,
+`#keepalive_timeout` 10 seconds); pass a `connection_configuration:` with
+`keepalive_interval: nil` to disable it.
 
 Cleartext `http` origins use direct HTTP/2 prior knowledge; HTTP/1.1 `Upgrade`
 is not attempted. HTTPS verifies the certificate and hostname, sends SNI, and
@@ -146,8 +154,9 @@ caller-owned streaming `IO` is never replayed.
 `Connection::Configuration#drain_timeout`; `#close` remains an immediate,
 idempotent cancellation. Connection configuration also bounds open streams,
 queued work, field sections, buffered bodies, control/empty-frame rates, and
-retained closed-stream state. Optional keepalive is enabled with
-`keepalive_interval`.
+retained closed-stream state. `HTTP2::Client` enables keepalive by default
+(`keepalive_interval` 30 seconds, `keepalive_timeout` 10 seconds); supply a
+`connection_configuration:` with `keepalive_interval: nil` to disable it.
 
 Advanced users can consume `Connection#diagnostics`, a bounded channel of
 frame metadata, settings, lifecycle changes, and typed errors. Diagnostics
@@ -166,8 +175,10 @@ The initial stable target is an HTTP/2 client. It does not provide:
 - Raw `Connection.connect_*`/`Connection.start` default to no transport
   timeouts and no keepalive; set `read_timeout:`/`write_timeout:` or
   `Configuration#keepalive_interval` when talking to untrusted peers.
-  `HTTP2::Client` sets read and write timeouts by default; keepalive
-  remains opt-in.
+  `HTTP2::Client` sets a write timeout by default and bounds the handshake
+  and each response wait with `read`, but does not set a persistent
+  `read_timeout` on the socket; it enables keepalive by default instead to
+  detect a silent peer on an established connection.
 
 A gRPC adapter belongs in a separate shard above the streaming API.
 See [Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope

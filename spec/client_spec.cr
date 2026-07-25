@@ -1103,6 +1103,117 @@ describe HTTP2::Client do
     end
   end
 
+  it "keeps a supplied connection's quiet stream alive past the read timeout via keepalive" do
+    UNIXSocket.pair do |client_io, peer|
+      keepalive_interval = 100.milliseconds
+      configuration = HTTP2::Connection::Configuration.new(
+        keepalive_interval: keepalive_interval
+      )
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+
+        # Answer keepalive PINGs for ~3 intervals before completing the
+        # response, well past the client's `read` timeout below. Each
+        # iteration blocks on a real inbound frame (the client's next
+        # PING), so this never sleeps.
+        deadline = Time.instant + keepalive_interval * 3
+        while Time.instant < deadline
+          frame = HTTP2::Frame.read(io)
+          if frame.is_a?(HTTP2::Frame::Ping) && !frame.ack?
+            frame.ack.write(io)
+            io.flush
+          end
+        end
+
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          request[:stream_id],
+          "done"
+        ).write(io)
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client_io, configuration)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(
+          read: 200.milliseconds,
+          idle: nil
+        )
+      )
+      begin
+        response = http.get("/")
+        response.body.gets_to_end.should eq("done")
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "keeps a dialed connection's quiet stream alive past the read timeout" do
+    server = TCPServer.new("127.0.0.1", 0)
+    peer_result = scripted_peer(server) do |listener_io|
+      socket = listener_io.as(TCPServer).accept
+      begin
+        complete_server_handshake(socket)
+        request = client_read_field_section(socket, HPack::Decoder.new)
+        write_server_fields(
+          socket,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+
+        # Idle for 2x the client's read timeout with no DATA in flight.
+        # Under the old persistent socket read timeout this silence alone
+        # killed the connection. No PING is expected here: the client
+        # uses its default 30s keepalive interval, far longer than this
+        # wait, so this spec proves the dial path survives quiescence on
+        # its own, without keepalive traffic to lean on.
+        idle = Channel(Nil).new
+        select
+        when idle.receive
+        when timeout(300.milliseconds)
+        end
+
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          request[:stream_id],
+          "done"
+        ).write(socket)
+        socket.flush
+      ensure
+        socket.close
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "http://127.0.0.1:#{server.local_address.port}",
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 1.second,
+        read: 150.milliseconds,
+        write: 1.second
+      )
+    )
+    begin
+      response = http.get("/")
+      response.body.gets_to_end.should eq("done")
+      wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close
+    end
+  end
+
   it "stops a flow-blocked upload after an early complete response" do
     UNIXSocket.pair do |client_io, peer|
       settings = HTTP2::Frame::Settings.new([
