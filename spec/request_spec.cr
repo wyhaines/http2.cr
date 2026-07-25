@@ -56,3 +56,20 @@ describe HTTP2::Request do
     request.headers.get_all("x-value").should eq(["one", "two"])
   end
 end
+
+describe HTTP2::Headers do
+  it "downcases field names converted from HTTP::Headers, preserving order, duplicates, and values" do
+    source = HTTP::Headers.new
+    source.add("Content-Type", "text/plain")
+    source.add("X-Value", "One")
+    source.add("X-Value", "Two")
+
+    headers = HTTP2::Headers.new(source)
+
+    headers.to_a.should eq([
+      HTTP2::Header.new("content-type", "text/plain"),
+      HTTP2::Header.new("x-value", "One"),
+      HTTP2::Header.new("x-value", "Two"),
+    ])
+  end
+end

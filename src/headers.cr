@@ -24,9 +24,14 @@ module HTTP2
       fields.each { |name, value| @fields << Header.new(name, value) }
     end
 
+    # `HTTP::Headers` field names are case-insensitive (RFC 9110 §5.1) but
+    # HTTP/2 requires lowercase on the wire (RFC 9113 §8.2.1); downcasing
+    # here is lossless and lets stdlib-interop callers pass mixed-case names
+    # without tripping outbound validation. Values are untouched.
     def initialize(fields : HTTP::Headers)
       fields.each do |name, values|
-        values.each { |value| @fields << Header.new(name, value) }
+        downcased_name = name.downcase
+        values.each { |value| @fields << Header.new(downcased_name, value) }
       end
     end
 

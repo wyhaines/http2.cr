@@ -346,6 +346,49 @@ describe HTTP2::Client do
     end
   end
 
+  it "downcases interop header names converted from HTTP::Headers on the wire" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_true
+        field_pairs(request[:fields]).should eq([
+          {":method", "GET"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/"},
+          {"content-type", "text/plain"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        sent_request = HTTP2::Request.new(
+          "GET",
+          "/",
+          HTTP::Headers{"Content-Type" => "text/plain"}
+        )
+        response = http.request(sent_request)
+        response.status.should eq(204)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "streams a POST and exposes response trailers" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|
