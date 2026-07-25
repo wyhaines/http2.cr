@@ -249,12 +249,17 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 8 gate passes formatting, Ameba, compilation, documentation, 210
+The Phase 8 gate passes formatting, Ameba, compilation, documentation, 214
 deterministic examples, and five independent nghttp2 examples in normal and
 `preview_mt` modes in the official Crystal 1.20.0 and 1.21.0 containers.
 An additional 5,000-case property stress run passes on Crystal 1.21.0.
 nghttp2 1.59.0 was used for the local release matrix. The `preview_mt` flag
-emits its expected deprecation warning on Crystal 1.21.
+emits its expected deprecation warning on Crystal 1.21. A 2026-07-24
+review-fix pass — the 1xx response cap, the bounded keepalive probe with
+fire-and-forget reader acknowledgements, the WINDOW_UPDATE/SETTINGS-ACK
+write guards, and the dead `EventBus`/`Cookies` removal — re-ran the
+deterministic gate (214 examples) on Crystal 1.22.0-dev locally; container
+and CI verification of this branch is still pending.
 
 ## Next Work
 
