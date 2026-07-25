@@ -249,7 +249,7 @@ crystal build src/http2.cr
 crystal docs
 ```
 
-The Phase 8 gate passes formatting, Ameba, compilation, documentation, 214
+The Phase 8 gate passed formatting, Ameba, compilation, documentation, 210
 deterministic examples, and five independent nghttp2 examples in normal and
 `preview_mt` modes in the official Crystal 1.20.0 and 1.21.0 containers.
 An additional 5,000-case property stress run passes on Crystal 1.21.0.
