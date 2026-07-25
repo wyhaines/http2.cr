@@ -76,6 +76,28 @@ module HTTP2
     # its full span: every other `request` call on the SAME `Client` —
     # even one that will dial or is bound to a different connection —
     # queues behind it until the wait resolves.
+    #
+    # **Limitation when a `Connection` is shared by more than one
+    # opener** (more than one `Client` bound to it, or raw `Connection`
+    # use alongside a `Client`): a freed slot can be won by a DIFFERENT
+    # opener first. RFC 9113 requires locally opened stream IDs to
+    # increase, so that opener's higher-ID stream implicitly closes
+    # ("skips") this request's still-reserved, lower-ID one. `request`
+    # detects this — surfaced internally as `Connection::ClosedError`
+    # ("stream N was skipped by stream M") or, rarely,
+    # `Connection::InvalidStateError` ("stream N is not active on this
+    # connection") — and recovers by reserving a fresh stream and
+    # retrying, within the same `stream_slot` budget, exactly as if it
+    # had lost the original wait. This recovery itself races the other
+    # opener for the NEXT freed slot, so under sustained multi-opener
+    # contention on one `Connection`, `request` is not guaranteed to win
+    # eventually within a bounded number of retries — only that it never
+    # hangs or corrupts connection state: it always either succeeds or
+    # raises once its own `stream_slot` budget is exhausted. A single
+    # `Client` per `Connection` (the common case; sharing one `Connection`
+    # across `Client`s is unusual) never hits this at all, since
+    # `request` calls on the SAME `Client` are already serialized against
+    # each other and cannot skip themselves.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
@@ -410,13 +432,21 @@ module HTTP2
     # freed slot first with a higher stream ID — RFC 9113 requires locally
     # opened stream IDs to increase, so opening that higher ID implicitly
     # closes ("skips") this method's still-idle lower one out from under
-    # it (`Connection#new_stream`'s doc; the skip itself is
-    # `plan_skipped_local_streams_unlocked`). The next retry then sees
-    # `Connection::InvalidStateError` ("stream N is not registered"), not
-    # `ConcurrentStreamLimitError` — allocating a fresh stream and
-    # retrying on it (within the same remaining budget) recovers instead
-    # of surfacing a hard, non-replayable error for what is, from the
-    # caller's perspective, still just "waiting for a slot."
+    # it (`Connection#new_stream`'s doc). `plan_skipped_local_streams_unlocked`
+    # stores a bare `Connection::ClosedError` as that skipped stream's
+    # terminal error EAGERLY — the instant the OTHER opener's HEADERS are
+    # planned, not lazily discovered later — so the COMMON outcome here is
+    # this waiter's own next `#send_headers` call raising that
+    # `ClosedError` straight out of `Stream#send_headers`'s own
+    # `raise_terminal!` guard, before `Connection#send_headers` even runs.
+    # A rarer race (both commands already enqueued at once) instead raises
+    # a bare `Connection::InvalidStateError` ("stream N is not active")
+    # from `Connection#plan_outbound_stream_event_unlocked`. Both are
+    # handled identically below (see `recoverable_stream_skip?`):
+    # allocating a fresh stream and retrying it (within the same
+    # remaining budget) recovers instead of surfacing a hard,
+    # non-replayable error for what is, from the caller's perspective,
+    # still just "waiting for a slot."
     private def send_headers_awaiting_slot(
       connection : Connection,
       stream : Stream,
@@ -439,7 +469,7 @@ module HTTP2
             cancellation.try(&.signal)
           )
           check_cancellation!(cancellation)
-        rescue error : Connection::InvalidStateError
+        rescue error : Connection::ClosedError | Connection::InvalidStateError
           raise error unless recoverable_stream_skip?(
                                connection,
                                current,
@@ -463,23 +493,35 @@ module HTTP2
 
     # Whether `current`'s HEADERS attempt was refused not because the
     # peer's concurrent-stream limit is still exhausted, but because a
-    # DIFFERENT opener on a `Connection` shared by more than one (more
-    # than one `Client`, or raw `Connection` use alongside a `Client`)
-    # already won a freed slot with a higher stream ID — implicitly
-    # skipping `current` out from under this wait (RFC 9113 requires
-    # locally opened stream IDs to increase;
-    # `Connection#plan_skipped_local_streams_unlocked` is the mechanism).
-    # A `DrainingError`, or any error observed once the connection has
-    # actually closed or is draining, is never recoverable — reallocating
-    # into a connection that will accept no further streams would just
-    # spin.
+    # DIFFERENT opener on a shared `Connection` already won a freed slot
+    # with a higher stream ID, implicitly skipping `current` out from
+    # under this wait (see the doc comment above).
+    #
+    # Matches only the two BARE error classes the skip/rare-race paths
+    # actually raise — `error.class ==`, not `#is_a?`, deliberately, so
+    # every SUBCLASS is excluded: a `DrainingError` (`< InvalidStateError`),
+    # a genuinely closed/draining connection's `ClosedError` (from
+    # `Connection#terminate`), a peer GOAWAY (`UnprocessedStreamError`),
+    # an explicit cancel (`CanceledError`), a peer reset
+    # (`StreamResetError`), or a drain timeout (`DrainedError`) must all
+    # still propagate untouched — reallocating into any of those would
+    # spin against a connection that will accept no further streams.
+    # (Verified: every one of those subclasses already coincides with
+    # `connection.closed?` or `connection.draining?` being true by the
+    # time a waiter observes it — GOAWAY sets `Draining` before it ever
+    # touches a stream's terminal error, `Connection#terminate` sets
+    # `Closed` before any stream sees its error — so the connection-state
+    # check below is redundant with the exact-class check for those
+    # specific cases, not a substitute for it: relying on either signal
+    # alone was the wrong tradeoff, so both stay.)
     private def recoverable_stream_skip?(
       connection : Connection,
       current : Stream,
       deadline : Time::Instant?,
-      error : Connection::InvalidStateError,
+      error : Connection::Error,
     ) : Bool
-      return false if error.is_a?(Connection::DrainingError)
+      return false unless error.class == Connection::ClosedError ||
+                          error.class == Connection::InvalidStateError
       return false unless deadline
       return false if connection.closed? || connection.draining?
 

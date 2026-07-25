@@ -139,6 +139,21 @@ other `request` call on the SAME `Client` — even one that will dial or is
 bound to a different connection — queues behind it until the wait
 resolves.
 
+**Limitation when one `Connection` is shared by more than one opener**
+(more than one `Client` bound to it, or raw `Connection` use alongside a
+`Client` — not the common case): a different opener can win a freed slot
+first, and RFC 9113's increasing-stream-ID rule then implicitly closes
+("skips") this request's own reservation. `request` detects this —
+internally, `Connection::ClosedError` ("stream N was skipped by stream
+M") or, rarely, `Connection::InvalidStateError` ("stream N is not active
+on this connection") — and recovers by reserving a fresh stream and
+retrying within the same `stream_slot` budget. That recovery races the
+other opener too, so under sustained multi-opener contention `request`
+is not guaranteed to win eventually; it is guaranteed to never hang and
+to always either succeed or raise `Connection::ConcurrentStreamLimitError`
+once its own budget is exhausted. A single `Client` per `Connection`
+never encounters this at all.
+
 A `Response` the caller abandons — never reads, never closes — would
 otherwise hold its stream and connection-window credit open forever,
 which can stall every other request on the connection. `idle` doubles as

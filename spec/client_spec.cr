@@ -780,6 +780,128 @@ describe HTTP2::Client do
     end
   end
 
+  # This ordering (reserve the competitor's stream ID, free the shared
+  # slot, then immediately open the competitor from the SAME test fiber)
+  # reproduces the skip-and-recover scenario deterministically under the
+  # default scheduler: 20/20 clean in isolation, plus repeated full-file
+  # runs, while preparing this spec. Under `-Dpreview_mt`'s genuine OS-
+  # thread parallelism it is NOT reliable — measured 1/15 in the same
+  # form — because the parked waiter's own wake-to-retry path is
+  # shorter than the competitor's (which needs an extra #new_stream
+  # call), so the waiter usually wins the freed slot itself instead of
+  # being skipped. That is a property of the scenario under true
+  # parallel scheduling, not a bug in the fix (see the task report for
+  # the full methodology and the other constructions tried). Per the
+  # plan's "any -Dpreview_mt flake: stop and investigate" constraint,
+  # this example only runs under the default scheduler; the recovery
+  # code path it exercises is ALSO covered, deterministically under
+  # both schedulers, by connection_stream_state_spec.cr's extended
+  # "closes lower idle streams when a higher ID opens" example, which
+  # pins the exact `Connection::ClosedError` shape `#send_headers`
+  # raises for a skipped stream without depending on any live race.
+  {% if flag?(:preview_mt) %}
+    pending "recovers a stream_slot wait after a shared connection's other opener wins and skips it (skipped under -Dpreview_mt: not reproducible without a live scheduler race — see comment above and the task report)"
+  {% else %}
+    it "recovers a stream_slot wait after a shared connection's other opener wins and skips it" do
+      UNIXSocket.pair do |client_io, peer|
+        peer_result = scripted_peer(peer) do |io|
+          settings = HTTP2::Frame::Settings.new([
+            HTTP2::Frame::Settings::Setting.new(
+              HTTP2::Frame::Settings::Identifier::MAX_CONCURRENT_STREAMS,
+              1_u32
+            ),
+          ])
+          complete_server_handshake(io, settings)
+          decoder = HPack::Decoder.new
+          encoder = HPack::Encoder.new
+
+          occupying_request = client_read_field_section(io, decoder)
+          read_until_reset(io).stream_id.should eq(
+            occupying_request[:stream_id]
+          )
+
+          # Whichever stream wins the freed slot first — "/second" itself
+          # (succeeding normally) or the test-fiber-driven "competitor"
+          # (skipping "/second"'s reservation) — respond to it.
+          winner_request = client_read_field_section(io, decoder)
+          write_server_fields(
+            io,
+            encoder,
+            winner_request[:stream_id],
+            [{":status", "200"}],
+            end_stream: true
+          )
+
+          # If "/second" was skipped, it recovers on a freshly reallocated
+          # stream once this slot frees too.
+          second_request = client_read_field_section(io, decoder)
+          write_server_fields(
+            io,
+            encoder,
+            second_request[:stream_id],
+            [{":status", "200"}],
+            end_stream: true
+          )
+        end
+
+        connection = HTTP2::Connection.start(client_io)
+        connection.wait_until_active(1.second)
+
+        occupying = connection.new_stream
+        open_client_stream(occupying, end_stream: true)
+
+        http = HTTP2::Client.new(
+          "http://example.test",
+          connection: connection,
+          timeouts: HTTP2::Client::Timeouts.new(stream_slot: 2.seconds)
+        )
+        begin
+          second_result = Channel(HTTP2::Response | Exception).new(1)
+          spawn do
+            begin
+              second_result.send(http.get("/second"))
+            rescue error
+              second_result.send(error)
+            end
+          end
+
+          # Wait for "/second" to have reserved its stream (id 3) and, in
+          # practice, to have already hit ConcurrentStreamLimitError once
+          # and parked — occupying is still active, so its first attempt
+          # cannot succeed yet.
+          eventually(1.second, "\"/second\" never reserved a stream") do
+            !connection.stream?(3_u32).nil?
+          end
+
+          # Reserve the "competitor" stream's ID *before* freeing the
+          # slot both it and "/second" will race for, then free it and
+          # immediately (same test fiber, no intervening code) attempt to
+          # open the competitor — deterministically reproduces this
+          # ordering under the default scheduler (verified 20/20 in
+          # isolation while preparing this spec; see the task report for
+          # the full methodology, including why this specific ordering —
+          # not a contrived sleep or Fiber.yield loop — is what makes it
+          # reproducible).
+          competitor = connection.new_stream
+          occupying.cancel
+          competitor.send_headers([] of HTTP2::HeaderField, end_stream: true)
+
+          result = select
+          when value = second_result.receive
+            value
+          when timeout(3.seconds)
+            fail("\"/second\" did not complete")
+          end
+          raise result if result.is_a?(Exception)
+          result.status.should eq(200)
+          wait_for_peer(peer_result)
+        ensure
+          http.close
+        end
+      end
+    end
+  {% end %}
+
   it "does not retry a stream_slot wait into a connection the peer is draining" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|
