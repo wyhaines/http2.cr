@@ -113,7 +113,7 @@ Timeouts apply independently:
 | Setting | Covers |
 | --- | --- |
 | `connect` | DNS lookup and TCP connection |
-| `read` | The HTTP/2 handshake (waiting for the peer's SETTINGS after dialing) and each response-header wait |
+| `read` | The TLS and HTTP/2 handshakes (for `https`, the TLS handshake itself; then, for both schemes, waiting for the peer's SETTINGS after dialing) and each response-header wait |
 | `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
 | `idle` | A blocked response-body read or trailer wait |
 
@@ -173,12 +173,13 @@ The initial stable target is an HTTP/2 client. It does not provide:
 - redirect, cookie, proxy, decompression, or retry policy beyond the explicit
   proven-unprocessed replay modes.
 - Raw `Connection.connect_*`/`Connection.start` default to no transport
-  timeouts and no keepalive; set `read_timeout:`/`write_timeout:` or
+  timeouts and no keepalive; set `read_timeout:`/`write_timeout:` (and, for
+  `connect_tls`/`start_tls`, `handshake_read_timeout:`) or
   `Configuration#keepalive_interval` when talking to untrusted peers.
-  `HTTP2::Client` sets a write timeout by default and bounds the handshake
-  and each response wait with `read`, but does not set a persistent
-  `read_timeout` on the socket; it enables keepalive by default instead to
-  detect a silent peer on an established connection.
+  `HTTP2::Client` sets a write timeout by default and bounds the TLS and
+  HTTP/2 handshakes and each response wait with `read`, but does not set a
+  persistent `read_timeout` on the socket; it enables keepalive by default
+  instead to detect a silent peer on an established connection.
 
 A gRPC adapter belongs in a separate shard above the streaming API.
 See [Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope

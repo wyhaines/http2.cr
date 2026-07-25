@@ -168,9 +168,13 @@ module HTTP2
     # deadlines). Against untrusted or unreliable peers, set them and/or
     # enable `Configuration#keepalive_interval`; otherwise a silent or
     # write-stalled peer can hold blocked callers indefinitely.
-    # `HTTP2::Client` sets `write_timeout` by default and bounds the
-    # handshake with a per-wait deadline instead of `read_timeout`; it
-    # enables keepalive by default to detect a silent peer once active.
+    # `handshake_read_timeout` bounds only the TLS handshake itself (see
+    # `start_tls`) without leaving a persistent `read_timeout` armed
+    # afterward. `HTTP2::Client` sets `write_timeout` by default and
+    # bounds the TLS and HTTP/2 handshakes with per-wait deadlines
+    # (`handshake_read_timeout` and `wait_until_active`, respectively)
+    # instead of a persistent `read_timeout`; it enables keepalive by
+    # default to detect a silent peer once active.
     def self.connect_tls(
       host : String,
       port : Int = 443,
@@ -181,6 +185,7 @@ module HTTP2
       connect_timeout : Time::Span? = nil,
       read_timeout : Time::Span? = nil,
       write_timeout : Time::Span? = nil,
+      handshake_read_timeout : Time::Span? = nil,
     ) : self
       transport = TCPSocket.new(
         host,
@@ -195,7 +200,8 @@ module HTTP2
           transport,
           server_name,
           context: context,
-          configuration: configuration
+          configuration: configuration,
+          handshake_read_timeout: handshake_read_timeout
         )
       rescue error
         transport.close unless transport.closed?
@@ -204,24 +210,54 @@ module HTTP2
     end
 
     # Wraps a supplied transport in verified TLS and starts HTTP/2.
+    #
+    # `handshake_read_timeout`, when given, bounds each individual read
+    # during the TLS handshake (per read, like `read_timeout` elsewhere —
+    # not a cumulative deadline for the whole handshake) by setting it as
+    # `transport`'s `read_timeout` for the duration of the handshake only;
+    # the transport's previous `read_timeout` (nil, or whatever a caller
+    # set directly) is reinstated once the handshake and ALPN check are
+    # done, before HTTP/2 starts — so it never lingers as a persistent
+    # transport-level deadline afterward, and a caller who also set a
+    # persistent `read_timeout` directly on `transport` gets it back
+    # unchanged. Silently ignored if `transport` doesn't support
+    # `read_timeout=` (its static type is the untyped `IO`).
+    # `connect_prior_knowledge` has no equivalent parameter because
+    # `Connection#start` performs no synchronous read of its own — the
+    # cleartext dial path never blocks on a read before `wait_until_active`
+    # is already covering the wait.
     def self.start_tls(
       transport : IO,
       server_name : String,
       *,
       context : OpenSSL::SSL::Context::Client = OpenSSL::SSL::Context::Client.new,
       configuration : Configuration = Configuration.new,
+      handshake_read_timeout : Time::Span? = nil,
     ) : self
       context.alpn_protocol = "h2"
-      tls = OpenSSL::SSL::Socket::Client.new(
-        transport,
-        context,
-        sync_close: true,
-        hostname: server_name
-      )
 
-      unless tls.alpn_protocol == "h2"
-        tls.close
-        raise TLSNegotiationError.new("the TLS peer did not negotiate ALPN h2")
+      previous_read_timeout = nil
+      if handshake_read_timeout
+        previous_read_timeout = transport.read_timeout if transport.responds_to?(:read_timeout)
+        transport.read_timeout = handshake_read_timeout if transport.responds_to?(:read_timeout=)
+      end
+
+      begin
+        tls = OpenSSL::SSL::Socket::Client.new(
+          transport,
+          context,
+          sync_close: true,
+          hostname: server_name
+        )
+
+        unless tls.alpn_protocol == "h2"
+          tls.close
+          raise TLSNegotiationError.new("the TLS peer did not negotiate ALPN h2")
+        end
+      ensure
+        if handshake_read_timeout && transport.responds_to?(:read_timeout=)
+          transport.read_timeout = previous_read_timeout
+        end
       end
 
       new(tls, configuration).start

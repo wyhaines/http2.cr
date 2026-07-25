@@ -28,18 +28,20 @@ module HTTP2
 
     # Per-operation deadlines. Nil disables the corresponding timeout.
     #
-    # `connect` covers DNS and TCP dialing, `read` covers the HTTP/2
-    # handshake (the wait for the peer's SETTINGS after dialing) and each
-    # response-header wait, `write` covers transport writes, and `idle`
-    # covers a blocked response-body read or trailer wait. There is no
-    # persistent socket-level read timeout, so a quiet-but-healthy
-    # connection (an idle pooled connection, a long-lived SSE or long-poll
-    # stream) is never killed merely for going quiet between waits.
-    # Liveness on an established connection is keepalive's job instead:
-    # `connection_configuration`'s `keepalive_interval`/`keepalive_timeout`
-    # (30 seconds / 10 seconds by default for `HTTP2::Client`) periodically
-    # PINGs the peer and fails the connection if it stops answering; supply
-    # a configuration with `keepalive_interval: nil` to disable it.
+    # `connect` covers DNS and TCP dialing, `read` covers the TLS and
+    # HTTP/2 handshakes (for `https` origins, the TLS handshake itself;
+    # then, for both schemes, the wait for the peer's SETTINGS after
+    # dialing) and each response-header wait, `write` covers transport
+    # writes, and `idle` covers a blocked response-body read or trailer
+    # wait. There is no persistent socket-level read timeout, so a
+    # quiet-but-healthy connection (an idle pooled connection, a
+    # long-lived SSE or long-poll stream) is never killed merely for
+    # going quiet between waits. Liveness on an established connection is
+    # keepalive's job instead: `connection_configuration`'s
+    # `keepalive_interval`/`keepalive_timeout` (30 seconds / 10 seconds by
+    # default for `HTTP2::Client`) periodically PINGs the peer and fails
+    # the connection if it stops answering; supply a configuration with
+    # `keepalive_interval: nil` to disable it.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
@@ -387,12 +389,16 @@ module HTTP2
 
     # Dials a new connection. Neither branch passes `read_timeout:`: a
     # persistent socket-level read deadline would kill idle pooled
-    # connections and quiet long-lived streams once active. The handshake
-    # wait is instead bounded by `ready_connection`'s
+    # connections and quiet long-lived streams once active. The HTTP/2
+    # handshake wait is instead bounded by `ready_connection`'s
     # `wait_until_active(@timeouts.read)` call above, and liveness after
     # that is keepalive's job, not a transport read timeout.
     # `write_timeout:` still bounds transport writes throughout the
-    # connection's life.
+    # connection's life. The HTTPS branch also passes
+    # `handshake_read_timeout: @timeouts.read`, which bounds only the TLS
+    # handshake itself (before any `Connection` exists to be covered by
+    # `wait_until_active`) and is not left armed afterward — see
+    # `Connection.start_tls`'s doc comment.
     private def dial : Connection
       case @origin.scheme
       when "http"
@@ -411,7 +417,8 @@ module HTTP2
           context: @tls_context,
           configuration: @connection_configuration,
           connect_timeout: @timeouts.connect,
-          write_timeout: @timeouts.write
+          write_timeout: @timeouts.write,
+          handshake_read_timeout: @timeouts.read
         )
       else
         raise InvalidRequestError.new(

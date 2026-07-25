@@ -1304,6 +1304,29 @@ describe HTTP2::Client do
     ).idle.should be_nil
   end
 
+  it "enables keepalive by default in the connection configuration" do
+    http = HTTP2::Client.new("http://example.test")
+    begin
+      http.connection_configuration.keepalive_interval.should eq(30.seconds)
+    ensure
+      http.close
+    end
+  end
+
+  it "uses a caller-supplied connection configuration verbatim" do
+    configuration = HTTP2::Connection::Configuration.new
+    http = HTTP2::Client.new(
+      "http://example.test",
+      connection_configuration: configuration
+    )
+    begin
+      http.connection_configuration.should be(configuration)
+      http.connection_configuration.keepalive_interval.should be_nil
+    ensure
+      http.close
+    end
+  end
+
   it "rejects origins with invalid ports" do
     expect_raises(ArgumentError, /invalid port/) do
       HTTP2::Client.new("https://example.test:0")
