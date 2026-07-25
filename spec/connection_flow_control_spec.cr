@@ -917,7 +917,7 @@ describe HTTP2::Connection do
   it "announces the configured connection receive window after the preface" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|
-        client_settings = read_client_preface(io)
+        read_client_preface(io)
         HTTP2::Frame::Settings
           .new([] of HTTP2::Frame::Settings::Setting)
           .write(io)
