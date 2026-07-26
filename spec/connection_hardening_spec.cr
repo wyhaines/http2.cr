@@ -776,6 +776,253 @@ describe HTTP2::Connection do
     end
   end
 
+  it "resets a stream whose inbound DATA queue overflows instead of " \
+     "closing the connection, restoring the discarded connection credit" do
+    UNIXSocket.pair do |client, peer|
+      flooded_id = Channel(UInt32).new(1)
+      healthy_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        # A manual, non-acknowledging handshake (same idiom as the
+        # pre-ACK PUSH_PROMISE spec in connection_control_spec.cr): the
+        # peer never sends `Settings.ack`, so `@effective_local_settings_
+        # state` stays at `client_defaults` (initial_window_size 65_535)
+        # for streams opened below. This deliberately decouples the
+        # stream's flow-control receive window (stays spacious) from
+        # `max_buffered_body_bytes` (always applied directly as the body
+        # buffer's own capacity, 8, regardless of ack state) — otherwise
+        # `synchronize_advertised_initial_window_size!` ties the two
+        # together and the flood would trip stream-level flow control
+        # (a pre-existing, different check) before ever reaching the
+        # body buffer this spec targets. This is not a contrived setup:
+        # it is the same pre-ACK race Task 7's report flagged as the
+        # only way a peer can outrun a reduced max_buffered_body_bytes.
+        read_client_preface(io)
+        HTTP2::Frame::Settings.new(
+          [] of HTTP2::Frame::Settings::Setting
+        ).write(io)
+        io.flush
+        skip_startup_window_update(io)
+          .as(HTTP2::Frame::Settings)
+          .ack?
+          .should be_true
+
+        flooded = flooded_id.receive
+        healthy = healthy_id.receive
+        read_client_headers(io, flooded)
+        read_client_headers(io, healthy)
+
+        # max_buffered_body_bytes is 8 and nothing ever reads the flooded
+        # stream's body: the first two 4-byte DATA frames fill it exactly,
+        # the third overflows it. None carries END_STREAM, so the stream
+        # stays half-closed(local) (registered in @streams) through the
+        # whole flood — this exercises the "still active" branch.
+        3.times do
+          HTTP2::Frame::Data.new(
+            0_u8,
+            flooded,
+            Bytes.new(4, 0x61_u8)
+          ).write(io)
+        end
+        io.flush
+
+        # All 12 charged bytes (3 frames x 4) must come back as connection
+        # credit: 4 for the rejected 3rd frame (released immediately) plus
+        # 8 for the two already-buffered, never-consumed frames (released
+        # once the reset stream is actually torn down). The two releases
+        # do not necessarily land in the same WINDOW_UPDATE, so accumulate
+        # until the full amount is seen rather than assuming one frame.
+        reset_seen = false
+        connection_credit = 0_u32
+        until reset_seen && connection_credit >= 12_u32
+          frame = HTTP2::Frame.read(io)
+          case frame
+          when HTTP2::Frame::ResetStream
+            frame.stream_id.should eq(flooded)
+            frame.error_code.should eq(
+              HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32
+            )
+            reset_seen = true
+          when HTTP2::Frame::WindowUpdate
+            if frame.stream_id == 0_u32
+              connection_credit += frame.window_size_increment
+            end
+          end
+        end
+        connection_credit.should eq(12_u32)
+
+        # Boundary checkpoint: exactly 12 bytes must be restored, not more.
+        # A stray extra credit frame (e.g. a double-release bug) would be
+        # the very next frame read back here instead of the PING's own
+        # pong — a hard cast, not a skip-loop, so it fails loudly.
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "restored")
+        ping.write(io)
+        io.flush
+        pong = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        pong.ack?.should be_true
+        pong.payload.should eq(ping.payload)
+
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_HEADERS |
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          healthy,
+          Bytes.empty
+        ).write(io)
+        io.flush
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        max_buffered_body_bytes: 8
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+
+        flooded_stream = connection.new_stream
+        open_client_stream(flooded_stream)
+        healthy_stream = connection.new_stream
+        open_client_stream(healthy_stream)
+
+        flooded_id.send(flooded_stream.id)
+        healthy_id.send(healthy_stream.id)
+
+        # As in the event-queue sibling spec above: wait for the peer's
+        # entire script (flood, observe the RST and credit, checkpoint,
+        # send the healthy response) before this fiber touches either
+        # stream, so nothing here can race the flood's own outcome.
+        wait_for_peer(peer_result)
+
+        flooded_stream.terminal_error.as(HTTP2::ProtocolError)
+          .error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+
+        error = expect_raises(HTTP2::ProtocolError) do
+          flooded_stream.body.read(Bytes.new(1))
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+
+        healthy_stream.receive(1.second).should be_a(
+          HTTP2::Connection::FieldSection
+        )
+        connection.active?.should be_true
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "terminates a stream locally, without an RST, when the DATA " \
+     "frame that overflows an already-full queue also ends the " \
+     "stream, still restoring the discarded connection credit" do
+    UNIXSocket.pair do |client, peer|
+      victim_id = Channel(UInt32).new(1)
+      other_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        # See the DATA-flood spec above for why this handshake
+        # deliberately withholds `Settings.ack` (decouples the stream's
+        # flow-control receive window from max_buffered_body_bytes).
+        read_client_preface(io)
+        HTTP2::Frame::Settings.new(
+          [] of HTTP2::Frame::Settings::Setting
+        ).write(io)
+        io.flush
+        skip_startup_window_update(io)
+          .as(HTTP2::Frame::Settings)
+          .ack?
+          .should be_true
+
+        victim = victim_id.receive
+        other = other_id.receive
+        read_client_headers(io, victim)
+        read_client_headers(io, other)
+
+        # Fill the queue (capacity 8) with two ordinary 4-byte DATA
+        # frames, then send a third, END_STREAM-flagged 4-byte frame.
+        # `victim` is already half-closed(local) (its own HEADERS carried
+        # END_STREAM), so this closing frame both overflows the buffer
+        # AND is the one whose own transition removes the stream from
+        # the active set — inside `accept_inbound_data`, *before*
+        # `deliver_data` is even attempted. That is a different branch
+        # of the fix than the plain-overflow case above (where the
+        # stream was still active when the overflow was detected).
+        2.times do
+          HTTP2::Frame::Data.new(
+            0_u8,
+            victim,
+            Bytes.new(4, 0x62_u8)
+          ).write(io)
+        end
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          victim,
+          Bytes.new(4, 0x62_u8)
+        ).write(io)
+        io.flush
+
+        # Nothing is owed to the peer for `victim` here — RFC 9113 has no
+        # RST to send once both sides already agree a stream is done. All
+        # 12 charged bytes still come back as connection credit even
+        # though no RST is involved: 4 for the rejected 3rd frame
+        # (released immediately) plus 8 for the two already-buffered
+        # frames (released by the direct local-termination branch).
+        connection_credit = 0_u32
+        until connection_credit >= 12_u32
+          frame = HTTP2::Frame.read(io).as(HTTP2::Frame::WindowUpdate)
+          connection_credit += frame.window_size_increment if frame.stream_id == 0_u32
+        end
+        connection_credit.should eq(12_u32)
+
+        # Verified, not just asserted by omission: a PING sent immediately
+        # after goes through the same single, FIFO-ordered writer queue as
+        # an RST would, so if one had been sent (a regression), it would
+        # be the *next* frame read back here, and the `.as(Ping)` cast
+        # below would fail instead of silently passing.
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "no-rst!!")
+        ping.write(io)
+        io.flush
+        reply = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        reply.ack?.should be_true
+        reply.payload.should eq(ping.payload)
+
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_HEADERS |
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          other,
+          Bytes.empty
+        ).write(io)
+        io.flush
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        max_buffered_body_bytes: 8
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+
+        victim_stream = connection.new_stream
+        open_client_stream(victim_stream)
+        other_stream = connection.new_stream
+        open_client_stream(other_stream)
+
+        victim_id.send(victim_stream.id)
+        other_id.send(other_stream.id)
+
+        wait_for_peer(peer_result)
+
+        other_stream.receive(1.second).should be_a(
+          HTTP2::Connection::FieldSection
+        )
+
+        error = expect_raises(HTTP2::ProtocolError) do
+          victim_stream.body.read(Bytes.new(1))
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+        connection.active?.should be_true
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "emits bounded structured frame and settings diagnostics" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|

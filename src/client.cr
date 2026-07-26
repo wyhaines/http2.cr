@@ -960,17 +960,10 @@ module HTTP2
         check_cancellation!(cancellation)
         validate_sent_length!(sent, body_length) if size.zero?
         sent += size
-        final = sent == body_length
-        stream.send_data(
-          buffer[0, size],
-          end_stream: final && trailers.empty?
-        )
+        stream.send_data(buffer[0, size])
       end
-      if body_length.zero?
-        finish_request_content(stream, trailers)
-      elsif !trailers.empty?
-        stream.send_headers(trailers, end_stream: true)
-      end
+      reject_excess_body!(source, body_length, cancellation)
+      finish_request_content(stream, trailers)
     end
 
     private def stream_body_to_eof(
@@ -1014,6 +1007,33 @@ module HTTP2
       raise InvalidRequestError.new(
         "streamed request body length #{actual} does not match " \
         "content-length #{expected}"
+      )
+    end
+
+    # Symmetric counterpart to `#validate_sent_length!`: that check catches
+    # a source that runs dry before the declared length; this one catches
+    # a source that still has more once exactly `body_length` bytes have
+    # already been sent. `#stream_sized_body` never reads past `body_length`
+    # on its own (each chunk is capped at the remaining declared amount), so
+    # without this probe a longer source is silently truncated to the
+    # declared length instead of surfacing as a request error. Probing
+    # before `#finish_request_content` runs means a caller-visible error is
+    # possible before END_STREAM is committed to the wire, rather than only
+    # after.
+    private def reject_excess_body!(
+      source : IO,
+      body_length : Int64,
+      cancellation : Cancellation?,
+    ) : Nil
+      check_cancellation!(cancellation)
+      probe = Bytes.new(1)
+      extra = source.read(probe)
+      check_cancellation!(cancellation)
+      return if extra.zero?
+
+      raise InvalidRequestError.new(
+        "streamed request body exceeds declared content-length " \
+        "#{body_length}"
       )
     end
 

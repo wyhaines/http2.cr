@@ -46,6 +46,21 @@ describe HTTP2::StreamBody do
     canceled.should be_true
   end
 
+  it "raises IO::Error instead of returning 0 when read after the " \
+     "caller closes the body" do
+    body = HTTP2::StreamBody.new(
+      8,
+      ->(_amount : Int32) { },
+      -> { }
+    )
+
+    body.close
+
+    expect_raises(IO::Error, /closed stream/) do
+      body.read(Bytes.new(1))
+    end
+  end
+
   it "wakes a blocked reader with a terminal error" do
     body = HTTP2::StreamBody.new(
       8,

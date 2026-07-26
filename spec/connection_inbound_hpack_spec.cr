@@ -283,6 +283,47 @@ describe HTTP2::Connection do
     end
   end
 
+  it "accepts a 257-field section under the raised default limit " \
+     "(legal but past the old 256 default; RFC imposes no field-count " \
+     "limit and the ~64 KiB section-size bound still caps the real " \
+     "exposure)" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      field_count = 257
+      fields = Array.new(field_count) { |index| {"x-field-#{index}", "v"} }
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        write_inbound_field_block(
+          io,
+          id,
+          HPack::Encoder.new.encode(fields),
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream)
+        stream_id.send(stream.id)
+
+        section = stream.receive(1.second)
+          .as(HTTP2::Connection::FieldSection)
+        section.fields.size.should eq(field_count)
+        section.fields.first.name.should eq("x-field-0")
+        section.fields.last.name.should eq("x-field-256")
+        connection.active?.should be_true
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "reports malformed suppressed bytes as a compression error" do
     UNIXSocket.pair do |client, peer|
       configuration = HTTP2::Connection::Configuration.new(

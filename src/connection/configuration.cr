@@ -18,6 +18,18 @@ module HTTP2
       getter keepalive_timeout : Time::Span
       getter max_compressed_field_section_size : Int32
       getter max_decoded_field_section_size : Int32
+      # An additional defense-in-depth cap on the number of fields a single
+      # decoded section may contain. Neither RFC 9113 nor RFC 7541 impose
+      # any field-count limit of their own — only the byte-size bounds
+      # (`max_compressed_field_section_size`, `max_decoded_field_section_size`)
+      # are protocol-adjacent. A too-low count limit rejects legitimate,
+      # if unusual, requests (large cookie jars, tracing/baggage headers,
+      # etc.) that were never actually a resource risk: even at this
+      # getter's default, a decoded section is still bounded by the ~64 KiB
+      # `max_decoded_field_section_size` default, so raising the count
+      # ceiling does not raise the real worst-case exposure — a section
+      # cannot reach anywhere near this many fields without also being
+      # mostly empty-valued padding that the byte cap already catches.
       getter max_decoded_fields : Int32
       getter max_decoded_string_size : Int32
       getter max_continuation_frames : Int32
@@ -48,7 +60,7 @@ module HTTP2
         @keepalive_timeout : Time::Span = 10.seconds,
         @max_compressed_field_section_size : Int32 = 64 * 1024,
         @max_decoded_field_section_size : Int32 = 64 * 1024,
-        @max_decoded_fields : Int32 = 256,
+        @max_decoded_fields : Int32 = 1024,
         max_decoded_string_size : Int32? = nil,
         @max_continuation_frames : Int32 = 16,
         @max_encoder_table_size : Int32 = 64 * 1024,

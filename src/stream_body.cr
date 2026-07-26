@@ -68,7 +68,17 @@ module HTTP2
               {count, nil, false}
             elsif error = @terminal_error
               {0, error, false}
-            elsif @finished || @closed
+            elsif @closed
+              # A caller-initiated `#close` is distinct from reaching a
+              # natural end of stream (`@finished`, still a plain 0-byte
+              # EOF below): once closed, any further read must not be
+              # mistaken for "the response completed normally," so it
+              # raises instead of silently returning 0. This branch only
+              # runs when `@terminal_error` is unset (checked above), so an
+              # existing terminal error always takes precedence over this
+              # generic closed signal.
+              {0, IO::Error.new("closed stream"), false}
+            elsif @finished
               {0, nil, false}
             else
               {0, nil, true}

@@ -1886,6 +1886,37 @@ describe HTTP2::Client do
     end
   end
 
+  it "resets a streamed request whose IO body exceeds its " \
+     "content-length" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        client_read_field_section(io, HPack::Decoder.new)
+        read_until_reset(io).error_code.should eq(
+          HTTP2::ErrorCode::CANCEL.to_u32
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        expect_raises(HTTP2::InvalidRequestError, /content-length/) do
+          http.post(
+            "/",
+            HTTP2::Headers{"content-length" => "3"},
+            IO::Memory.new("abcd")
+          )
+        end
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "validates timeout configuration" do
     expect_raises(ArgumentError, /connect timeout/) do
       HTTP2::Client::Timeouts.new(connect: Time::Span.zero)

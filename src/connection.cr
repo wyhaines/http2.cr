@@ -2052,12 +2052,23 @@ module HTTP2
 
         data = frame.data.dup
         unless stream.deliver_data(data)
+          # This frame's own flow-controlled bytes were charged against
+          # the connection window in `accept_inbound_data` above but never
+          # made it into the body buffer — release that credit regardless
+          # of which branch below is taken next. Any bytes from *earlier*
+          # frames still sitting in the body buffer (never consumed by the
+          # application) are a separate pool, released later by whichever
+          # of `fail_overflowed_stream`'s two branches actually tears the
+          # stream down (`Stream#terminate` -> `StreamBody#terminate`), not
+          # here — see that method's own accounting.
           release_discarded_connection_credit(flow_size)
           return if stream.body.closed? || stream.terminal_error
 
-          raise QueueFullError.new(
+          fail_overflowed_stream(
+            stream,
             "stream #{stream.id} body reached its configured byte limit"
           )
+          return
         end
 
         overhead = frame.payload.size - data.size
@@ -2210,7 +2221,10 @@ module HTTP2
       return if ignored || stream.nil?
 
       unless stream.deliver(event)
-        fail_overflowed_stream(stream)
+        fail_overflowed_stream(
+          stream,
+          "stream #{stream.id} event queue reached its configured limit"
+        )
         return
       end
       if section = event.as?(FieldSection)
@@ -2225,9 +2239,11 @@ module HTTP2
       wake_drain_monitor if stream.closed?
     end
 
-    # A single stream's bounded inbound event queue filling up (a
-    # consumer that stopped reading, or fell behind) used to raise a
-    # connection-fatal `QueueFullError` here — one slow reader took every
+    # A single stream's bounded inbound queue filling up — either the
+    # metadata event queue (`Stream#deliver`, headers/trailers/PRIORITY)
+    # or the DATA body-byte queue (`Stream#deliver_data`, gated by
+    # `max_buffered_body_bytes`) — used to raise a connection-fatal
+    # `QueueFullError` at each call site — one slow reader took every
     # other stream down with it. Treat it like any other stream-scoped
     # protocol violation instead: RST just this stream with
     # ENHANCE_YOUR_CALM and let the rest of the connection carry on.
@@ -2236,8 +2252,12 @@ module HTTP2
     # eventual stream removal, and LocalReset retention (so a frame for
     # this stream already in flight from the peer is absorbed rather than
     # treated as a fresh violation) for free — the same path every other
-    # stream-scoped error already takes.
-    private def fail_overflowed_stream(stream : Stream) : Nil
+    # stream-scoped error already takes. `message` is caller-supplied so
+    # the two queues keep their own distinct, descriptive wording.
+    private def fail_overflowed_stream(
+      stream : Stream,
+      message : String,
+    ) : Nil
       if stream.terminal_error
         # `Stream#deliver` returns `false` for two different reasons:
         # the queue is genuinely full (what this method exists to
@@ -2255,7 +2275,7 @@ module HTTP2
       end
 
       error = ProtocolError.new(
-        "stream #{stream.id} event queue reached its configured limit",
+        message,
         ErrorCode::ENHANCE_YOUR_CALM,
         ErrorScope::Stream,
         stream.id
