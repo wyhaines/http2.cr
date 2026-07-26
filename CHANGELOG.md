@@ -3,7 +3,10 @@
 All notable changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.0.0-rc.1 — 2026-07-26
+
+This release candidate replaces the original frame-codec spike with an
+origin-bound, streaming HTTP/2 client.
 
 ### Changed (breaking)
 
@@ -16,6 +19,17 @@ All notable changes are recorded here. This project follows
 
 ### Added
 
+- Complete RFC 9113 frame parsing, stream state, flow control, SETTINGS,
+  PING, GOAWAY, cancellation, and graceful draining.
+- Persistent HPACK encoding and decoding with bounded field-block assembly.
+- Verified TLS with SNI and ALPN `h2`, plus cleartext prior knowledge.
+- Concurrent requests, streaming request and response bodies, informational
+  responses, CONNECT, and request/response trailers.
+- Explicit timeouts, safe opt-in replay, keepalive, resource limits, and
+  structured diagnostics.
+- Deterministic property coverage and an independent nghttp2 interoperability
+  matrix for TLS, fragmentation, flow control, trailers, resets, GOAWAY, and
+  concurrent streams.
 - Added a configurable connection-level receive window
   (`connection_receive_window`, default 1 MiB), announced via an accounted
   `WINDOW_UPDATE` sent immediately after the connection preface.
@@ -45,6 +59,9 @@ All notable changes are recorded here. This project follows
 
 ### Changed
 
+- The client and protocol APIs have been redesigned and are not compatible
+  with the original `0.1.0` spike.
+- Crystal 1.20.0 is now the minimum supported compiler.
 - Coalesced receive-credit `WINDOW_UPDATE` frames at a half-window watermark,
   for both the connection and each stream, flushing all pending credit on any
   writer wakeup and at stream end instead of one update per body read.
@@ -64,10 +81,15 @@ All notable changes are recorded here. This project follows
   matched case-insensitively and always keep the literal, never-indexed wire
   form; `Client#additional_never_indexed_fields` extends that exemption to
   caller-named fields.
-- `graceful_close` no longer sends a TLS `close_notify` alert on either the
-  forceful or the graceful path — the raw socket is closed directly instead
-  — so a peer may see the connection disappear rather than a clean TLS
-  shutdown (it may log something like "unexpected EOF").
+- For a connection the library dialed itself (`connect_tls`, `start_tls`,
+  and `HTTP2::Client`), `graceful_close` no longer sends a TLS
+  `close_notify` alert on either the forceful or the graceful path — the
+  raw socket is closed directly instead — so a peer may see the connection
+  disappear rather than a clean TLS shutdown (it may log something like
+  "unexpected EOF"). A caller-built `OpenSSL::SSL::Socket` passed directly
+  to `Connection.start` has no raw socket for the library to discover, so
+  closing it still falls back to the socket's own close and reaches
+  `SSL_shutdown` there, sending `close_notify` as before.
 - The client now re-asserts the ALPN `h2` protocol offer on its TLS context
   before every dial, instead of only once. This self-heals a shared context
   whose ALPN offer was changed by other code between dials, but a context
@@ -78,8 +100,13 @@ All notable changes are recorded here. This project follows
   one byte past the declared length before finishing the request and raises
   `InvalidRequestError` if the body has more, instead of silently
   truncating it; that probe read has no timeout of its own, so a
-  non-conforming source that blocks there rather than returning EOF stalls
-  the request indefinitely, not merely until a configured timeout — see
+  non-conforming source that blocks there rather than returning EOF parks
+  the upload fiber — holding the caller's own `IO` — indefinitely, with
+  nothing in the library able to unblock it. The request itself still
+  fails, with `RequestTimeoutError`, once the response-wait timeout
+  (`read`, 30s by default) elapses, since the peer never receives
+  `END_STREAM`; with `read` disabled, though, the request has no bound
+  either and hangs right alongside the upload fiber — see
   `Request#initialize`'s doc comment. A correctly-sized body now sends one
   extra, empty `DATA` frame carrying `END_STREAM` after its final content
   chunk (previously the final chunk carried `END_STREAM` directly).
@@ -108,6 +135,15 @@ All notable changes are recorded here. This project follows
 
 ### Fixed
 
+- Capped informational (1xx) responses per stream (default 16); excess is a
+  stream-scoped protocol error.
+- Bounded the keepalive probe end-to-end so a write-stalled peer is detected
+  within the keepalive timeout, and made reader acknowledgements
+  fire-and-forget.
+- Rejected caller-built WINDOW_UPDATE and SETTINGS-ACK frames in the public
+  write API to protect flow-control and settings accounting.
+- Removed the dead `EventBus` and `Cookies` spike remnants from the public
+  API, and corrected the documented scope of the `write` timeout.
 - Made closed-stream retention age-aware (`closed_stream_retention`, default
   30s, hard-capped at 4x the count limit); late frames after a peer's
   RST_STREAM are now absorbed silently with flow-control credit restored —
@@ -174,43 +210,6 @@ All notable changes are recorded here. This project follows
   first time a mixed-case name (`Authorization`, `Content-Type`, etc.) was
   used this way. Native `HTTP2::Headers` construction (hash literals,
   `#add`, `#[]=`) is unchanged and still rejects uppercase field names.
-
-## 1.0.0-rc.1 — 2026-07-24
-
-This release candidate replaces the original frame-codec spike with an
-origin-bound, streaming HTTP/2 client.
-
-### Added
-
-- Complete RFC 9113 frame parsing, stream state, flow control, SETTINGS,
-  PING, GOAWAY, cancellation, and graceful draining.
-- Persistent HPACK encoding and decoding with bounded field-block assembly.
-- Verified TLS with SNI and ALPN `h2`, plus cleartext prior knowledge.
-- Concurrent requests, streaming request and response bodies, informational
-  responses, CONNECT, and request/response trailers.
-- Explicit timeouts, safe opt-in replay, keepalive, resource limits, and
-  structured diagnostics.
-- Deterministic property coverage and an independent nghttp2 interoperability
-  matrix for TLS, fragmentation, flow control, trailers, resets, GOAWAY, and
-  concurrent streams.
-
-### Changed
-
-- The client and protocol APIs have been redesigned and are not compatible
-  with the original `0.1.0` spike.
-- Crystal 1.20.0 is now the minimum supported compiler.
-
-### Fixed
-
-- Capped informational (1xx) responses per stream (default 16); excess is a
-  stream-scoped protocol error.
-- Bounded the keepalive probe end-to-end so a write-stalled peer is detected
-  within the keepalive timeout, and made reader acknowledgements
-  fire-and-forget.
-- Rejected caller-built WINDOW_UPDATE and SETTINGS-ACK frames in the public
-  write API to protect flow-control and settings accounting.
-- Removed the dead `EventBus` and `Cookies` spike remnants from the public
-  API, and corrected the documented scope of the `write` timeout.
 
 ## 0.1.0 — 2022-01-12
 
