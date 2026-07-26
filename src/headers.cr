@@ -1,5 +1,6 @@
 require "http/headers"
 require "hpack"
+require "set"
 require "./header_field"
 
 module HTTP2
@@ -11,6 +12,20 @@ module HTTP2
   class Headers
     include Enumerable(Header)
 
+    # Field names whose value must never be promoted to HPACK's compressed,
+    # indexed representation (RFC 7541 §6.2.3) or inserted into the
+    # connection's dynamic table. Private: this is the library's
+    # unconditional, built-in floor, not a caller-mutable collection — a
+    # caller adds to the effective set via `to_header_fields`'s
+    # `extra_never_indexed` parameter (see `Client#additional_never_indexed_fields`),
+    # never by reaching into this one.
+    private SENSITIVE_FIELD_NAMES = Set{
+      "authorization",
+      "proxy-authorization",
+      "cookie",
+      "set-cookie",
+    }
+
     @fields = [] of Header
 
     def initialize
@@ -20,8 +35,9 @@ module HTTP2
       fields.each { |field| @fields << field }
     end
 
+    # Names are downcased on insertion — see `#add`'s doc comment for why.
     def initialize(fields : Enumerable(Tuple(String, String)))
-      fields.each { |name, value| @fields << Header.new(name, value) }
+      fields.each { |name, value| @fields << Header.new(name.downcase, value) }
     end
 
     # `HTTP::Headers` field names are case-insensitive (RFC 9110 §5.1) but
@@ -40,14 +56,25 @@ module HTTP2
     end
 
     # Appends a field without replacing existing fields of the same name.
+    #
+    # The name is downcased on insertion, enforcing the "exactly matching
+    # lowercase name" contract `#[]`/`#get_all` below already document:
+    # every mutator (`#add`, `#[]=`, the tuple-based `#initialize`) stores
+    # lowercase names, so a caller cannot bypass case-sensitive logic
+    # elsewhere — most importantly `to_header_fields`'s never-index
+    # selection — merely by supplying a differently-cased name.
     def add(name : String, value : String) : self
-      @fields << Header.new(name, value)
+      @fields << Header.new(name.downcase, value)
       self
     end
 
+    # Replaces every existing field with this name (matched
+    # case-insensitively, via the downcasing `#add` performs) with a
+    # single field carrying *value*.
     def []=(name : String, value : String) : String
-      delete(name)
-      add(name, value)
+      downcased_name = name.downcase
+      delete(downcased_name)
+      add(downcased_name, value)
       value
     end
 
@@ -109,15 +136,28 @@ module HTTP2
     #
     # Ordinary fields opt into HPACK incremental indexing (RFC 7541 6.2.1),
     # letting them enter the connection's dynamic table so a repeated field
-    # compresses to an indexed reference on a later request. Credential and
-    # cookie fields are the confidentiality boundary this creates: they are
-    # marked `Never` so the HPACK encoder emits them as a literal-never-
-    # indexed representation (RFC 7541 6.2.3) and never inserts them into
-    # the dynamic table, on the first request or any later one.
-    def to_header_fields : Array(HeaderField)
+    # compresses to an indexed reference on a later request.
+    # `SENSITIVE_FIELD_NAMES` and *extra_never_indexed* (a caller's own
+    # additional credential/secret header names — see
+    # `Client#additional_never_indexed_fields`) are the confidentiality
+    # boundary this creates: a matching field is marked `Never` so the
+    # HPACK encoder emits it as a literal-never-indexed representation
+    # (RFC 7541 6.2.3) and never inserts it into the dynamic table, on the
+    # first request or any later one.
+    #
+    # Both the field's own name and every entry of *extra_never_indexed*
+    # are downcased right here, immediately before comparison — every
+    # `Headers` mutator already stores lowercase names (see `#add`), but
+    # this decision does not rely on that holding true elsewhere. It is
+    # correct regardless of how the field reached `@fields` or how the
+    # caller cased *extra_never_indexed*.
+    def to_header_fields(
+      extra_never_indexed : Enumerable(String) = [] of String,
+    ) : Array(HeaderField)
+      never_indexed = extra_never_indexed.map(&.downcase).to_set
       @fields.map do |field|
-        indexing = case field.name
-                   when "authorization", "proxy-authorization", "cookie", "set-cookie"
+        name = field.name.downcase
+        indexing = if SENSITIVE_FIELD_NAMES.includes?(name) || never_indexed.includes?(name)
                      HeaderField::Indexing::Never
                    else
                      HeaderField::Indexing::Incremental

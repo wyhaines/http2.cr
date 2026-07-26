@@ -100,4 +100,43 @@ describe HTTP2::Headers do
       .to_header_fields.first
     ordinary.indexing.should eq(HTTP2::HeaderField::Indexing::Incremental)
   end
+
+  it "downcases names inserted via the low-level add, []=, and tuple-constructor paths, so a mixed-case credential still selects Never" do
+    # Task 9 review, Finding 1: only the HTTP::Headers conversion
+    # constructor downcased on insertion. `#add`/`#[]=`/the tuple
+    # constructor did not, so `Headers.new.add("Authorization", ...)`
+    # stored the name verbatim and `to_header_fields`'s case-sensitive
+    # `case field.name` never matched it -- a mixed-case credential sent
+    # through the low-level `to_header_fields` + `Stream#send_headers`
+    # path (bypassing `Client`'s own request validation, which happens to
+    # reject uppercase field names first) reached HPACK
+    # `Indexing::Incremental` and the peer's dynamic table. Both layers are
+    # fixed and both are pinned here: `Headers` now downcases on every
+    # insertion path, AND `to_header_fields` downcases defensively again
+    # itself, so the selection is correct even if a future insertion path
+    # forgets to normalize.
+    added = HTTP2::Headers.new.add("Authorization", "secret")
+    added.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
+    added_field = added.to_header_fields.first
+    added_field.name.should eq("authorization")
+    added_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+
+    assigned = HTTP2::Headers.new
+    assigned["Authorization"] = "secret"
+    assigned.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
+    assigned_field = assigned.to_header_fields.first
+    assigned_field.name.should eq("authorization")
+    assigned_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+
+    tupled = HTTP2::Headers.new([{"Authorization", "secret"}])
+    tupled.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
+    tupled_field = tupled.to_header_fields.first
+    tupled_field.name.should eq("authorization")
+    tupled_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+
+    # Near-misses stay ordinary (Incremental) -- the fix must not overmatch.
+    HTTP2::Headers.new.add("Authorization-Foo", "x")
+      .to_header_fields.first.indexing
+      .should eq(HTTP2::HeaderField::Indexing::Incremental)
+  end
 end

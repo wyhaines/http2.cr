@@ -411,6 +411,76 @@ describe HTTP2::Client do
     end
   end
 
+  it "keeps an additional_never_indexed_fields name literal-never-indexed and out of the peer's table, without disturbing an unrelated repeated field" do
+    # Task 9 review, Finding 2: before this option existed, a caller's own
+    # custom credential header (e.g. `x-api-key`) had no way to opt out of
+    # HPACK incremental indexing -- it landed in the connection's dynamic
+    # table exactly like any other repeated header. `x-session` here is
+    # the positive control proving the opt-out is narrow: it is NOT in
+    # `additional_never_indexed_fields`, so it must still compress to an
+    # indexed reference on the second request, same as every ordinary
+    # field.
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+
+        first = client_read_field_section(io, decoder)
+        first[:fields].find! { |field| field.name == "x-api-key" }
+          .tap do |field|
+            field.value.should eq("sk_live_secret")
+            field.indexing.should eq(HPack::Indexing::NEVER)
+          end
+        decoder.table.includes?({"x-api-key", "sk_live_secret"})
+          .should be_false
+        write_server_fields(
+          io, HPack::Encoder.new, first[:stream_id],
+          [{":status", "204"}], end_stream: true
+        )
+
+        second = client_read_field_section(io, decoder)
+        second[:fields].find! { |field| field.name == "x-api-key" }
+          .tap do |field|
+            field.value.should eq("sk_live_secret")
+            # Still literal-never-indexed on the repeat -- the opt-out held.
+            field.indexing.should eq(HPack::Indexing::NEVER)
+          end
+        second[:fields].find! { |field| field.name == "x-session" }
+          .tap do |field|
+            field.value.should eq("abc123")
+            # The un-opted-out field still compresses -- proves the
+            # opt-out is additive, not a global change of behavior.
+            field.indexing.should eq(HPack::Indexing::INDEXED)
+          end
+        decoder.table.includes?({"x-api-key", "sk_live_secret"})
+          .should be_false
+        write_server_fields(
+          io, HPack::Encoder.new, second[:stream_id],
+          [{":status", "204"}], end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(read: 2.seconds),
+        additional_never_indexed_fields: ["x-api-key"]
+      )
+      begin
+        headers = HTTP2::Headers{
+          "x-api-key" => "sk_live_secret",
+          "x-session" => "abc123",
+        }
+        http.get("/one", headers).status.should eq(204)
+        http.get("/two", headers).status.should eq(204)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "streams a POST and exposes response trailers" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|
@@ -1234,8 +1304,17 @@ describe HTTP2::Client do
       expect_raises(HTTP2::InvalidRequestError, /pseudo-fields/) do
         http.get("/", HTTP2::Headers{":path" => "/other"})
       end
+      # Task 9 review, Finding 1: Headers#[]=/#add/the tuple constructor
+      # now downcase on insertion (closing a case-sensitive bypass of
+      # to_header_fields' never-index selection), so an uppercase name
+      # supplied through the native Headers API is silently normalized
+      # rather than rejected here -- matching the HTTP::Headers-interop
+      # constructor's existing, unchanged behavior for the same casing.
+      # This sub-case now exercises a byte field_name_error still rejects
+      # regardless of case, so the "malformed field name" path stays
+      # covered.
       expect_raises(HTTP2::InvalidRequestError, /field name/) do
-        http.get("/", HTTP2::Headers{"X-Upper" => "value"})
+        http.get("/", HTTP2::Headers{"bad field" => "value"})
       end
       expect_raises(HTTP2::InvalidRequestError, /connection-specific/) do
         http.get("/", HTTP2::Headers{"connection" => "close"})

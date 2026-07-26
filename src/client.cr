@@ -1,4 +1,5 @@
 require "uri"
+require "set"
 require "./cancellation"
 require "./connection"
 require "./http_semantics"
@@ -159,6 +160,23 @@ module HTTP2
     getter replay_policy : ReplayPolicy
     getter max_replay_attempts : Int32
 
+    # Extra field names, beyond the library's own built-in four
+    # (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`),
+    # that must never be promoted to HPACK's compressed, indexed
+    # representation or inserted into this client's connections' dynamic
+    # tables (see Task 9's HPACK incremental-indexing change). A caller
+    # with its own credential or secret header — `x-api-key`,
+    # `x-csrf-token`, a bearer token carried under a non-standard name —
+    # adds it here so it keeps the same literal-never-indexed treatment
+    # RFC 7541 §7.1.3 reserves for that wire marker precisely so
+    # intermediaries cannot promote it. Comparison is case-insensitive
+    # (names are downcased when this client is constructed, and again
+    # wherever they are matched against a field). Empty by default: this
+    # is purely additive and cannot narrow the built-in four, which stay
+    # unconditional. Mutating the returned `Set` after construction takes
+    # effect on the next request this client sends.
+    getter additional_never_indexed_fields : Set(String)
+
     @origin : Origin
     @connection : Connection?
     @retired_connections = [] of Connection
@@ -189,6 +207,7 @@ module HTTP2
       @tls_context : OpenSSL::SSL::Context::Client = Connection.default_tls_context,
       @replay_policy : ReplayPolicy = ReplayPolicy::Never,
       @max_replay_attempts : Int32 = 1,
+      additional_never_indexed_fields : Enumerable(String) = [] of String,
       connection : Connection? = nil,
     )
       if @max_replay_attempts < 0
@@ -196,6 +215,8 @@ module HTTP2
           "maximum replay attempt count cannot be negative"
         )
       end
+      @additional_never_indexed_fields =
+        additional_never_indexed_fields.map(&.downcase).to_set
       uri = origin.is_a?(URI) ? origin : URI.parse(origin)
       @origin = parse_origin(uri, require_origin_only: true)
       @connection = connection
@@ -694,13 +715,21 @@ module HTTP2
       else
         pseudo_fields << HeaderField.new(":scheme", @origin.scheme)
         pseudo_fields << HeaderField.new(":authority", authority)
+        # Deliberately left at the default Indexing::None (Task 9 review).
+        # Unlike :method/:scheme (a handful of static-table values, so
+        # incremental indexing would be a no-op either way), :path is
+        # normally unique per request and rarely a static-table hit, so
+        # marking it Incremental would actually insert full path+query
+        # values into the connection's dynamic table -- and a query
+        # string can carry secrets (tokens, API keys). Do not "optimize"
+        # this without a deliberate, separately reviewed decision.
         pseudo_fields << HeaderField.new(":path", path)
       end
-      pseudo_fields.concat(headers.to_header_fields)
+      pseudo_fields.concat(headers.to_header_fields(@additional_never_indexed_fields))
 
       PreparedRequest.new(
         pseudo_fields,
-        request.trailers.to_header_fields,
+        request.trailers.to_header_fields(@additional_never_indexed_fields),
         request.body_for_attempt,
         request.body_length,
         content_length,
