@@ -1083,4 +1083,349 @@ describe HTTP2::Connection do
       connection.close
     end
   end
+
+  it "closes the connection with FRAME_SIZE_ERROR when an inbound frame " \
+     "exceeds our advertised SETTINGS_MAX_FRAME_SIZE" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+
+        # One octet past the default advertised SETTINGS_MAX_FRAME_SIZE
+        # (16_384) -- an extension type unknown to this implementation, so
+        # if the size guard were ever bypassed the frame would merely be
+        # ignored (RFC 9113 4.1) rather than tripping some unrelated,
+        # frame-specific validation and muddying what actually failed.
+        # The real bytes (not just a declared length) are sent so that a
+        # bypassed guard reads a complete, well-formed frame instead of
+        # blocking on payload bytes that were never written.
+        oversized = Bytes.new(
+          HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD + 1,
+          0x41_u8
+        )
+        io.write(wire_frame(0xff_u8, 0_u8, 0_u32, oversized))
+        io.flush
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::FRAME_SIZE_ERROR.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(HTTP2::FrameSizeError)
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "trips the empty-frame limiter on a zero-length DATA flood with no " \
+     "END_STREAM on an open stream" do
+    UNIXSocket.pair do |client, peer|
+      ready = Channel(Nil).new(1)
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+        ready.receive
+
+        begin
+          1_100.times do
+            HTTP2::Frame::Data.new(0_u8, id, Bytes.empty).write(io)
+          end
+          io.flush
+        rescue IO::Error
+          # The connection may already have reacted to the limiter
+          # tripping and force-closed its socket before the flood
+          # finished writing all 1_100 frames -- that's the point of the
+          # test, not a failure; stop writing early instead of treating a
+          # broken pipe here as a spec error.
+        end
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32)
+      end
+
+      # Default configuration: max_empty_frames_per_window is 1_000, so the
+      # flood (1_100, comfortably over) trips the limiter within the
+      # default 1-second window. The stream is opened without END_STREAM
+      # on either side and stays that way throughout: a zero-length DATA
+      # frame always succeeds at StreamBody#enqueue (its `return true if
+      # data.empty?` short-circuit runs before the capacity check) and
+      # never touches the per-stream event queue at all (DATA is
+      # delivered via Stream#deliver_data, a completely different path
+      # from Stream#deliver's stream_event_capacity-bounded channel that
+      # PRIORITY/HEADERS events use) -- so the connection-level
+      # empty-frame counter is the only limiter this flood can trip.
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream, end_stream: false)
+      stream_id.send(stream.id)
+      ready.send(nil)
+
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(
+        HTTP2::Connection::ResourceLimitError
+      )
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "processes a max-size inbound GOAWAY without unbounded retention, " \
+     "then a PING normally" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        # At the boundary this implementation will ever accept without
+        # tripping the FRAME_SIZE_ERROR pinned above: debug data fills
+        # the frame out to exactly the default inbound max frame size
+        # (16_384 octets total; 8 of those are the fixed last-stream-id +
+        # error-code fields GOAWAY always carries).
+        debug_data = Bytes.new(
+          HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD - 8,
+          0x58_u8
+        )
+        HTTP2::Frame::GoAway.new(
+          id,
+          HTTP2::ErrorCode::NO_ERROR,
+          debug_data
+        ).write(io)
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
+        ping.write(io)
+        io.flush
+
+        pong = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        pong.ack?.should be_true
+        pong.payload.should eq(ping.payload)
+      end
+
+      # last_stream_id is pinned to the one stream this test opens (same
+      # idiom as the GOAWAY-flood spec above) so it stays active rather
+      # than idle -- otherwise, with zero active streams, the drain
+      # monitor's own independent quiet-peer check could race this
+      # GOAWAY and close the connection with DrainedError before the
+      # PING below ever gets a chance to prove the connection is still
+      # healthy (see the GOAWAY-flood spec's comment for the full
+      # explanation of that race).
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      stream_id.send(stream.id)
+
+      wait_for_peer(peer_result)
+
+      connection.draining?.should be_true
+      connection.stream?(stream.id).should be(stream)
+
+      goaway = connection.last_goaway.as(HTTP2::Frame::GoAway)
+      goaway.debug_data.size.should eq(
+        HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD - 8
+      )
+
+      # `Diagnostic` (connection/diagnostic.cr) deliberately has no field
+      # for a frame's raw payload or GOAWAY's debug data -- only a
+      # `payload_length` count. Confirm the emitted frame diagnostic
+      # actually reflects that design (an Int32 length, not the
+      # 16_376-byte string, and no message built from it) and that the
+      # lifecycle diagnostic emitted alongside it is the fixed, short
+      # literal `emit_lifecycle` always sends, not something sized off
+      # the debug data.
+      found_frame = false
+      found_lifecycle = false
+      until found_frame && found_lifecycle
+        diagnostic = select
+        when value = connection.diagnostics.receive
+          value
+        when timeout(1.second)
+          fail("expected GOAWAY diagnostics were not emitted")
+        end
+
+        if diagnostic.kind.frame? &&
+           diagnostic.frame_type == HTTP2::Frame::GoAway::TypeCode
+          diagnostic.payload_length.should eq(
+            HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD
+          )
+          diagnostic.message.should be_nil
+          found_frame = true
+        elsif diagnostic.kind.lifecycle? &&
+              diagnostic.message == "draining after peer GOAWAY"
+          found_lifecycle = true
+        end
+      end
+
+      connection.close
+    end
+  end
+
+  it "trips ENHANCE_YOUR_CALM on an RST_STREAM flood" do
+    UNIXSocket.pair do |client, peer|
+      ready = Channel(Nil).new(1)
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+        ready.receive
+
+        begin
+          1_100.times do
+            HTTP2::Frame::ResetStream.new(
+              id,
+              HTTP2::ErrorCode::CANCEL
+            ).write(io)
+          end
+          io.flush
+        rescue IO::Error
+          # As with the GOAWAY flood above: the connection may already
+          # have reacted to the limiter tripping and force-closed its
+          # socket before the flood finished writing all 1_100 frames.
+        end
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32)
+      end
+
+      # Default configuration: max_control_frames_per_window is 1_000, and
+      # RST_STREAM is one of InboundFrameRateLimiter#control_frame?'s
+      # recognized types. The first RST_STREAM legitimately closes
+      # `stream` (retained as a RemoteReset "late frame" target for the
+      # rest of the flood, per ClosedStream#tolerates_late_frames?), but
+      # observe_inbound_frame's rate-limiter check runs unconditionally
+      # on every inbound frame before any of that per-stream handling, so
+      # it never matters whether a given RST_STREAM is the first (a real
+      # reset) or the 1_099th (an absorbed repeat) -- unlike the GOAWAY
+      # flood above, this never touches @last_goaway or starts the drain
+      # monitor, so no active stream needs to be kept alive for the flood
+      # itself to trip the limiter; opening one is only what makes the
+      # first RST_STREAM legal instead of "RST_STREAM on an idle stream"
+      # (its own, different connection error).
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      stream_id.send(stream.id)
+      ready.send(nil)
+
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(
+        HTTP2::Connection::ResourceLimitError
+      )
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "closes the connection when the peer sends a repeated trailer-like " \
+     "HEADERS frame after a stream has already fully closed" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        encoder = HPack::Encoder.new
+        # A normal final response followed by one legitimate trailer
+        # section that cleanly ends the stream -- pins that ordinary
+        # trailers still work before exercising the adversarial case.
+        io.write(encode_headers_frame(encoder, id, [{":status", "200"}]))
+        io.write(
+          encode_headers_frame(
+            encoder,
+            id,
+            [{"x-trace-id", "legitimate"}],
+            end_stream: true
+          )
+        )
+        io.flush
+
+        # Repeated: a second, trailer-shaped HEADERS frame for the same
+        # stream ID, arriving after both sides already agree it is
+        # closed.
+        io.write(
+          encode_headers_frame(
+            encoder,
+            id,
+            [{"x-trace-id", "too-late"}],
+            end_stream: true
+          )
+        )
+        io.flush
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::STREAM_CLOSED.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      stream.inbound_validator =
+        HTTP2::ResponseValidator.new(stream.id, "GET")
+      open_client_stream(stream)
+      stream_id.send(stream.id)
+
+      # The stream closes cleanly (mutual END_STREAM) well before the
+      # connection-level violation lands, so the connection removes it
+      # from its own registry -- but a clean close never calls
+      # Stream#terminate, so this Stream object's own terminal_error
+      # stays nil regardless of what later happens to the connection, and
+      # these two receives cannot race the later connection failure (see
+      # Stream#receive: it only ever raises this stream's OWN
+      # terminal_error, never the connection's).
+      stream.receive(1.second).should be_a(HTTP2::Connection::FieldSection)
+      trailer = stream.receive(1.second).as(HTTP2::Connection::FieldSection)
+      trailer.end_stream?.should be_true
+
+      wait_for_peer(peer_result)
+
+      connection.wait_closed(1.second)
+      error = connection.terminal_error.as(HTTP2::ProtocolError)
+      error.error_code.should eq(HTTP2::ErrorCode::STREAM_CLOSED)
+      error.scope.should eq(HTTP2::ErrorScope::Connection)
+    end
+  end
+
+  it "closes the connection when a CONTINUATION sequence exceeds the " \
+     "configured fragment-count limit" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        # An opening HEADERS frame (no END_HEADERS) followed by 17
+        # CONTINUATION fragments -- one past the default
+        # max_continuation_frames (16). Fragment content is irrelevant:
+        # the count check in FieldBlockAssembler#continue runs before
+        # HPACK decode ever sees a byte of it (field_block_assembler_spec.cr
+        # pins the same limit at the unit level directly against the
+        # assembler; this is its socket-level twin).
+        HTTP2::Frame::Headers.new(0_u8, id, Bytes[0]).write(io)
+        17.times do
+          HTTP2::Frame::Continuation.new(0_u8, id, Bytes[0]).write(io)
+        end
+        io.flush
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      stream_id.send(stream.id)
+
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(
+        HTTP2::Connection::ResourceLimitError
+      )
+      wait_for_peer(peer_result)
+    end
+  end
 end
