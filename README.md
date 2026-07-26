@@ -3,17 +3,16 @@
 
 # http2.cr
 
-`http2.cr` is a pure Crystal implementation of HTTP/2. The project is being
-rebuilt from an earlier frame-codec spike into a production-quality client with
-a reusable protocol core.
+`http2.cr` is a pure Crystal implementation of HTTP/2: a production-quality,
+origin-bound streaming client built on a reusable protocol core.
 
 ## Status
 
-The source tree is prepared as `1.0.0-rc.1`, the first release candidate for
-the rebuilt client. All implementation phases are complete, including an
-independent local nghttp2 matrix. The candidate is suitable for integration
-testing; validate it under your workload before production deployment and
-report API or protocol issues before the final 1.0 release.
+The source tree is prepared as `1.0.0-rc.1`, the first release candidate.
+All implementation phases are complete, including an independent local
+nghttp2 matrix. The candidate is suitable for integration testing; validate
+it under your workload before production deployment and report API or
+protocol issues before the final 1.0 release.
 
 Development is organized in ordered phases:
 

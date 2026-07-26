@@ -73,6 +73,6 @@ origin-bound, streaming HTTP/2 client.
 - Removed the dead `EventBus` and `Cookies` spike remnants from the public
   API, and corrected the documented scope of the `write` timeout.
 
-## 0.1.0
+## 0.1.0 — 2022-01-12
 
 - Published the initial experimental frame-codec implementation.

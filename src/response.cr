@@ -63,10 +63,25 @@ module HTTP2
       raise request_error
     end
 
+    # Stops consuming the response without attaching a request-specific
+    # error. Discards any buffered body bytes (returning their
+    # flow-control credit) and, unless the stream already reached a
+    # natural end, sends RST_STREAM to cancel it — but does not record a
+    # terminal error for that reset: a later `#body` read raises only a
+    # generic `IO::Error` ("Closed stream"), not a stream's own terminal
+    # error, which keeps a caller's own graceful stop distinguishable
+    # from `#cancel` and from a library-initiated reclamation (see
+    # `Client::Timeouts#idle`) by exception type. Safe to call more than
+    # once, or after the body has already finished.
     def close : Nil
       @body.close
     end
 
+    # Cancels the request outright: sends RST_STREAM and fails the
+    # stream with a `RequestCanceledError`, so — unlike `#close` — a
+    # later `#body` read or `#trailers` wait raises that same error
+    # instead of a generic `IO::Error`. Safe to call more than once, or
+    # after the stream has already closed.
     def cancel : Nil
       error = RequestCanceledError.new("HTTP/2 request was canceled")
       abort_request(error)

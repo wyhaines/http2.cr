@@ -21,4 +21,4 @@ development_dependencies:
 dependencies:
   hpack:
     github: wyhaines/hpack.cr
-    commit: dd3aef145a1b9f7f5193e7266833f1c77d7e297d
+    version: ~> 1.3.0

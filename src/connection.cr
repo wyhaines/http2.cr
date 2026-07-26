@@ -143,6 +143,23 @@ module HTTP2
     end
 
     # Creates and starts a connection over a caller-supplied duplex IO.
+    #
+    # **TLS callers: prefer `connect_tls`/`start_tls`, or `HTTP2::Client`.**
+    # If `transport` is a caller-built `OpenSSL::SSL::Socket`, this
+    # connection's `tls_raw_transport` stays `nil` forever — only
+    # `start_tls` can set it (its setter is `protected`, so there is no
+    # way for a caller to supply it here), and Crystal's
+    # `OpenSSL::SSL::Socket` exposes no accessor for the raw `IO` behind
+    # its BIO, so the library has no way to discover it after the fact
+    # either. That leaves `#close`/`#terminate` exposed to the unbounded
+    # `SSL_shutdown` close hang described on `#close_transport`'s doc
+    # comment: with no raw socket to force-close instead, shutdown falls
+    # back to the TLS wrapper's own close, which can block indefinitely
+    # against a stalled peer if `transport` has no `write_timeout` set.
+    # `connect_tls`, `start_tls`, and `HTTP2::Client` are unaffected —
+    # they dial the raw socket themselves and record it. A caller who
+    # must use this constructor with their own TLS socket should set a
+    # `write_timeout` on it directly to bound that close.
     def self.start(
       transport : IO,
       configuration : Configuration = Configuration.new,
@@ -415,10 +432,18 @@ module HTTP2
       # counter nothing will ever read again, and `wake_flow_control`
       # already tolerates a closed `@flow_control_wakeup` channel (see
       # its own `rescue Channel::ClosedError`). The reader-start guard
-      # below exists for a different reason — to avoid spawning a new
-      # fiber at all once `initial_command.wait`'s `rescue` has already
-      # torn the connection down — not because skipping it here would be
-      # unsafe.
+      # below exists for a different reason: `initial_command.wait`'s own
+      # `rescue` always re-raises after tearing the connection down, so
+      # it never reaches the guard itself. What the guard actually
+      # protects against is a concurrent, independent teardown landing
+      # between `initial_command.wait` returning successfully and the
+      # check below — either a caller's own public, unguarded `#close`
+      # (a thin wrapper around the private `#terminate`), or the writer
+      # fiber spawned above reaching that same private `#terminate`
+      # itself, on its own, after a transport write failure (see
+      # `#process_write_command`/`#write_scheduled_frames`) — without the
+      # guard, either race could spawn a reader fiber on a connection
+      # that is already closed.
       delta = @configuration.connection_receive_window.to_i64 -
               SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
       if delta > 0

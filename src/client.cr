@@ -436,6 +436,12 @@ module HTTP2
       raise first_error if first_error
     end
 
+    # True once `#close` or `#graceful_close` has been called — both set
+    # the closed flag immediately when invoked, even while a
+    # `#graceful_close` drain is still in progress, not only once
+    # teardown finishes. A request made after this returns `true` fails
+    # immediately with `ClosedError`, without dialing or touching the
+    # network.
     def closed? : Bool
       @mutex.synchronize { @closed }
     end

@@ -1352,6 +1352,14 @@ describe HTTP2::Client do
     end
   end
 
+  it "raises Client::ClosedError for a request made after #close" do
+    http = HTTP2::Client.new("http://example.test")
+    http.close
+    expect_raises(HTTP2::Client::ClosedError) do
+      http.get("/")
+    end
+  end
+
   it "dials outside its mutex, so #closed? is not blocked behind an " \
      "in-progress connect+TLS handshake" do
     server = TCPServer.new("127.0.0.1", 0)
