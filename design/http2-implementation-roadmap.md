@@ -12,10 +12,12 @@ between phases and add tests with each behavior, not in a final test-only pass.
 Use [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html) and
 [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541.html) as normative sources.
 
-The current repository is a frame-oriented spike, not a usable client. Its
-connection and stream types are partial, `HTTP2::Client` exists only in specs,
-and several handlers are empty or mix wire parsing with protocol state. Treat
-existing code as material to test and refactor, not as established behavior.
+At the start of this roadmap, the repository was a frame-oriented spike, not a
+usable client: connection and stream types were partial, `HTTP2::Client`
+existed only in specs, and several handlers were empty or mixed wire parsing
+with protocol state. That code was treated as material to test and refactor,
+not as established behavior. All phases below are now complete; see
+[Implementation status](implementation-status.md) for current verification.
 
 Maintain these invariants throughout:
 

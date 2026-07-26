@@ -1,6 +1,6 @@
 # HTTP/2 Implementation Status
 
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 
 ## Phase Progress
 
@@ -270,6 +270,38 @@ gate, age-aware closed-stream retention (30s, hard-capped at 4x the count
 limit) with tolerance for late frames after a peer reset, and fire-and-forget
 reader-side RST_STREAM sends — re-ran the deterministic gate (229 examples)
 in normal and `preview_mt` modes on Crystal 1.22.0-dev locally; container and
+CI verification of this branch is still pending. A 2026-07-26 polish and
+hardening pass (Plan 3: P1.6-P1.9 plus the full P2 backlog) — realigned
+`Client#post`'s argument order to `(target, headers, body)` matching
+`#request` and Crystal stdlib (breaking); fixed a pre-existing `graceful_close`
+busy-loop (a terminal `DrainTimeoutError`/`KeepaliveTimeoutError` was rescued
+and retried with no yield, pinning a CPU core) and a pre-existing indefinite
+hang in `Connection#close`/`#graceful_close` against a peer that stops
+reading, for both cleartext and TLS transports; enabled outbound HPACK
+incremental indexing for non-sensitive fields with a caller-extensible
+never-indexed set (`Client#additional_never_indexed_fields`); bounded the
+reader's GOAWAY send, gave EOF-after-peer-GOAWAY its own error carrying the
+peer's code, kept server-preface errors' real error codes, added GOAWAY to
+the control-frame rate budget, and truncated/sanitized peer GOAWAY debug data;
+rejected self-dependent PRIORITY/HEADERS, detected WINDOW_UPDATE overflow on
+half-closed(local) streams, and bounded pre-ACK PUSH_PROMISE tolerance; reset
+only the offending stream (`ENHANCE_YOUR_CALM`) instead of the whole
+connection on per-stream event-queue or DATA-body-queue overflow, with
+flow-control credit restored; hardened sized request-body EOF verification
+(rejecting an over-length body instead of silently truncating it) and made a
+closed `StreamBody` raise on read instead of returning a silent EOF; narrowed
+TLS error translation to actual handshake failures and floored TLS 1.2 on the
+internally created context; downcased `HTTP::Headers` interop field names
+while keeping native construction strict; added opt-in concurrent-stream-slot
+waiting and idle-based abandoned-response reclamation; moved connection
+dialing outside the client mutex and gave `graceful_close` a single deadline
+shared across connections; raised `max_decoded_fields`' default from 256 to
+1024; and switched the `hpack` dependency from a commit pin to
+`version: ~> 1.3.0` (resolving to the same commit) — re-ran the deterministic
+gate (288 examples default, 0 pending; 287 examples under `-Dpreview_mt`, 0
+pending — the one-example difference is a pre-existing `preview_mt`-only
+guard, not a regression), `bin/ameba` (79 files, 0 failures), formatting, and
+`crystal build`/`crystal docs` on Crystal 1.22.0-dev locally; container and
 CI verification of this branch is still pending.
 
 ## Next Work

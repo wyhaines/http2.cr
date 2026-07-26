@@ -391,7 +391,19 @@ describe HTTP2::Connection do
 
         ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "12345678")
         ping.write(io)
-        HTTP2::Frame.read(io).as(HTTP2::Frame::Ping).ack?.should be_true
+
+        # The tolerated "late" DATA frame's discarded connection-level
+        # receive credit is restored eagerly (`release_discarded_connection_credit`
+        # wakes the writer unconditionally, unlike an ordinary read's
+        # watermark-gated release), so a WINDOW_UPDATE(0, ...) can land on
+        # the wire before or after the PING ack depending on scheduling —
+        # skip past it, same idiom as the pre-ACK PUSH_PROMISE spec.
+        pong = nil
+        until pong
+          frame = HTTP2::Frame.read(io)
+          pong = frame.as?(HTTP2::Frame::Ping)
+        end
+        pong.ack?.should be_true
       end
 
       connection = HTTP2::Connection.start(client)
