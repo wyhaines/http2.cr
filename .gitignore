@@ -8,3 +8,10 @@
 # Libraries don't need dependency lock
 # Dependencies will be locked in applications that use them
 /shard.lock
+
+# Planning artifacts — never committed
+design/plans/
+design/specs/
+spec/probe_*.cr
+spec/zz_*.cr
+.claude/
