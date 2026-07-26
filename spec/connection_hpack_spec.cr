@@ -93,6 +93,124 @@ describe HTTP2::Connection do
     end
   end
 
+  it "gives to_header_fields ordinary fields incremental indexing, so a repeated field compresses and decodes as an indexed reference" do
+    UNIXSocket.pair do |client, peer|
+      ready = Channel(Nil).new(1)
+      observed = Channel(Tuple(Int32, Int32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        ready.receive
+        decoder = HPack::Decoder.new
+
+        first = read_header_sequence(io)
+        first_fields = decoder.decode_with_metadata(first[:encoded])[:fields]
+        first_fields.map { |field| {field.name, field.value} }.should eq([
+          {"x-session", "abc123"},
+        ])
+        # First appearance: a literal representation that ALSO performs
+        # dynamic-table insertion (RFC 7541 6.2.1), not a bare literal —
+        # proof the field was actually filed away, not merely encoded.
+        first_fields.first.indexing.should eq(HPack::Indexing::ALWAYS)
+        decoder.table.includes?({"x-session", "abc123"}).should be_true
+
+        second = read_header_sequence(io)
+        second_fields = decoder.decode_with_metadata(second[:encoded])[:fields]
+        second_fields.map { |field| {field.name, field.value} }.should eq([
+          {"x-session", "abc123"},
+        ])
+        # Second appearance: a pure indexed reference (RFC 7541 6.1). This
+        # only decodes to the right name/value because the peer's own
+        # dynamic table already holds the entry inserted above — that is
+        # the peer-side proof the table is populated, independent of the
+        # size delta asserted below.
+        second_fields.first.indexing.should eq(HPack::Indexing::INDEXED)
+
+        observed.send({first[:encoded].size, second[:encoded].size})
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        first_stream = connection.new_stream
+        second_stream = connection.new_stream
+        ready.send(nil)
+
+        fields = HTTP2::Headers.new(HTTP::Headers{"x-session" => "abc123"})
+          .to_header_fields
+        first_stream.send_headers(fields, end_stream: true)
+        second_stream.send_headers(fields, end_stream: true)
+
+        # Wait for the peer's assertions before reading `observed`: if the
+        # peer fails before it sends, checking the peer's outcome first
+        # surfaces that failure instead of blocking forever on a value that
+        # will never arrive.
+        wait_for_peer(peer_result)
+        first_size, second_size = observed.receive
+        second_size.should be < first_size
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "keeps to_header_fields output for authorization literal-never-indexed with no compression benefit on repeat" do
+    UNIXSocket.pair do |client, peer|
+      ready = Channel(Nil).new(1)
+      observed = Channel(Tuple(Int32, Int32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        ready.receive
+        decoder = HPack::Decoder.new
+
+        first = read_header_sequence(io)
+        first_fields = decoder.decode_with_metadata(first[:encoded])[:fields]
+        first_fields.map { |field| {field.name, field.value} }.should eq([
+          {"authorization", "Bearer secret-token"},
+        ])
+        first_fields.first.indexing.should eq(HPack::Indexing::NEVER)
+
+        second = read_header_sequence(io)
+        second_fields = decoder.decode_with_metadata(second[:encoded])[:fields]
+        second_fields.map { |field| {field.name, field.value} }.should eq([
+          {"authorization", "Bearer secret-token"},
+        ])
+        # A regression that let this credential become table-indexable
+        # would decode as HPack::Indexing::INDEXED here instead — this
+        # assertion fails either way the field's actual indexing behaves,
+        # unlike a check that only inspects size.
+        second_fields.first.indexing.should eq(HPack::Indexing::NEVER)
+
+        # The credential must never enter the dynamic table, regardless of
+        # how many identical requests carry it.
+        decoder.table.includes?({"authorization", "Bearer secret-token"})
+          .should be_false
+        decoder.table.empty?.should be_true
+
+        observed.send({first[:encoded].size, second[:encoded].size})
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        first_stream = connection.new_stream
+        second_stream = connection.new_stream
+        ready.send(nil)
+
+        fields = HTTP2::Headers.new(HTTP::Headers{
+          "Authorization" => "Bearer secret-token",
+        }).to_header_fields
+        first_stream.send_headers(fields, end_stream: true)
+        second_stream.send_headers(fields, end_stream: true)
+
+        wait_for_peer(peer_result)
+        first_size, second_size = observed.receive
+        second_size.should eq(first_size)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "emits coalesced encoder table updates after SETTINGS ACKs" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)

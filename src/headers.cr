@@ -106,13 +106,21 @@ module HTTP2
     end
 
     # :nodoc:
+    #
+    # Ordinary fields opt into HPACK incremental indexing (RFC 7541 6.2.1),
+    # letting them enter the connection's dynamic table so a repeated field
+    # compresses to an indexed reference on a later request. Credential and
+    # cookie fields are the confidentiality boundary this creates: they are
+    # marked `Never` so the HPACK encoder emits them as a literal-never-
+    # indexed representation (RFC 7541 6.2.3) and never inserts them into
+    # the dynamic table, on the first request or any later one.
     def to_header_fields : Array(HeaderField)
       @fields.map do |field|
         indexing = case field.name
-                   when "authorization", "proxy-authorization", "cookie"
+                   when "authorization", "proxy-authorization", "cookie", "set-cookie"
                      HeaderField::Indexing::Never
                    else
-                     HeaderField::Indexing::None
+                     HeaderField::Indexing::Incremental
                    end
         HeaderField.new(field.name, field.value, indexing: indexing)
       end

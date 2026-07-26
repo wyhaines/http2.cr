@@ -77,18 +77,20 @@ describe HTTP2::Headers do
     # RFC 7541 §6.2.3: a literal never-indexed representation is a wire
     # marker forwarding intermediaries must preserve and must never promote
     # to an indexed form; RFC 7541 §6.2.2 (`Indexing::None`) carries no such
-    # guarantee. This pins that *selection* surviving interop casing, not
-    # dynamic-table insertion — `to_header_fields` never emits
-    # `Indexing::Incremental`, so nothing reaches the HPACK dynamic table
-    # either way today. The distinction becomes a real confidentiality
-    # boundary once a future policy adds incremental indexing for
-    # non-sensitive fields.
+    # guarantee. This pins that *selection* surviving interop casing. It is
+    # a real confidentiality boundary, not a wire-marker nicety: ordinary
+    # fields from `to_header_fields` carry `Indexing::Incremental` and are
+    # eligible for HPACK dynamic-table insertion (Task 9), so authorization,
+    # proxy-authorization, cookie, and set-cookie must always take the
+    # never-indexed path instead, regardless of interop casing.
     sensitive = HTTP2::Headers.new(HTTP::Headers{
       "Authorization"       => "secret",
       "Proxy-Authorization" => "also-secret",
       "Cookie"              => "session=abc",
+      "Set-Cookie"          => "session=abc",
     }).to_header_fields
     sensitive.map(&.indexing).should eq([
+      HTTP2::HeaderField::Indexing::Never,
       HTTP2::HeaderField::Indexing::Never,
       HTTP2::HeaderField::Indexing::Never,
       HTTP2::HeaderField::Indexing::Never,
@@ -96,6 +98,6 @@ describe HTTP2::Headers do
 
     ordinary = HTTP2::Headers.new(HTTP::Headers{"Content-Type" => "text/plain"})
       .to_header_fields.first
-    ordinary.indexing.should eq(HTTP2::HeaderField::Indexing::None)
+    ordinary.indexing.should eq(HTTP2::HeaderField::Indexing::Incremental)
   end
 end
