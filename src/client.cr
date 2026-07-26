@@ -140,6 +140,20 @@ module HTTP2
       keepalive_interval: 30.seconds
     )
 
+    # The minimum per-connection slice `#graceful_close` ever passes to
+    # `Connection#graceful_close`, even for a connection reached after
+    # the shared deadline (see `#graceful_close`'s doc comment) has
+    # already elapsed. `Connection#graceful_close` rejects a
+    # non-positive timeout outright (`ArgumentError`), so SOME positive
+    # floor is required; this is deliberately tiny — a guard against
+    # that `ArgumentError`, not a fairness guarantee that a connection
+    # reached this late gets a meaningful chance to drain. A connection
+    # reached with essentially no budget left either has nothing active
+    # to wait for (drains immediately) or does, and immediately raises
+    # `Connection::DrainTimeoutError` — both fast, bounded outcomes,
+    # rather than an exception from `#graceful_close` itself.
+    MIN_GRACEFUL_CLOSE_TIMEOUT = 1.millisecond
+
     private record Origin,
       scheme : String,
       host : String,
@@ -391,6 +405,15 @@ module HTTP2
     end
 
     # Gracefully drains all connections currently owned by this client.
+    #
+    # `timeout` is a SHARED deadline across every connection, not a
+    # per-connection budget: it is applied once, up front, and each
+    # connection in turn receives only whatever of it remains (floored
+    # at `MIN_GRACEFUL_CLOSE_TIMEOUT`), so N connections that each need
+    # a full drain still take roughly `timeout` in total rather than
+    # N times `timeout` — a client with several retired connections
+    # behind the current one closes in bounded time instead of one that
+    # grows with however many connections happen to be pending.
     def graceful_close(
       timeout : Time::Span = @connection_configuration.drain_timeout,
     ) : Nil
@@ -399,10 +422,13 @@ module HTTP2
       end
 
       connections = take_connections_for_close
+      deadline = Time.instant + timeout
       first_error = nil
       connections.each do |connection|
         begin
-          connection.graceful_close(timeout)
+          remaining = deadline - Time.instant
+          remaining = MIN_GRACEFUL_CLOSE_TIMEOUT if remaining < MIN_GRACEFUL_CLOSE_TIMEOUT
+          connection.graceful_close(remaining)
         rescue error
           first_error ||= error
         end
@@ -598,6 +624,27 @@ module HTTP2
       abort_stream(leftover, error)
     end
 
+    # Returns the connection to use for the next request, dialing a fresh
+    # one if necessary. The dial itself (`#dial`'s connect-plus-TLS-
+    # handshake) deliberately runs OUTSIDE `@mutex` — it can take a
+    # connect-timeout's worth of wall-clock time against a slow or
+    # unresponsive origin, and holding `@mutex` for that whole span would
+    # serialize `#close`/`#closed?`/every other concurrent `#request`
+    # call behind it. Only the bookkeeping before and after the dial —
+    # deciding WHETHER to dial, and publishing the result — runs locked.
+    #
+    # That split means two fibers can legitimately decide to dial at the
+    # same time (both saw `@connection` as nil/unusable before either had
+    # dialed). Both dial in full, unlocked; whichever RE-ACQUIRES `@mutex`
+    # first publishes its connection to `@connection` and wins. The loser
+    # re-checks `@connection` under the lock, finds the winner's
+    # connection already there, closes its own now-redundant one (never
+    # handed to any caller, so this is the only reference to it), and
+    # returns the winner's connection instead — first-wins, and the
+    # loser's dial never leaks a socket. The same re-check catches a
+    # `#close` that landed while this fiber was dialing: `@closed` is
+    # rechecked too, and a late-arriving dial is closed immediately
+    # rather than published.
     private def connection_for_request : Connection
       @mutex.synchronize do
         raise ClosedError.new("HTTP/2 client is closed") if @closed
@@ -616,8 +663,20 @@ module HTTP2
           @retired_connections << current unless current.closed?
           @connection = nil
         end
+      end
 
-        @connection = dial
+      dialed = dial
+      @mutex.synchronize do
+        if @closed
+          dialed.close
+          raise ClosedError.new("HTTP/2 client is closed")
+        end
+        if current = @connection
+          dialed.close
+          next current
+        end
+
+        @connection = dialed
       end
     end
 
@@ -1298,6 +1357,14 @@ module HTTP2
       end
     end
 
+    # Stops an upload that is still in flight after its response has
+    # already COMPLETED (informational responses aside, the final status
+    # plus any trailers/remote end have all already arrived). The reset
+    # this sends therefore carries NO_ERROR, not CANCEL: nothing was
+    # cancelled — the response finished normally, and the still-sending
+    # request body is simply moot from this point on. Contrast
+    # `#abort_stream`'s CANCEL default, used by every OTHER caller for a
+    # genuine timeout, cancellation, or protocol error.
     private def stop_early_upload(
       stream : Stream,
       upload : UploadState,
@@ -1309,12 +1376,17 @@ module HTTP2
       end
       abort_stream(
         stream,
-        EarlyResponseStop.new("response completed before request upload")
+        EarlyResponseStop.new("response completed before request upload"),
+        ErrorCode::NO_ERROR
       )
     end
 
-    private def abort_stream(stream : Stream, error : Exception) : Nil
-      stream.abort(error)
+    private def abort_stream(
+      stream : Stream,
+      error : Exception,
+      error_code : ErrorCode = ErrorCode::CANCEL,
+    ) : Nil
+      stream.abort(error, error_code)
     rescue error : Connection::InvalidStateError
       raise error unless stream.closed? || stream.terminal_error
     end

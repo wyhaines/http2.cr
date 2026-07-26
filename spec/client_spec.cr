@@ -27,6 +27,22 @@ private def client_read_field_section(
   }
 end
 
+# Test-only: `@retired_connections` has no public setter, and there is
+# no deterministic (sleep-free, non-networked-race) way to get a SECOND
+# entry into it through the public API alone -- that requires a real
+# peer GOAWAY racing a redial. Reopening the class to add a single
+# setter (Crystal has no Ruby-style `instance_variable_set`) keeps this
+# out of `src/client.cr`'s production surface while still only touching
+# `@retired_connections` through a normal, statically-typed method; see
+# "applies one shared deadline across every connection" below for the
+# one spec that uses it.
+class HTTP2::Client
+  # :nodoc:
+  def test_only_retired_connections=(connections : Array(Connection)) : Nil
+    @retired_connections = connections
+  end
+end
+
 describe "HTTP2::Client recovery" do
   it "replays a proven-unprocessed owned POST only when explicitly allowed" do
     server = TCPServer.new("127.0.0.1", 0)
@@ -242,6 +258,68 @@ describe "HTTP2::Client recovery" do
       http.graceful_close(1.second)
       http.closed?.should be_true
       wait_for_peer(peer_result)
+    end
+  end
+
+  it "applies one shared deadline across every connection instead of " \
+     "one full timeout per connection" do
+    UNIXSocket.pair do |client_a, peer_a|
+      UNIXSocket.pair do |client_b, peer_b|
+        stream_id_a = Channel(UInt32).new(1)
+        stream_id_b = Channel(UInt32).new(1)
+        peer_result_a = scripted_peer(peer_a) do |io|
+          complete_server_handshake(io)
+          id = stream_id_a.receive
+          read_client_headers(io, id)
+          HTTP2::Frame.read(io).should be_a(HTTP2::Frame::GoAway)
+          io.read(Bytes.new(1)).should eq(0)
+        end
+        peer_result_b = scripted_peer(peer_b) do |io|
+          complete_server_handshake(io)
+          id = stream_id_b.receive
+          read_client_headers(io, id)
+          HTTP2::Frame.read(io).should be_a(HTTP2::Frame::GoAway)
+          io.read(Bytes.new(1)).should eq(0)
+        end
+
+        # Two connections, each with one active stream that never
+        # finishes, so each genuinely consumes its ENTIRE per-connection
+        # drain budget rather than resolving instantly.
+        connection_a = HTTP2::Connection.start(client_a)
+        connection_a.wait_until_active(1.second)
+        stream_a = connection_a.new_stream
+        open_client_stream(stream_a)
+        stream_id_a.send(stream_a.id)
+
+        connection_b = HTTP2::Connection.start(client_b)
+        connection_b.wait_until_active(1.second)
+        stream_b = connection_b.new_stream
+        open_client_stream(stream_b)
+        stream_id_b.send(stream_b.id)
+
+        http = HTTP2::Client.new(
+          "http://example.test",
+          connection: connection_a
+        )
+        # See `test_only_retired_connections=` above for why this test
+        # helper exists instead of driving a real retire-then-redial.
+        http.test_only_retired_connections = [connection_b] of HTTP2::Connection
+
+        timeout = 300.milliseconds
+        started = Time.instant
+        expect_raises(HTTP2::Connection::DrainTimeoutError) do
+          http.graceful_close(timeout)
+        end
+        elapsed = Time.instant - started
+
+        # Sequential per-connection timeouts would take close to 2x
+        # timeout (~600ms); a single shared deadline keeps the total
+        # close to 1x timeout (~300ms). Generous margin, no sleeps.
+        elapsed.should be < 500.milliseconds
+        http.closed?.should be_true
+        wait_for_peer(peer_result_a)
+        wait_for_peer(peer_result_b)
+      end
     end
   end
 end
@@ -1065,6 +1143,76 @@ describe HTTP2::Client do
       http.get("/one").status.should eq(204)
       http.get("/two").status.should eq(204)
       wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close
+    end
+  end
+
+  it "dials outside its mutex, so #closed? is not blocked behind an " \
+     "in-progress connect+TLS handshake" do
+    server = TCPServer.new("127.0.0.1", 0)
+    accepted = Channel(Nil).new(1)
+    release = Channel(Nil).new(1)
+    peer_result = scripted_peer(server) do |listener|
+      socket = listener.as(TCPServer).accept
+      begin
+        # Completes the bare TCP handshake but never writes a single TLS
+        # byte back, so the client's OpenSSL handshake attempt inside
+        # `dial` stays blocked reading for a ServerHello that never
+        # arrives, for exactly as long as this test needs it to.
+        accepted.send(nil)
+        select
+        when release.receive
+        when timeout(2.seconds)
+        end
+      ensure
+        socket.close
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "https://127.0.0.1:#{server.local_address.port}",
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 2.seconds,
+        read: 2.seconds,
+        write: 2.seconds
+      )
+    )
+    begin
+      # Joined at the end (`dial_done`) rather than left to run
+      # unobserved: an abandoned fiber still unwinding a TLS/socket
+      # error at the exact moment the process exits is a known
+      # `-Dpreview_mt` shutdown hazard unrelated to anything under test
+      # here, and joining it avoids relying on that timing at all.
+      dial_done = Channel(Nil).new(1)
+      spawn do
+        http.get("/") rescue nil
+      ensure
+        dial_done.send(nil)
+      end
+      accepted.receive
+
+      result = Channel(Bool).new(1)
+      spawn { result.send(http.closed?) }
+      outcome = select
+      when value = result.receive
+        value
+      when timeout(100.milliseconds)
+        fail(
+          "closed? did not return within 100ms while a dial was pending"
+        )
+      end
+      outcome.should be_false
+
+      release.send(nil)
+      wait_for_peer(peer_result)
+
+      select
+      when dial_done.receive
+      when timeout(2.seconds)
+        fail("background dial fiber never settled")
+      end
     ensure
       http.close
       server.close
@@ -1917,8 +2065,12 @@ describe HTTP2::Client do
           "rejected"
         ).write(io)
         io.flush
+
+        # The response already completed successfully; the upload is
+        # merely moot, not cancelled, so the early-stop reset must carry
+        # NO_ERROR rather than CANCEL.
         read_until_reset(io).error_code.should eq(
-          HTTP2::ErrorCode::CANCEL.to_u32
+          HTTP2::ErrorCode::NO_ERROR.to_u32
         )
       end
 
