@@ -144,6 +144,33 @@ describe HTTP2::Connection do
     end
   end
 
+  it "carries the original error code when the server preface is " \
+     "malformed" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        read_client_preface(io)
+        HTTP2::FrameHeader.new(
+          20_000,
+          HTTP2::Frame::Settings::TypeCode,
+          0_u8,
+          0_u32
+        ).write(io)
+        io.flush
+
+        goaway = skip_startup_window_update(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(
+          HTTP2::ErrorCode::FRAME_SIZE_ERROR.to_u32
+        )
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_closed(1.second)
+      error = connection.terminal_error.as(HTTP2::ProtocolError)
+      error.error_code.should eq(HTTP2::ErrorCode::FRAME_SIZE_ERROR)
+      wait_for_peer(peer_result)
+    end
+  end
+
   it "enters draining state after sending GOAWAY" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|
@@ -176,6 +203,39 @@ describe HTTP2::Connection do
       end
 
       connection.close
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "fails an in-flight stream with the peer's GOAWAY code when the " \
+     "connection then hits EOF" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        read_client_headers(io, 1_u32)
+        HTTP2::Frame::GoAway.new(
+          1_u32,
+          HTTP2::ErrorCode::INTERNAL_ERROR.to_u32,
+          "server is restarting"
+        ).write(io)
+        io.flush
+        io.close
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+
+      connection.wait_closed(1.second)
+      error = expect_raises(HTTP2::Connection::GoAwayTerminationError) do
+        stream.receive(1.second)
+      end
+      error.error_code.should eq(HTTP2::ErrorCode::INTERNAL_ERROR.to_u32)
+      error.message.to_s.should contain("server is restarting")
+      connection.terminal_error.should be_a(
+        HTTP2::Connection::GoAwayTerminationError
+      )
       wait_for_peer(peer_result)
     end
   end

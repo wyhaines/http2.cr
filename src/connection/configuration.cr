@@ -12,6 +12,7 @@ module HTTP2
       getter max_pending_pings : Int32
       getter settings_ack_timeout : Time::Span
       getter drain_timeout : Time::Span
+      getter goaway_flush_timeout : Time::Span
       getter keepalive_interval : Time::Span?
       getter keepalive_timeout : Time::Span
       getter max_compressed_field_section_size : Int32
@@ -40,6 +41,7 @@ module HTTP2
         @max_pending_pings : Int32 = 8,
         @settings_ack_timeout : Time::Span = 10.seconds,
         @drain_timeout : Time::Span = 30.seconds,
+        @goaway_flush_timeout : Time::Span = 5.seconds,
         @keepalive_interval : Time::Span? = nil,
         @keepalive_timeout : Time::Span = 10.seconds,
         @max_compressed_field_section_size : Int32 = 64 * 1024,
@@ -127,6 +129,9 @@ module HTTP2
         end
         if @drain_timeout <= Time::Span.zero
           raise ArgumentError.new("drain timeout must be positive")
+        end
+        if @goaway_flush_timeout <= Time::Span.zero
+          raise ArgumentError.new("goaway flush timeout must be positive")
         end
         if interval = @keepalive_interval
           if interval <= Time::Span.zero

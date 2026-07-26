@@ -30,6 +30,11 @@ describe HTTP2::Connection::Configuration do
         drain_timeout: Time::Span.zero
       )
     end
+    expect_raises(ArgumentError, /goaway flush timeout/) do
+      HTTP2::Connection::Configuration.new(
+        goaway_flush_timeout: Time::Span.zero
+      )
+    end
     expect_raises(ArgumentError, /keepalive interval/) do
       HTTP2::Connection::Configuration.new(
         keepalive_interval: Time::Span.zero
@@ -408,6 +413,43 @@ describe HTTP2::Connection do
     end
   end
 
+  it "terminates within the flush timeout when a connection-level " \
+     "protocol violation hits a stalled transport" do
+    # A PING frame targeting a nonzero stream ID is a connection-scoped
+    # protocol violation (RFC 9113 6.7) discovered while parsing the frame
+    # itself, in `reader_loop`'s own `rescue error : ProtocolError` — the
+    # same #send_goaway this test exercises, not the per-stream
+    # `handle_stream_violation` path the "keeps the reader processing..."
+    # spec above covers.
+    violation = wire_frame(
+      HTTP2::Frame::Ping::TypeCode,
+      0_u8,
+      1_u32,
+      Bytes.new(8, 0_u8)
+    )
+    configuration = HTTP2::Connection::Configuration.new(
+      goaway_flush_timeout: 100.milliseconds
+    )
+    transport = StallingWriteIO.new(violation)
+    connection = HTTP2::Connection.start(transport, configuration)
+    begin
+      connection.wait_until_active(1.second)
+      transport.stall!
+      transport.release_gated_reads!
+
+      # Well over goaway_flush_timeout (100ms) but far under any default
+      # keepalive/write-timeout recovery — a stalled #send_goaway that
+      # blocks on #command.wait forever (no timeout raced in) would still
+      # be parked when this bound elapses, since nothing else in this
+      # configuration (no keepalive, StallingWriteIO honors no
+      # write_timeout) can ever unblock it.
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(HTTP2::ProtocolError)
+    ensure
+      connection.close
+    end
+  end
+
   it "rejects excessive inbound control traffic" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|
@@ -465,6 +507,64 @@ describe HTTP2::Connection do
       )
       connection = HTTP2::Connection.start(client, configuration)
       connection.wait_until_active(1.second)
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(
+        HTTP2::Connection::ResourceLimitError
+      )
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "trips ENHANCE_YOUR_CALM on a GOAWAY flood" do
+    UNIXSocket.pair do |client, peer|
+      ready = Channel(Nil).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        read_client_headers(io, 1_u32)
+        ready.receive
+
+        begin
+          1_100.times do
+            HTTP2::Frame::GoAway.new(
+              1_u32,
+              HTTP2::ErrorCode::NO_ERROR
+            ).write(io)
+          end
+          io.flush
+        rescue IO::Error
+          # The connection may already have reacted to the limiter
+          # tripping and force-closed its socket before the flood
+          # finished writing all 1_100 frames — that's the point of the
+          # test, not a failure; stop writing early instead of treating
+          # a broken pipe here as a spec error.
+        end
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(
+          HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32
+        )
+      end
+
+      # Default configuration: max_control_frames_per_window is 1_000, so
+      # the flood (1_100, comfortably over) trips the limiter without
+      # needing a tightened override, within the default 1-second window
+      # since the whole flood is written and read essentially at once.
+      #
+      # last_stream_id is pinned to the one stream this test opens (never
+      # 0) so that stream stays active (not "unprocessed") across every
+      # flood frame — otherwise, with zero active streams, the
+      # connection's drain monitor can independently decide the peer has
+      # gone quiet and close with DrainedError, racing the rate limiter
+      # tripping (observed under -Dpreview_mt thread-scheduling
+      # pressure). Only the rate limiter's own closure is under test
+      # here, so that race is closed structurally rather than relying on
+      # timing to usually favor the limiter.
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      stream = connection.new_stream
+      open_client_stream(stream)
+      ready.send(nil)
+
       connection.wait_closed(1.second)
       connection.terminal_error.should be_a(
         HTTP2::Connection::ResourceLimitError

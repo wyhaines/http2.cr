@@ -962,6 +962,36 @@ module HTTP2
       @submission_mutex.synchronize { enqueue(command) }
     end
 
+    # Enqueues a command and waits up to `timeout` for the writer to flush
+    # it, then returns either way. Used only by #send_goaway from the
+    # reader fiber: a bare #submit_nowait would race the GOAWAY against
+    # the reader's own #terminate on a HEALTHY connection — #terminate
+    # closes @write_queue and the transport without flushing, and
+    # #process_write_command completes-with-error once a terminal error is
+    # set, so a nowait-then-terminate sequence can drop the GOAWAY even
+    # when the peer was reading fine, trading RFC 9113 5.4.1's "send
+    # GOAWAY before closing" on the common path for a rare-path
+    # improvement. Racing #command.wait against a deadline keeps the
+    # common (healthy) case exactly as reliable as the old unbounded
+    # #submit — the writer flushes it and #wait's completion branch wins,
+    # almost always well inside the deadline — while still bounding the
+    # reader's worst case: if the transport is genuinely stalled, this
+    # method returns once `timeout` elapses without the command having
+    # completed. The GOAWAY stays queued (or in-flight, if the writer
+    # already dequeued it and is blocked trying to send it); the caller
+    # (#reader_loop's rescue) then calls #terminate, which force-closes
+    # the transport and unblocks whichever of those two states the
+    # command was in — completing it with the terminal error rather than
+    # ever sending it. A peer that stalled its own reads forfeits the
+    # courtesy frame instead of hanging the connection indefinitely.
+    private def submit_bounded(
+      command : WriteCommand,
+      timeout : Time::Span,
+    ) : Nil
+      @submission_mutex.synchronize { enqueue(command) }
+      command.wait(timeout)
+    end
+
     private def submit_data(frame : Frame::Data) : Nil
       stream = @mutex.synchronize do
         active = @streams[frame.stream_id]?
@@ -1504,7 +1534,8 @@ module HTTP2
       )
     rescue error : ProtocolError
       raise ProtocolError.new(
-        "invalid server connection preface: #{error.message}"
+        "invalid server connection preface: #{error.message}",
+        error.error_code
       )
     end
 
@@ -1600,7 +1631,24 @@ module HTTP2
           )
         )
       else
-        terminate(error) unless closed?
+        terminate(eof_termination_error(error)) unless closed?
+      end
+    end
+
+    # A bare `IO::EOFError` says only "the socket closed," which is
+    # actionless for streams still open at or below a peer GOAWAY's
+    # last_stream_id (ones the peer promised to still finish). If the
+    # peer told us why it was leaving before it actually left — a GOAWAY
+    # carrying a non-NO_ERROR code — surface that diagnosis instead so
+    # those streams fail with something a caller can branch on. A
+    # NO_ERROR GOAWAY (or no GOAWAY at all) is an ordinary/graceful
+    # disconnect, so the original EOF passes through unchanged.
+    private def eof_termination_error(error : IO::EOFError) : Exception
+      goaway = @mutex.synchronize { @last_goaway }
+      if goaway && goaway.error_code != ErrorCode::NO_ERROR.to_u32
+        GoAwayTerminationError.new(goaway)
+      else
+        error
       end
     end
 
@@ -2294,6 +2342,15 @@ module HTTP2
       )
     end
 
+    # Sends the reader's reactive GOAWAY (a protocol violation just raised
+    # `error` out of #reader_loop). Deliberately NOT a plain #submit (would
+    # block the reader indefinitely against a stalled peer — the deadlock
+    # #submit_nowait already avoids for PING/SETTINGS ACKs and
+    # #send_reset_nowait avoids for RST_STREAM) and deliberately NOT a bare
+    # #submit_nowait either (see #submit_bounded's comment for why that
+    # would race the GOAWAY against #terminate and could drop it even on a
+    # healthy connection). #submit_bounded is the deadline-bounded middle
+    # ground: wait for the flush, but not forever.
     private def send_goaway(error : ProtocolError) : Nil
       last_stream_id = @mutex.synchronize do
         if previous = @last_sent_goaway
@@ -2305,7 +2362,14 @@ module HTTP2
           @last_processed_peer_stream_id
         end
       end
-      write_frame(Frame::GoAway.new(last_stream_id, error.error_code))
+      frame = Frame::GoAway.new(last_stream_id, error.error_code)
+      command = WriteCommand.new([frame] of Frames)
+      # Either outcome (flushed within the deadline, `true`; deadline
+      # elapsed first, `false`) falls through to a normal return here —
+      # #reader_loop's caller proceeds straight to #terminate next either
+      # way, which is what actually reclaims a timed-out send (see
+      # #submit_bounded).
+      submit_bounded(command, @configuration.goaway_flush_timeout)
     rescue
       # The original protocol violation remains the terminal error.
     end

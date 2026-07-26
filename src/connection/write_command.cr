@@ -146,6 +146,24 @@ module HTTP2
           raise ClosedError.new("HTTP/2 stream #{stream.id} is closed")
         end
       end
+
+      # Waits up to `timeout` for completion, raising on an error
+      # completion exactly like the deadline-free `#wait`. Returns `true`
+      # if the command completed within the bound, `false` if the
+      # deadline elapsed first — the command stays queued (or in-flight)
+      # in that case, and whichever of the writer's normal completion
+      # paths (a flushed write, or the terminal-error drain the writer's
+      # `ensure` runs once the connection closes) will complete it later;
+      # this method just stops waiting for that to happen.
+      def wait(timeout : Time::Span) : Bool
+        select
+        when error = @completion.receive
+          raise error if error
+          true
+        when timeout(timeout)
+          false
+        end
+      end
     end
   end
 end

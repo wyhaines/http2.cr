@@ -103,6 +103,27 @@ module HTTP2
       end
     end
 
+    # The connection ended (EOF) after the peer sent a GOAWAY signaling a
+    # failure (a non-NO_ERROR code). Raised in place of a bare
+    # `IO::EOFError` so streams at or below the GOAWAY's last_stream_id —
+    # ones the peer promised to still finish — fail with the peer's own
+    # diagnosis instead of an opaque "the socket closed."
+    class GoAwayTerminationError < ClosedError
+      getter goaway : Frame::GoAway
+
+      def initialize(@goaway : Frame::GoAway)
+        message = "connection closed after peer GOAWAY with error code " \
+                  "#{@goaway.error_code}"
+        debug = @goaway.debug_data
+        message += ": #{String.new(debug)}" unless debug.empty?
+        super(message)
+      end
+
+      def error_code : UInt32
+        @goaway.error_code
+      end
+    end
+
     class ResourceLimitError < ProtocolError
       def initialize(message : String)
         super(message, ErrorCode::ENHANCE_YOUR_CALM)

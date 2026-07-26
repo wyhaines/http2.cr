@@ -51,7 +51,8 @@ module HTTP2
           frame.is_a?(Frame::Ping) ||
           frame.is_a?(Frame::Priority) ||
           frame.is_a?(Frame::ResetStream) ||
-          frame.is_a?(Frame::WindowUpdate)
+          frame.is_a?(Frame::WindowUpdate) ||
+          frame.is_a?(Frame::GoAway)
       end
     end
   end
