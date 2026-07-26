@@ -1892,6 +1892,20 @@ describe HTTP2::Client do
       peer_result = scripted_peer(peer) do |io|
         complete_server_handshake(io)
         client_read_field_section(io, HPack::Decoder.new)
+
+        # The declared 3 bytes go out before the overrun is even
+        # detected (the probe runs only after `sent == body_length`),
+        # but critically WITHOUT END_STREAM — the whole point of
+        # dropping the in-loop "attach END_STREAM to the final chunk"
+        # optimization was to keep END_STREAM off the wire until the
+        # probe confirms there is nothing left. `read_until_reset`
+        # alone (used below) discards frames without inspecting them,
+        # so it cannot tell an end_stream-carrying DATA frame from any
+        # other frame; assert this one directly instead.
+        data = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        data.data.should eq("abc".to_slice)
+        data.end_stream?.should be_false
+
         read_until_reset(io).error_code.should eq(
           HTTP2::ErrorCode::CANCEL.to_u32
         )
@@ -1903,13 +1917,60 @@ describe HTTP2::Client do
         connection: connection
       )
       begin
-        expect_raises(HTTP2::InvalidRequestError, /content-length/) do
+        expect_raises(
+          HTTP2::InvalidRequestError,
+          /exceeds declared content-length/
+        ) do
           http.post(
             "/",
             HTTP2::Headers{"content-length" => "3"},
             IO::Memory.new("abcd")
           )
         end
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "sends a correctly-sized IO body as one content frame then a " \
+     "separate empty END_STREAM frame" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_false
+
+        content = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        content.data.should eq("abc".to_slice)
+        content.end_stream?.should be_false
+
+        ending = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        ending.data.should be_empty
+        ending.end_stream?.should be_true
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.post(
+          "/",
+          HTTP2::Headers{"content-length" => "3"},
+          IO::Memory.new("abc")
+        )
+        response.status.should eq(204)
         wait_for_peer(peer_result)
       ensure
         http.close

@@ -56,9 +56,25 @@ describe HTTP2::StreamBody do
 
     body.close
 
-    expect_raises(IO::Error, /closed stream/) do
+    expect_raises(IO::Error, /Closed stream/) do
       body.read(Bytes.new(1))
     end
+  end
+
+  it "still raises the stream's own terminal error, not the generic " \
+     "closed-stream error, when a terminated body is also closed" do
+    body = HTTP2::StreamBody.new(
+      8,
+      ->(_amount : Int32) { },
+      -> { }
+    )
+    error = IO::Error.new("stream reset")
+
+    body.terminate(error)
+    body.close
+
+    exception = expect_raises(IO::Error) { body.read(Bytes.new(1)) }
+    exception.same?(error).should be_true
   end
 
   it "wakes a blocked reader with a terminal error" do

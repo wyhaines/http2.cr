@@ -50,10 +50,13 @@ module HTTP2
     # bytes consumed since the previous check, the response's stream is
     # canceled: flow-control credit for that buffered data is returned,
     # RST_STREAM is sent, and the body is left with a terminal error, so
-    # a later read raises rather than returning a silent EOF — a
-    # deliberate difference from the caller's own `Response#close`, which
-    # stays silent, so a library-initiated reclamation is distinguishable
-    # from a caller's own graceful stop. If any bytes WERE consumed in
+    # a later read raises that specific error (e.g. `RequestTimeoutError`
+    # here). A caller's own `Response#close` also makes a later read
+    # raise rather than return a silent EOF, but with a generic
+    # `IO::Error` ("Closed stream") instead of a stream's own terminal
+    # error — a library-initiated reclamation stays distinguishable from
+    # a caller's own graceful stop by exception type, not by whether
+    # reading raises at all. If any bytes WERE consumed in
     # that window, the deadline simply re-arms, so a slow-but-active
     # reader is never killed. A quiet stream with an EMPTY buffer — an
     # SSE or long-poll response waiting between events, a successful
@@ -226,6 +229,9 @@ module HTTP2
     end
 
     # Sends a POST request. IO bodies stream from their current position.
+    # An IO body paired with an explicit `content-length` header must EOF
+    # exactly at that declared length — see `Request#initialize` for what
+    # happens, and the risk, if it does not.
     def post(
       target : String,
       headers : Headers = Headers.new,
@@ -240,7 +246,8 @@ module HTTP2
       )
     end
 
-    # Builds and sends a request for any HTTP method.
+    # Builds and sends a request for any HTTP method. See `Request#initialize`
+    # for the EOF requirement on a sized IO `body`.
     def request(
       method : String,
       target : String,
@@ -1172,11 +1179,15 @@ module HTTP2
     # unread buffered bytes AND none were read since the previous check,
     # the response is treated as abandoned and its stream is canceled —
     # credit for those buffered bytes returned, RST_STREAM sent, and the
-    # body given a terminal error so a later read raises instead of
-    # returning a silent EOF (distinguishing library-initiated
-    # reclamation from the caller's own `Response#close`, which is
-    # deliberately silent). A quiet stream with an EMPTY buffer — an SSE
-    # or long-poll response between events, a quiet CONNECT tunnel while
+    # body given a terminal error so a later read raises that specific
+    # error (e.g. `RequestTimeoutError` here). A caller's own
+    # `Response#close` also makes a later read raise rather than return a
+    # silent EOF, but with a generic `IO::Error` ("Closed stream") instead
+    # of a stream's own terminal error — library-initiated reclamation
+    # stays distinguishable from the caller's own `Response#close` by
+    # exception type, not by whether reading raises at all. A quiet
+    # stream with an EMPTY buffer — an SSE or long-poll response between
+    # events, a quiet CONNECT tunnel while
     # the app uploads — pins no credit and is left running indefinitely,
     # matching `Timeouts`' documented "never killed merely for going
     # quiet" contract. Any consumption between checks re-arms the

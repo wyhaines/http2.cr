@@ -24,12 +24,22 @@ module HTTP2
       # (`max_compressed_field_section_size`, `max_decoded_field_section_size`)
       # are protocol-adjacent. A too-low count limit rejects legitimate,
       # if unusual, requests (large cookie jars, tracing/baggage headers,
-      # etc.) that were never actually a resource risk: even at this
-      # getter's default, a decoded section is still bounded by the ~64 KiB
-      # `max_decoded_field_section_size` default, so raising the count
-      # ceiling does not raise the real worst-case exposure — a section
-      # cannot reach anywhere near this many fields without also being
-      # mostly empty-valued padding that the byte cap already catches.
+      # etc.) that were never actually a resource risk.
+      #
+      # This getter's default does not newly exceed what the byte-size cap
+      # already permits: the HPack field-section-size accounting this
+      # library uses charges `name.bytesize + value.bytesize + 32` per
+      # field (RFC 7541's dynamic-table-size formula, reused here for the
+      # section limit), so even a maximally degenerate all-empty-valued
+      # section already fits roughly 65_536 / 32 = 2_048 fields under the
+      # ~64 KiB `max_decoded_field_section_size` default *regardless* of
+      # this setting — a peer could already force that many small
+      # allocations through a handful of large-valued fields totaling
+      # close to the byte cap. This getter's default (1_024) stays
+      # comfortably under that implicit ~2_048 ceiling, not above it —
+      # it does not, by itself, keep a large field count out; it only
+      # avoids rejecting a legitimate, unusually field-heavy request
+      # while staying within what the byte cap alone already allows.
       getter max_decoded_fields : Int32
       getter max_decoded_string_size : Int32
       getter max_continuation_frames : Int32

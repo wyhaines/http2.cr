@@ -77,7 +77,7 @@ module HTTP2
               # runs when `@terminal_error` is unset (checked above), so an
               # existing terminal error always takes precedence over this
               # generic closed signal.
-              {0, IO::Error.new("closed stream"), false}
+              {0, IO::Error.new("Closed stream"), false}
             elsif @finished
               {0, nil, false}
             else

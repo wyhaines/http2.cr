@@ -161,10 +161,14 @@ that safety net, but only once the body is actually pinning credit: each
 time `idle` elapses with unread buffered data present and no bytes read
 since the previous check, the response's stream is canceled — credit for
 that buffered data returned, RST_STREAM sent, and the body left with a
-terminal error so a later read raises instead of silently returning EOF
-(unlike a caller's own `Response#close`, which stays silent). Any
-consumption in that window re-arms the deadline instead, so a reader
-that is merely slow is never killed. A quiet stream with an EMPTY buffer
+terminal error so a later read raises that specific error (e.g.
+`RequestTimeoutError` here). A caller's own `Response#close` also makes a
+later read raise rather than return a silent EOF, but with a generic
+`IO::Error` ("Closed stream") instead of a stream's own terminal error —
+the two remain distinguishable by exception type, not by whether reading
+raises at all. Any consumption in that window re-arms the deadline
+instead, so a reader that is merely slow is never killed. A quiet stream
+with an EMPTY buffer
 — an SSE or long-poll response between events, a successful CONNECT
 tunnel sitting quiet while the app uploads — pins no credit and keeps
 running indefinitely, matching the "never killed merely for going quiet"
