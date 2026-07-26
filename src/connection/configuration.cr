@@ -10,6 +10,7 @@ module HTTP2
       getter max_open_streams : Int32
       getter max_pending_settings : Int32
       getter max_pending_pings : Int32
+      getter max_pre_ack_push_promises : Int32
       getter settings_ack_timeout : Time::Span
       getter drain_timeout : Time::Span
       getter goaway_flush_timeout : Time::Span
@@ -39,6 +40,7 @@ module HTTP2
         @max_open_streams : Int32 = 100,
         @max_pending_settings : Int32 = 8,
         @max_pending_pings : Int32 = 8,
+        @max_pre_ack_push_promises : Int32 = 8,
         @settings_ack_timeout : Time::Span = 10.seconds,
         @drain_timeout : Time::Span = 30.seconds,
         @goaway_flush_timeout : Time::Span = 5.seconds,
@@ -112,6 +114,11 @@ module HTTP2
         if @max_pending_pings <= 0
           raise ArgumentError.new(
             "maximum pending PING count must be positive"
+          )
+        end
+        if @max_pre_ack_push_promises <= 0
+          raise ArgumentError.new(
+            "maximum pre-ACK PUSH_PROMISE count must be positive"
           )
         end
         if @diagnostic_queue_capacity <= 0

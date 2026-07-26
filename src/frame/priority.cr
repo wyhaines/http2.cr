@@ -19,11 +19,21 @@ module HTTP2
 
     protected def validate!
       require_stream_id!("PRIORITY")
-      return if payload.size == 5
+      unless payload.size == 5
+        frame_size_error!(
+          "PRIORITY frame payload must be exactly 5 octets",
+          ErrorScope::Stream
+        )
+      end
 
-      frame_size_error!(
-        "PRIORITY frame payload must be exactly 5 octets",
-        ErrorScope::Stream
+      # RFC 7540 5.3.1 (a MUST; RFC 9113 drops the requirement along with
+      # priority itself, but conformance suites such as h2spec still test
+      # it): a stream cannot depend on itself.
+      return unless stream_dependency == stream_id
+
+      stream_protocol_error!(
+        "PRIORITY frame must not set stream #{stream_id} as its own " \
+        "dependency"
       )
     end
   end

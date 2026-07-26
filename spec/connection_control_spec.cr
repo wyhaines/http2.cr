@@ -56,6 +56,65 @@ describe HTTP2::Connection do
     end
   end
 
+  it "bounds pre-ACK PUSH_PROMISE tolerance" do
+    UNIXSocket.pair do |client, peer|
+      parent_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        read_client_preface(io)
+
+        HTTP2::Frame::Settings.new(
+          [] of HTTP2::Frame::Settings::Setting
+        ).write(io)
+        io.flush
+        skip_startup_window_update(io)
+          .as(HTTP2::Frame::Settings)
+          .ack?
+          .should be_true
+
+        id = parent_id.receive
+        read_client_headers(io, id)
+
+        # 9 promises before the client's own ENABLE_PUSH=0 SETTINGS is
+        # ever acknowledged (this script never sends that ACK) — one
+        # more than the configured (default 8) pre-ACK tolerance, each
+        # individually well-formed and targeting a distinct, increasing,
+        # even promised stream ID.
+        9.times do |index|
+          HTTP2::Frame::PushPromise.new(
+            HTTP2::Frame::PushPromise::Flags::END_HEADERS,
+            id,
+            ((index + 1) * 2).to_u32
+          ).write(io)
+        end
+        io.flush
+
+        # The 8 promises within tolerance are each individually accepted
+        # and then immediately auto-cancelled (this library never
+        # actually consumes a push — see the "rejects a legal pre-ACK
+        # push" example above), so their RST_STREAM(CANCEL) frames
+        # interleave with the eventual GOAWAY on the wire; skip past
+        # them to the connection-level violation this example targets.
+        goaway = nil
+        until goaway
+          frame = HTTP2::Frame.read(io)
+          goaway = frame.as?(HTTP2::Frame::GoAway)
+        end
+        goaway.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      parent = connection.new_stream
+      open_client_stream(parent)
+      parent_id.send(parent.id)
+
+      connection.wait_closed(1.second)
+      error = connection.terminal_error.as(HTTP2::ProtocolError)
+      error.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR)
+      wait_for_peer(peer_result)
+    end
+  end
+
   it "closes when PUSH_PROMISE arrives after push-disable acknowledgement" do
     UNIXSocket.pair do |client, peer|
       parent_id = Channel(UInt32).new(1)
@@ -111,6 +170,44 @@ describe HTTP2::Connection do
         wait_for_peer(peer_result)
         connection.stream?(99_u32).should be_nil
         connection.active?.should be_true
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "resets a stream that sends PRIORITY depending on itself" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+
+        # Built from raw wire bytes, not `Frame::Priority.new` — that
+        # constructor now performs this same self-dependency validation
+        # (see priority_frame_spec.cr), so it cannot be used to build the
+        # malformed frame a real non-conforming peer would send.
+        payload = Bytes.new(5)
+        IO::ByteFormat::BigEndian.encode(id, payload[0, 4])
+        payload[4] = 15_u8
+        io.write(wire_frame(HTTP2::Frame::Priority::TypeCode, 0_u8, id, payload))
+        io.flush
+
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(id)
+        reset.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR.to_u32)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream, end_stream: false)
+        stream_id.send(stream.id)
+        eventually { stream.closed? }
+        connection.active?.should be_true
+        wait_for_peer(peer_result)
       ensure
         connection.close
       end

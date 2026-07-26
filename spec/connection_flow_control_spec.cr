@@ -868,6 +868,47 @@ describe HTTP2::Connection do
     end
   end
 
+  it "rejects stream window overflow on a half-closed(local) stream" do
+    UNIXSocket.pair do |client, peer|
+      stream_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        id = stream_id.receive
+        read_client_headers(io, id)
+        HTTP2::Frame::WindowUpdate.new(
+          id,
+          HTTP2::FrameHeader::MAX_STREAM_ID
+        ).write(io)
+        io.flush
+
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(id)
+        reset.error_code.should eq(
+          HTTP2::ErrorCode::FLOW_CONTROL_ERROR.to_u32
+        )
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        # END_STREAM on our own HEADERS (no body) makes this stream
+        # half-closed(local) before the peer's WINDOW_UPDATE arrives — the
+        # state this sub-change's fix targets, as opposed to the sibling
+        # "rejects connection and stream window overflow at the correct
+        # scope" example above, which stays open.
+        open_client_stream(stream, end_stream: true)
+        stream.state.should eq(HTTP2::Stream::State::HalfClosedLocal)
+        stream_id.send(stream.id)
+        eventually { stream.closed? }
+        connection.active?.should be_true
+        wait_for_peer(peer_result)
+      ensure
+        connection.close
+      end
+    end
+  end
+
   it "rejects a SETTINGS change that overflows an active stream window" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)

@@ -68,6 +68,12 @@ module HTTP2
     @drain_deadline : Time::Instant?
     @last_inbound_activity = Time.instant
     @keepalive_sequence = 0_u32
+    # Counts PUSH_PROMISE frames accepted while our own ENABLE_PUSH=0
+    # SETTINGS has not yet been acknowledged (see `validate_push_promise!`).
+    # Never reset: `send_settings` already refuses to ever re-enable push
+    # (`updated.enable_push?` check), so there is exactly one such window
+    # per connection, immediately after `start`.
+    @pre_ack_push_promise_count = 0
     @streams = {} of UInt32 => Stream
     @closed_streams = {} of UInt32 => ClosedStream
     @closed_stream_order = [] of UInt32
@@ -1821,6 +1827,25 @@ module HTTP2
           )
         end
 
+        # `@effective_local_settings_state` only reflects our own
+        # ENABLE_PUSH=0 once the peer has acknowledged it (see
+        # `acknowledge_local_settings`), so the check above alone leaves
+        # an unbounded tolerance window immediately after `start`, before
+        # that ACK arrives — every PUSH_PROMISE the peer sends in that
+        # window is otherwise accepted (and immediately auto-cancelled,
+        # see `reject_push_promise`) with no limit. Bound how many of
+        # those this connection tolerates; past that, treat it as the
+        # connection-level protocol violation it is (RFC 9113 places no
+        # duty on us to keep entertaining a peer that keeps pushing well
+        # past a reasonable grace period).
+        @pre_ack_push_promise_count += 1
+        if @pre_ack_push_promise_count > @configuration.max_pre_ack_push_promises
+          raise ProtocolError.new(
+            "PUSH_PROMISE count exceeded the pre-acknowledgement " \
+            "tolerance of #{@configuration.max_pre_ack_push_promises}"
+          )
+        end
+
         parent_state = stream_state_unlocked(frame.stream_id)
         closed = @closed_streams[frame.stream_id]?
         unless closed.try(&.tolerates_late_frames?)
@@ -1948,8 +1973,16 @@ module HTTP2
         next false unless stream
 
         stream.transition_to(transition.next_state || state)
-        next false unless state.open? || state.half_closed_remote?
 
+        # The overflow check runs for every state the transition above
+        # already allowed (including half-closed(local) and
+        # reserved(local), where we will never send another DATA frame on
+        # this stream) — RFC 9113 6.9.1's "MUST NOT allow a flow-control
+        # window to exceed 2^31-1" is a validity rule on the WINDOW_UPDATE
+        # itself, not conditioned on whether we still have anything left
+        # to send. Only the actual bookkeeping mutation below (which only
+        # matters for a stream that can still send) is skipped for the
+        # states this doesn't apply to.
         updated = stream.send_window + increment
         if updated > FrameHeader::MAX_STREAM_ID.to_i64
           raise ProtocolError.new(
@@ -1960,6 +1993,8 @@ module HTTP2
             frame.stream_id
           )
         end
+        next false unless state.open? || state.half_closed_remote?
+
         stream.adjust_send_window(increment)
         true
       end
@@ -2136,9 +2171,8 @@ module HTTP2
       return if ignored || stream.nil?
 
       unless stream.deliver(event)
-        raise QueueFullError.new(
-          "stream #{stream.id} event queue reached its configured limit"
-        )
+        fail_overflowed_stream(stream)
+        return
       end
       if section = event.as?(FieldSection)
         if section.end_stream?
@@ -2150,6 +2184,44 @@ module HTTP2
         end
       end
       wake_drain_monitor if stream.closed?
+    end
+
+    # A single stream's bounded inbound event queue filling up (a
+    # consumer that stopped reading, or fell behind) used to raise a
+    # connection-fatal `QueueFullError` here — one slow reader took every
+    # other stream down with it. Treat it like any other stream-scoped
+    # protocol violation instead: RST just this stream with
+    # ENHANCE_YOUR_CALM and let the rest of the connection carry on.
+    # Reusing `handle_stream_violation` gets the standard fire-and-forget
+    # RST (`send_reset_nowait`, safe to call from the reader fiber),
+    # eventual stream removal, and LocalReset retention (so a frame for
+    # this stream already in flight from the peer is absorbed rather than
+    # treated as a fresh violation) for free — the same path every other
+    # stream-scoped error already takes.
+    private def fail_overflowed_stream(stream : Stream) : Nil
+      error = ProtocolError.new(
+        "stream #{stream.id} event queue reached its configured limit",
+        ErrorCode::ENHANCE_YOUR_CALM,
+        ErrorScope::Stream,
+        stream.id
+      )
+      if @mutex.synchronize { @streams[stream.id]?.try(&.same?(stream)) }
+        handle_stream_violation(error)
+        return
+      end
+
+      # The very transition that produced the undelivered event already
+      # closed and removed this stream (e.g. trailers ending an
+      # already-half-closed(local) stream) before delivery was even
+      # attempted, a few lines up in `transition_and_deliver`. Nothing is
+      # owed to the peer — RFC 9113 has nothing left to RST, both sides
+      # already agreed the stream is done — but a caller parked in
+      # `Stream#receive` waiting for the event that just failed to
+      # deliver must not be stranded forever: terminate the stream
+      # directly instead of relying on `handle_stream_violation`, which
+      # would (correctly) no-op for a stream it can no longer find.
+      emit_error(error, stream.id)
+      @mutex.synchronize { terminate_stream_unlocked(stream, error) }
     end
 
     private def resolve_inbound_transition_unlocked(

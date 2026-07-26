@@ -34,4 +34,14 @@ describe HTTP2::Frame::Priority do
       end
     end
   end
+
+  it "rejects a self-referential stream dependency as a stream error" do
+    expect_violation(
+      HTTP2::ErrorCode::PROTOCOL_ERROR,
+      HTTP2::ErrorScope::Stream,
+      1_u32
+    ) do
+      HTTP2::Frame::Priority.new(0_u8, 1_u32, Bytes[0, 0, 0, 1, 15])
+    end
+  end
 end

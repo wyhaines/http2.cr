@@ -25,6 +25,9 @@ describe HTTP2::Connection::Configuration do
     expect_raises(ArgumentError, /pending PING/) do
       HTTP2::Connection::Configuration.new(max_pending_pings: 0)
     end
+    expect_raises(ArgumentError, /pre-ACK PUSH_PROMISE/) do
+      HTTP2::Connection::Configuration.new(max_pre_ack_push_promises: 0)
+    end
     expect_raises(ArgumentError, /drain timeout/) do
       HTTP2::Connection::Configuration.new(
         drain_timeout: Time::Span.zero
@@ -570,6 +573,196 @@ describe HTTP2::Connection do
         HTTP2::Connection::ResourceLimitError
       )
       wait_for_peer(peer_result)
+    end
+  end
+
+  it "resets a stream whose inbound event queue overflows instead of " \
+     "closing the connection" do
+    UNIXSocket.pair do |client, peer|
+      flooded_id = Channel(UInt32).new(1)
+      healthy_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        flooded = flooded_id.receive
+        healthy = healthy_id.receive
+        read_client_headers(io, flooded)
+        read_client_headers(io, healthy)
+
+        # stream_event_capacity is 2 and nothing ever reads from the
+        # flooded stream: the first two PRIORITY frames fill its inbound
+        # event queue, the third overflows it.
+        3.times do
+          HTTP2::Frame::Priority.new(
+            0_u8,
+            flooded,
+            Bytes[0, 0, 0, 0, 15]
+          ).write(io)
+        end
+        io.flush
+
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(flooded)
+        reset.error_code.should eq(
+          HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32
+        )
+
+        # Composition check: the RST above only reaches the wire after
+        # the writer fiber has already removed the stream from the
+        # active set and retained it as a LocalReset entry (see
+        # `apply_outbound_transition_unlocked`) — so this frame, sent
+        # only once that has been observed, exercises the existing
+        # reset-tolerant "late frame" path (absorbed, credit restored)
+        # rather than a fresh violation or a second RST.
+        HTTP2::Frame::Priority.new(
+          0_u8,
+          flooded,
+          Bytes[0, 0, 0, 0, 15]
+        ).write(io)
+
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_HEADERS |
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          healthy,
+          Bytes.empty
+        ).write(io)
+        io.flush
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        stream_event_capacity: 2
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+
+        flooded_stream = connection.new_stream
+        open_client_stream(flooded_stream)
+        healthy_stream = connection.new_stream
+        open_client_stream(healthy_stream)
+
+        flooded_id.send(flooded_stream.id)
+        healthy_id.send(healthy_stream.id)
+
+        # Wait for the peer's entire script (flood, read the RST back,
+        # send the late frame, send the healthy response) to finish
+        # before this fiber touches either stream. This is not
+        # incidental: `flooded_stream`'s inbound channel is buffered, so
+        # a receiver of this fiber's own that raced ahead and parked in
+        # `#receive` while the flood was still in flight could rendezvous
+        # directly with a send that would otherwise have overflowed the
+        # queue, silently draining it and masking the very condition this
+        # spec exists to trigger — a "parked consumer" must mean "not
+        # draining concurrently with the flood," not "actively racing
+        # it." The peer only reads the RST_STREAM back after the writer
+        # fiber has already run `apply_outbound_transition_unlocked`
+        # (which happens before that frame is even flushed), so by the
+        # time this returns, the flood's outcome — 2 buffered events, the
+        # 3rd rejected — is already settled.
+        wait_for_peer(peer_result)
+
+        # `Stream#receive` checks `terminal_error` unconditionally before
+        # ever looking at a buffered event (see `Stream#receive`'s first
+        # line) — once the stream is terminated, the two PRIORITY events
+        # that *did* fit under capacity 2 are no longer individually
+        # observable through the public API, even though they are still
+        # sitting in the channel. That is pre-existing `Stream#receive`
+        # behavior for every termination cause, not specific to this
+        # fix — asserted here as the terminal ENHANCE_YOUR_CALM error,
+        # not a third buffered frame.
+        error = expect_raises(HTTP2::ProtocolError) do
+          flooded_stream.receive(1.second)
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+
+        healthy_stream.receive(1.second).should be_a(
+          HTTP2::Connection::FieldSection
+        )
+        connection.active?.should be_true
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "terminates a stream locally, without an RST, when the closing " \
+     "event itself overflows an already-full queue" do
+    UNIXSocket.pair do |client, peer|
+      victim_id = Channel(UInt32).new(1)
+      other_id = Channel(UInt32).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        victim = victim_id.receive
+        other = other_id.receive
+        read_client_headers(io, victim)
+        read_client_headers(io, other)
+
+        # Fill the queue (capacity 2) with two ordinary PRIORITY frames,
+        # then send trailers (HEADERS+END_STREAM) as the third. `victim`
+        # is already half-closed(local) (its own HEADERS carried
+        # END_STREAM), so this closing event both overflows the queue
+        # AND is the one whose own transition removes the stream from
+        # the active set — inside `transition_and_deliver`, *before*
+        # delivery is even attempted. That is a different branch of the
+        # fix than the plain-overflow case above (where the stream was
+        # still active when the overflow was detected).
+        2.times do
+          HTTP2::Frame::Priority.new(
+            0_u8,
+            victim,
+            Bytes[0, 0, 0, 0, 15]
+          ).write(io)
+        end
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_HEADERS |
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          victim,
+          Bytes.empty
+        ).write(io)
+        io.flush
+
+        # Nothing is owed to the peer for `victim` here — RFC 9113 has no
+        # RST to send once both sides already agree a stream is done —
+        # so this response for the unrelated `other` stream is the very
+        # next thing the peer sends, with no RST_STREAM for `victim` in
+        # between.
+        HTTP2::Frame::Headers.new(
+          HTTP2::Frame::Headers::Flags::END_HEADERS |
+          HTTP2::Frame::Headers::Flags::END_STREAM,
+          other,
+          Bytes.empty
+        ).write(io)
+        io.flush
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        stream_event_capacity: 2
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+
+        victim_stream = connection.new_stream
+        open_client_stream(victim_stream)
+        other_stream = connection.new_stream
+        open_client_stream(other_stream)
+
+        victim_id.send(victim_stream.id)
+        other_id.send(other_stream.id)
+
+        wait_for_peer(peer_result)
+
+        other_stream.receive(1.second).should be_a(
+          HTTP2::Connection::FieldSection
+        )
+
+        error = expect_raises(HTTP2::ProtocolError) do
+          victim_stream.receive(1.second)
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+        connection.active?.should be_true
+      ensure
+        connection.close
+      end
     end
   end
 

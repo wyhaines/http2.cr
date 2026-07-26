@@ -452,7 +452,8 @@ describe HTTP2::Connection do
     end
   end
 
-  it "terminates instead of blocking when a stream event queue is full" do
+  it "resets a stream instead of closing the connection when its event " \
+     "queue is full" do
     UNIXSocket.pair do |client, peer|
       stream_id = Channel(UInt32).new(1)
       peer_result = scripted_peer(peer) do |io|
@@ -466,23 +467,49 @@ describe HTTP2::Connection do
             Bytes.empty
           ).write(io)
         end
+        io.flush
+
+        reset = HTTP2::Frame.read(io).as(HTTP2::Frame::ResetStream)
+        reset.stream_id.should eq(id)
+        reset.error_code.should eq(
+          HTTP2::ErrorCode::ENHANCE_YOUR_CALM.to_u32
+        )
+
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "12345678")
+        ping.write(io)
+        io.flush
+        reply = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        reply.ack?.should be_true
       end
 
       configuration = HTTP2::Connection::Configuration.new(
         stream_event_capacity: 1
       )
       connection = HTTP2::Connection.start(client, configuration)
-      connection.wait_until_active(1.second)
-      stream = connection.new_stream
-      open_client_stream(stream)
-      stream_id.send(stream.id)
+      begin
+        connection.wait_until_active(1.second)
+        stream = connection.new_stream
+        open_client_stream(stream)
+        stream_id.send(stream.id)
 
-      connection.wait_closed(1.second)
-      connection.terminal_error.should be_a(HTTP2::Connection::QueueFullError)
-      expect_raises(HTTP2::Connection::QueueFullError) do
-        stream.receive(1.second)
+        # Wait for the peer's whole script (including reading the RST
+        # back) before this fiber calls #receive — `stream`'s inbound
+        # channel is buffered, so a receiver parked here while the
+        # second HEADERS frame is still in flight could rendezvous
+        # directly with the send that is supposed to overflow the
+        # capacity-1 queue, masking the very condition under test. See
+        # the equivalent note on the PRIORITY-flood spec in
+        # connection_hardening_spec.cr for the full explanation.
+        wait_for_peer(peer_result)
+
+        error = expect_raises(HTTP2::ProtocolError) do
+          stream.receive(1.second)
+        end
+        error.error_code.should eq(HTTP2::ErrorCode::ENHANCE_YOUR_CALM)
+        connection.active?.should be_true
+      ensure
+        connection.close
       end
-      wait_for_peer(peer_result)
     end
   end
 

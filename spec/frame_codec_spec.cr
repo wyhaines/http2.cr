@@ -86,7 +86,12 @@ describe HTTP2::Frame do
     frames << HTTP2::Frame::Headers.new(
       0xff_u8,
       1_u32,
-      Bytes[0, 0, 0, 0, 1, 0]
+      # Priority dependency (bytes 1-4, PADDED puts pad length in byte 0)
+      # deliberately not 1: this frame's own stream ID is 1, and
+      # Frame::Headers#validate! now rejects a self-referential PRIORITY
+      # dependency — unrelated to what this example actually exercises
+      # (that unused/undefined flag bits are masked away).
+      Bytes[0, 0, 0, 0, 2, 0]
     )
     frames << HTTP2::Frame::Priority.new(0xff_u8, 1_u32, Bytes.new(5))
     frames << HTTP2::Frame::ResetStream.new(0xff_u8, 1_u32, Bytes.new(4))
