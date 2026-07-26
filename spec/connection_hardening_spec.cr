@@ -721,10 +721,20 @@ describe HTTP2::Connection do
         io.flush
 
         # Nothing is owed to the peer for `victim` here — RFC 9113 has no
-        # RST to send once both sides already agree a stream is done —
-        # so this response for the unrelated `other` stream is the very
-        # next thing the peer sends, with no RST_STREAM for `victim` in
-        # between.
+        # RST to send once both sides already agree a stream is done.
+        # Actually verified, not just asserted by omission: a PING sent
+        # immediately after goes through the same single, FIFO-ordered
+        # writer queue as an RST would, so if one had been sent (a
+        # regression), it would be the *next* frame read back here, and
+        # the `.as(HTTP2::Frame::Ping)` cast below would fail instead of
+        # silently passing.
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "no-rst!!")
+        ping.write(io)
+        io.flush
+        reply = HTTP2::Frame.read(io).as(HTTP2::Frame::Ping)
+        reply.ack?.should be_true
+        reply.payload.should eq(ping.payload)
+
         HTTP2::Frame::Headers.new(
           HTTP2::Frame::Headers::Flags::END_HEADERS |
           HTTP2::Frame::Headers::Flags::END_STREAM,

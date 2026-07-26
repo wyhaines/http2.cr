@@ -1675,6 +1675,35 @@ module HTTP2
         )
       end
 
+      # RFC 7540 5.3.1 (a MUST; RFC 9113 drops the requirement along
+      # with priority itself, but conformance suites such as h2spec
+      # still test it): a stream cannot depend on itself. Deliberately
+      # checked here, *after* `@decoder.decode_each` above has already
+      # run — not in `Frame::Headers#validate!`, where it would reject
+      # the frame before its field block is ever decoded. HEADERS
+      # carries a header block fragment that the peer's encoder has
+      # already committed to the shared HPACK dynamic table on send;
+      # rejecting it pre-decode leaves that table entry (and every
+      # index after it) permanently desynchronized between the two
+      # ends, corrupting every later field block on every stream, not
+      # just this one — even though the connection looks fine (this
+      # stream alone gets RST). `Frame::Priority` carries no field block
+      # and has none of this hazard, so its own check stays in
+      # `validate!` unchanged; `Frame::PushPromise#validate!` already
+      # avoids a stream-scoped error entirely for the same reason this
+      # one is deliberately placed post-decode instead.
+      if priority = block.priority
+        if priority.stream_dependency == block.stream_id
+          raise ProtocolError.new(
+            "HEADERS frame priority must not set stream " \
+            "#{block.stream_id} as its own dependency",
+            ErrorCode::PROTOCOL_ERROR,
+            ErrorScope::Stream,
+            block.stream_id
+          )
+        end
+      end
+
       FieldSection.new(block, fields, result.decoded_size)
     rescue error : HPack::ResourceLimitError
       raise ResourceLimitError.new(
@@ -1980,9 +2009,19 @@ module HTTP2
         # this stream) — RFC 9113 6.9.1's "MUST NOT allow a flow-control
         # window to exceed 2^31-1" is a validity rule on the WINDOW_UPDATE
         # itself, not conditioned on whether we still have anything left
-        # to send. Only the actual bookkeeping mutation below (which only
-        # matters for a stream that can still send) is skipped for the
-        # states this doesn't apply to.
+        # to send. Only the actual bookkeeping mutation below
+        # (`adjust_send_window`, which only matters for a stream that can
+        # still send) is skipped for the states this doesn't apply to.
+        #
+        # That skip narrows what this catches for exactly those excluded
+        # states: since `stream.send_window` is never updated while
+        # excluded, `updated` below is always this frozen baseline plus
+        # only the *current* increment, not a running cumulative total —
+        # a single increment large enough to overflow on its own is
+        # still caught, but a series of smaller increments that would
+        # only overflow once summed is not. For open/half-closed(remote)
+        # streams, where the mutation always runs, the check is
+        # genuinely cumulative.
         updated = stream.send_window + increment
         if updated > FrameHeader::MAX_STREAM_ID.to_i64
           raise ProtocolError.new(
@@ -2199,6 +2238,22 @@ module HTTP2
     # treated as a fresh violation) for free — the same path every other
     # stream-scoped error already takes.
     private def fail_overflowed_stream(stream : Stream) : Nil
+      if stream.terminal_error
+        # `Stream#deliver` returns `false` for two different reasons:
+        # the queue is genuinely full (what this method exists to
+        # handle), or the stream was already terminated for an unrelated
+        # reason by the time delivery was attempted (e.g. a concurrent
+        # `Stream#cancel`). That termination already recorded its own,
+        # correct error — this delivery attempt simply arrived too late
+        # to matter. Do nothing rather than mislabel it as a queue
+        # overflow: `Stream#terminate` is idempotent, so a second RST
+        # here would at best be redundant and at worst overwrite a
+        # correct diagnosis with an incorrect one on the wire (even
+        # though the stream's own `terminal_error` stays correct
+        # locally, since `terminate` never overwrites once set).
+        return
+      end
+
       error = ProtocolError.new(
         "stream #{stream.id} event queue reached its configured limit",
         ErrorCode::ENHANCE_YOUR_CALM,
@@ -2220,8 +2275,17 @@ module HTTP2
       # deliver must not be stranded forever: terminate the stream
       # directly instead of relying on `handle_stream_violation`, which
       # would (correctly) no-op for a stream it can no longer find.
+      #
+      # Unlike the branch above, nothing gets written to the transport
+      # here (no RST is sent), so `process_write_command`'s own
+      # post-flush `wake_drain_monitor` call never fires for this
+      # closure — wake it explicitly so a graceful drain waiting on
+      # exactly this stream (if it happened to be the last active one)
+      # notices promptly instead of idling until the next unrelated
+      # flush or the drain deadline.
       emit_error(error, stream.id)
       @mutex.synchronize { terminate_stream_unlocked(stream, error) }
+      wake_drain_monitor
     end
 
     private def resolve_inbound_transition_unlocked(

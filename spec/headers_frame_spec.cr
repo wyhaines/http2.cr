@@ -90,34 +90,4 @@ describe HTTP2::Frame::Headers do
       )
     end
   end
-
-  it "rejects a self-referential PRIORITY dependency as a stream error" do
-    expect_violation(
-      HTTP2::ErrorCode::PROTOCOL_ERROR,
-      HTTP2::ErrorScope::Stream,
-      1_u32
-    ) do
-      HTTP2::Frame::Headers.new(
-        HTTP2::Frame::Headers::Flags::PRIORITY,
-        1_u32,
-        Bytes[0, 0, 0, 1, 15]
-      )
-    end
-  end
-
-  it "accounts for padding before checking a self-referential " \
-     "PRIORITY dependency" do
-    expect_violation(
-      HTTP2::ErrorCode::PROTOCOL_ERROR,
-      HTTP2::ErrorScope::Stream,
-      1_u32
-    ) do
-      HTTP2::Frame::Headers.new(
-        HTTP2::Frame::Headers::Flags::PADDED |
-        HTTP2::Frame::Headers::Flags::PRIORITY,
-        1_u32,
-        Bytes[0, 0, 0, 0, 1, 15]
-      )
-    end
-  end
 end

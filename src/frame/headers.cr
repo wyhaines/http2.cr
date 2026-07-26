@@ -57,16 +57,6 @@ module HTTP2
     protected def validate!
       require_stream_id!("HEADERS")
       validate_padding!(priority? ? 5 : 0)
-
-      # See the matching comment in Frame::Priority#validate! — the same
-      # "cannot depend on itself" rule applies to HEADERS carrying an
-      # inline PRIORITY payload.
-      return unless priority? && stream_dependency == stream_id
-
-      stream_protocol_error!(
-        "HEADERS frame priority must not set stream #{stream_id} as " \
-        "its own dependency"
-      )
     end
   end
 end

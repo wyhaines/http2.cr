@@ -74,12 +74,11 @@ describe HTTP2::Connection do
         id = parent_id.receive
         read_client_headers(io, id)
 
-        # 9 promises before the client's own ENABLE_PUSH=0 SETTINGS is
-        # ever acknowledged (this script never sends that ACK) — one
-        # more than the configured (default 8) pre-ACK tolerance, each
-        # individually well-formed and targeting a distinct, increasing,
-        # even promised stream ID.
-        9.times do |index|
+        # Exactly the configured (default 8) pre-ACK tolerance first —
+        # the client's own ENABLE_PUSH=0 SETTINGS is never acknowledged
+        # by this script, each promise is individually well-formed and
+        # targets a distinct, increasing, even promised stream ID.
+        8.times do |index|
           HTTP2::Frame::PushPromise.new(
             HTTP2::Frame::PushPromise::Flags::END_HEADERS,
             id,
@@ -88,12 +87,35 @@ describe HTTP2::Connection do
         end
         io.flush
 
-        # The 8 promises within tolerance are each individually accepted
-        # and then immediately auto-cancelled (this library never
-        # actually consumes a push — see the "rejects a legal pre-ACK
-        # push" example above), so their RST_STREAM(CANCEL) frames
-        # interleave with the eventual GOAWAY on the wire; skip past
-        # them to the connection-level violation this example targets.
+        # Boundary checkpoint: exactly 8 must be tolerated, not treated
+        # as already one too many. A PING proves the connection is still
+        # healthy (not just "hasn't closed yet") — it round-trips only
+        # if the reader is still processing frames normally, and the 8
+        # promises within tolerance are each individually accepted and
+        # then immediately auto-cancelled (this library never actually
+        # consumes a push — see the "rejects a legal pre-ACK push"
+        # example above), so their RST_STREAM(CANCEL) frames interleave
+        # with the PING ack on the wire; skip past them.
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
+        ping.write(io)
+        io.flush
+        pong = nil
+        until pong
+          frame = HTTP2::Frame.read(io)
+          pong = frame.as?(HTTP2::Frame::Ping)
+        end
+        pong.ack?.should be_true
+        pong.payload.should eq(ping.payload)
+
+        # The 9th promise — one past tolerance — is the connection-level
+        # violation this example targets.
+        HTTP2::Frame::PushPromise.new(
+          HTTP2::Frame::PushPromise::Flags::END_HEADERS,
+          id,
+          18_u32
+        ).write(io)
+        io.flush
+
         goaway = nil
         until goaway
           frame = HTTP2::Frame.read(io)
@@ -111,6 +133,8 @@ describe HTTP2::Connection do
       connection.wait_closed(1.second)
       error = connection.terminal_error.as(HTTP2::ProtocolError)
       error.error_code.should eq(HTTP2::ErrorCode::PROTOCOL_ERROR)
+      error.message.to_s.should contain("PUSH_PROMISE")
+      error.message.to_s.should contain("8")
       wait_for_peer(peer_result)
     end
   end
