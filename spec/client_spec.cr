@@ -322,6 +322,54 @@ describe "HTTP2::Client recovery" do
       end
     end
   end
+
+  it "does not hang graceful_close on a connection with an open, " \
+     "still-streaming response" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        # Headers only, no end_stream: the response stays open, exactly
+        # like an SSE/long-poll stream the caller hasn't read yet.
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+        io.flush
+        HTTP2::Frame.read(io).should be_a(HTTP2::Frame::GoAway)
+        io.read(Bytes.new(1)).should eq(0)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+
+        started = Time.instant
+        expect_raises(HTTP2::Connection::DrainTimeoutError) do
+          http.graceful_close(300.milliseconds)
+        end
+        elapsed = Time.instant - started
+
+        # A background monitor fiber is still parked on this exact
+        # stream, waiting for trailers/remote-end, when the connection
+        # is torn down by the drain deadline -- this must resolve
+        # promptly, not hang the process (see client.cr's
+        # `#monitor_response` doc comment on the shared
+        # `Connection::TimeoutError` rescue).
+        elapsed.should be < 1.second
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
 end
 
 private def write_server_fields(
@@ -1219,6 +1267,101 @@ describe HTTP2::Client do
     end
   end
 
+  it "dials once per concurrent cold requester, but every loser " \
+     "closes its own connection so exactly one survives" do
+    server = TCPServer.new("127.0.0.1", 0)
+    concurrency = 8
+    counts_mutex = Mutex.new
+    accepted = 0
+    closed = 0
+
+    peer_result = scripted_peer(server) do |listener|
+      concurrency.times do
+        socket = listener.as(TCPServer).accept
+        counts_mutex.synchronize { accepted += 1 }
+        spawn do
+          begin
+            complete_server_handshake(socket)
+            decoder = HPack::Decoder.new
+            encoder = HPack::Encoder.new
+            loop do
+              request = client_read_field_section(socket, decoder)
+              write_server_fields(
+                socket,
+                encoder,
+                request[:stream_id],
+                [{":status", "204"}],
+                end_stream: true
+              )
+            end
+          rescue
+            # A losing dial: the client closed this socket before (or
+            # partway through) the handshake, since `#connection_for_request`
+            # decided this connection was redundant. Or, for the one
+            # survivor, the eventual `#close` at the end of this
+            # example. Either way, falls through to the `ensure` below.
+          ensure
+            counts_mutex.synchronize { closed += 1 }
+          end
+        end
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "http://127.0.0.1:#{server.local_address.port}",
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 2.seconds,
+        read: 2.seconds,
+        write: 2.seconds
+      )
+    )
+    begin
+      # Spawned back-to-back, with no blocking call in between, so the
+      # scheduler does not run any of them until every one of these
+      # `concurrency` fibers is already enqueued -- each independently
+      # observes `@connection` as nil/unusable and dials, exactly the
+      # race `#connection_for_request`'s doc comment describes.
+      results = Channel(Exception?).new(concurrency)
+      concurrency.times do |i|
+        spawn do
+          http.get("/#{i}").status.should eq(204)
+          results.send(nil)
+        rescue error
+          results.send(error)
+        end
+      end
+      concurrency.times do
+        error = results.receive
+        raise error if error
+      end
+
+      eventually(message: "server never accepted #{concurrency} connections") do
+        counts_mutex.synchronize { accepted } == concurrency
+      end
+      # All `concurrency` requests already completed successfully above,
+      # which -- since every loser is discarded before ever being handed
+      # to a caller -- could only happen by all of them sharing the SAME
+      # one surviving connection. The other `concurrency - 1` are
+      # therefore already closed by their losing fibers by this point,
+      # independent of the `#close` below.
+      eventually(
+        message: "expected exactly #{concurrency - 1} losing " \
+                 "connections closed before #close"
+      ) do
+        counts_mutex.synchronize { closed } == concurrency - 1
+      end
+
+      http.close
+      eventually(message: "the surviving connection never closed") do
+        counts_mutex.synchronize { closed } == concurrency
+      end
+      wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close
+    end
+  end
+
   it "collects informational responses before the final response" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|
@@ -1920,6 +2063,54 @@ describe HTTP2::Client do
         finish.send(nil)
         response.body.gets_to_end.should eq("")
         response.trailers.should be_empty
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  # `Connection::KeepaliveTimeoutError` and `Connection::DrainTimeoutError`
+  # (see the graceful_close spec above) share one ancestor,
+  # `Connection::TimeoutError`, and so share the exact same rescue branch
+  # in `#monitor_response` -- this pins the OTHER subclass reaching that
+  # branch behaves the same way (fails the response promptly with the
+  # connection's own terminal error) rather than assuming coverage of one
+  # implies the other.
+  it "fails an open response with the connection's own " \
+     "KeepaliveTimeoutError, instead of hanging, when a keepalive PING " \
+     "goes unanswered" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+        io.flush
+        HTTP2::Frame.read(io).should be_a(HTTP2::Frame::Ping)
+        io.read(Bytes.new(1)).should eq(0)
+      end
+
+      configuration = HTTP2::Connection::Configuration.new(
+        keepalive_interval: 20.milliseconds,
+        keepalive_timeout: 20.milliseconds
+      )
+      connection = HTTP2::Connection.start(client_io, configuration)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+
+        expect_raises(HTTP2::Connection::KeepaliveTimeoutError) do
+          response.trailers(2.seconds)
+        end
         wait_for_peer(peer_result)
       ensure
         http.close

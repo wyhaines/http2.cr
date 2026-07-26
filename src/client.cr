@@ -636,15 +636,29 @@ module HTTP2
     # That split means two fibers can legitimately decide to dial at the
     # same time (both saw `@connection` as nil/unusable before either had
     # dialed). Both dial in full, unlocked; whichever RE-ACQUIRES `@mutex`
-    # first publishes its connection to `@connection` and wins. The loser
-    # re-checks `@connection` under the lock, finds the winner's
-    # connection already there, closes its own now-redundant one (never
-    # handed to any caller, so this is the only reference to it), and
-    # returns the winner's connection instead — first-wins, and the
-    # loser's dial never leaks a socket. The same re-check catches a
-    # `#close` that landed while this fiber was dialing: `@closed` is
-    # rechecked too, and a late-arriving dial is closed immediately
-    # rather than published.
+    # first publishes its connection to `@connection` and wins — UNLESS
+    # the winner's connection has ALREADY gone closed/draining by the
+    # time a slower dialer checks (a real window: the loser's dial can
+    # take arbitrarily longer than the winner's), in which case the
+    # slower dialer retires it exactly as the fast path above would and
+    # promotes ITS OWN freshly-dialed connection instead, rather than
+    # hand back a connection that would immediately fail
+    # `#wait_until_active`/raise on first use. A dial that turns out to
+    # be redundant (a genuine loser, or one that arrives after `#close`)
+    # is closed AFTER releasing `@mutex` — `Connection#close` joins
+    # several background fibers with no timeout, so closing it while
+    # still holding `@mutex` could wedge `#close`/`#closed?`/every other
+    # request behind a stuck teardown, exactly the failure mode this
+    # whole split exists to avoid.
+    #
+    # Concurrent cold dials are the one cost of this: N simultaneous
+    # requests against an idle client each perform their own full dial
+    # (N TCP connects, N TLS handshakes for `https`) before N-1 are
+    # discarded, where a fully-serialized dial would perform exactly
+    # one. Not addressed here — a "dial in progress, wait for it"
+    # latch would trade this for a different set of tradeoffs and is a
+    # candidate for a follow-up if the extra dials prove costly in
+    # practice.
     private def connection_for_request : Connection
       @mutex.synchronize do
         raise ClosedError.new("HTTP/2 client is closed") if @closed
@@ -665,19 +679,43 @@ module HTTP2
         end
       end
 
-      dialed = dial
-      @mutex.synchronize do
-        if @closed
-          dialed.close
-          raise ClosedError.new("HTTP/2 client is closed")
-        end
-        if current = @connection
-          dialed.close
-          next current
-        end
+      publish_dialed_connection(dial)
+    end
 
-        @connection = dialed
+    # Publishes a freshly-dialed connection as `@connection`, UNLESS
+    # either `#close` landed, or another fiber's dial already won, while
+    # this one was in flight — see `#connection_for_request`'s doc
+    # comment for the full race. `dialed` is closed AFTER `@mutex` is
+    # released whenever it turns out to be redundant (a genuine loser,
+    # or one arriving after `#close`): `Connection#close` joins several
+    # background fibers with no timeout, so closing it while still
+    # holding `@mutex` could wedge `#close`/`#closed?`/every other
+    # request behind a stuck teardown.
+    private def publish_dialed_connection(dialed : Connection) : Connection
+      redundant = nil
+      begin
+        @mutex.synchronize do
+          if @closed
+            redundant = dialed
+            raise ClosedError.new("HTTP/2 client is closed")
+          end
+
+          current = @connection
+          if current && connection_still_usable?(current)
+            redundant = dialed
+            next current
+          end
+
+          @retired_connections << current if current && !current.closed?
+          @connection = dialed
+        end
+      ensure
+        redundant.try(&.close)
       end
+    end
+
+    private def connection_still_usable?(connection : Connection) : Bool
+      !connection.closed? && !connection.draining?
     end
 
     private def ready_connection : Connection
@@ -1307,6 +1345,33 @@ module HTTP2
                 idle
               )
             rescue Connection::TimeoutError
+              # `Connection::TimeoutError` covers two DIFFERENT
+              # situations that share nothing but a common ancestor:
+              # (1) the wait itself timed out (`idle` elapsed) while
+              # the stream is still perfectly healthy -- the case the
+              # buffered-bytes check below exists for, where looping
+              # back to wait again is exactly the intended "never
+              # killed merely for going quiet" behavior; and (2) the
+              # STREAM has been terminated for a reason unrelated to
+              # this wait (e.g. `Connection::DrainTimeoutError` from
+              # `#graceful_close`, or `Connection::KeepaliveTimeoutError`
+              # from a dead peer) that HAPPENS to subclass
+              # `Connection::TimeoutError` too, surfaced here via
+              # `Stream#raise_terminal!`. Looping back in case (2) does
+              # NOT wait again -- `@terminal_signal` is already and
+              # permanently closed, so the next `#receive_until_remote_end`
+              # call raises the identical error immediately, with no
+              # blocking operation in between: an infinite, non-yielding
+              # loop that starves every other fiber in the process (not
+              # merely this request). `stream.terminal_error` is the
+              # authoritative signal distinguishing the two: only
+              # `raise_terminal!` (case 2) sets it before raising; a bare
+              # wait timeout (case 1) never does.
+              if terminal = stream.terminal_error
+                metadata.fail(terminal)
+                break
+              end
+
               consumed_now = stream.body.consumed_bytes
               if consumed_now != consumed_at_last_check
                 consumed_at_last_check = consumed_now
