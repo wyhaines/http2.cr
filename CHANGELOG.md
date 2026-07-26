@@ -117,7 +117,8 @@ All notable changes are recorded here. This project follows
   a write-stalled transport can no longer park the reader mid-violation.
 - `Connection::Configuration` now rejects a `max_retained_closed_streams`
   large enough to overflow its own internal 4x hard cap (`ArgumentError` at
-  construction) instead of risking silent `Int32` wraparound.
+  construction) instead of letting that multiplication raise `OverflowError`
+  the first time a stream closes.
 - Fixed `Client#graceful_close` busy-looping indefinitely (pinning a CPU
   core at ~100% and starving every fiber in the process, not just the one
   request) instead of returning, when a response body was still open and
@@ -166,13 +167,13 @@ All notable changes are recorded here. This project follows
 - Narrowed the `OpenSSL::SSL::Error` rescue around TLS connection setup to
   the handshake construction itself, so it can no longer swallow an
   unrelated error raised later in the same method.
-- `HTTP::Headers` field names converted via the interop constructor are
-  downcased (RFC 9110 §5.1 case-insensitivity vs. RFC 9113 §8.2.1's
-  lowercase-wire requirement) — including the four sensitive header names,
-  so a mixed-case `Authorization` (etc.) supplied that way now correctly
-  gets HPACK's never-indexed wire form instead of the ordinary
-  without-indexing form. Native `HTTP2::Headers` construction is unchanged
-  and still rejects uppercase field names outright.
+- `HTTP::Headers` field names converted via the interop constructor
+  (`Headers.new(HTTP::Headers)`) are now downcased (RFC 9110 §5.1
+  case-insensitivity vs. RFC 9113 §8.2.1's lowercase-wire requirement)
+  instead of being rejected outright by outbound field-name validation the
+  first time a mixed-case name (`Authorization`, `Content-Type`, etc.) was
+  used this way. Native `HTTP2::Headers` construction (hash literals,
+  `#add`, `#[]=`) is unchanged and still rejects uppercase field names.
 
 ## 1.0.0-rc.1 — 2026-07-24
 
