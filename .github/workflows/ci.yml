@@ -6,6 +6,7 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,18 +15,43 @@ jobs:
   test:
     name: Crystal ${{ matrix.crystal }}
     runs-on: ubuntu-latest
+    # Only the "latest" lane is allowed to fail: it tracks the newest Crystal
+    # release as a canary and must never block the required 1.20.0/1.21.0 legs
+    # or make the workflow's overall conclusion look green when they fail.
+    continue-on-error: ${{ matrix.crystal == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
         crystal:
           - 1.20.0
           - 1.21.0
+          - latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: crystal-lang/install-crystal@v1
+        id: install_crystal
         with:
           crystal: ${{ matrix.crystal }}
+
+      - name: Cache shards dependencies and Ameba binary
+        id: shards-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            lib
+            bin/ameba
+          # Keyed on the resolved Crystal version (not the "latest" alias) so a
+          # canary-lane cache never survives an actual Crystal release bump, and
+          # on shard.yml's hash. shard.lock is gitignored (not committed) here,
+          # so `shards install` always re-resolves from scratch regardless of
+          # this cache: dependencies without a lock file are re-resolved against
+          # the upstream refs every run (verified empirically), so a stale
+          # restored lib/ self-corrects instead of masking a newer resolution
+          # (e.g. hpack's `~> 1.3.0` picking up a future 1.3.x patch release).
+          key: ${{ runner.os }}-shards-${{ steps.install_crystal.outputs.crystal }}-${{ hashFiles('shard.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-shards-${{ steps.install_crystal.outputs.crystal }}-
 
       - name: Install dependencies
         run: shards install
@@ -35,6 +61,10 @@ jobs:
           sudo apt-get install --yes nghttp2-server
           nghttpd --version
       - name: Build Ameba
+        # Safe to skip on an exact cache hit: the key already covers the
+        # resolved Crystal version and shard.yml (which pins Ameba's commit),
+        # the only two inputs that affect the compiled binary's correctness.
+        if: steps.shards-cache.outputs.cache-hit != 'true'
         run: shards build ameba -Dpreview_mt
       - name: Check formatting
         run: crystal tool format --check
@@ -53,3 +83,10 @@ jobs:
       - name: Build documentation
         if: matrix.crystal == '1.21.0'
         run: crystal docs
+      - name: Upload documentation artifact
+        if: matrix.crystal == '1.21.0'
+        uses: actions/upload-artifact@v6
+        with:
+          name: docs
+          path: docs/
+          if-no-files-found: error
