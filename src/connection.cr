@@ -27,8 +27,15 @@ module HTTP2
     # connection is a TLS one; `nil` for every other constructor (cleartext,
     # or a caller-supplied `@transport` via `.start`). `#close_transport`
     # closes this directly instead of routing a force-close through the TLS
-    # wrapper's own `#close` — see `#close_transport` for why.
-    property tls_raw_transport : IO?
+    # wrapper's own `#close` — see `#close_transport` for why. The setter
+    # is `protected`, not public: it exists only for `self.start_tls` (a
+    # class method of this same type, which `protected` permits) to
+    # record the raw socket at construction time. Nothing outside this
+    # class has a legitimate reason to reassign it after the fact, and a
+    # `property` here would put a public setter on the 1.0 API for no
+    # benefit.
+    getter tls_raw_transport : IO?
+    protected setter tls_raw_transport : IO?
 
     @state = State::New
     @terminal_error : Exception?
@@ -87,7 +94,6 @@ module HTTP2
     @flow_control_wakeup = Channel(Nil).new(1)
     @pending_data = {} of UInt32 => Deque(WriteCommand)
     @data_schedule = Deque(UInt32).new
-    @pending_data_count = 0
     @field_blocks : FieldBlockAssembler
     @inbound_frame_rate_limiter : InboundFrameRateLimiter
     @encoder : HPack::Encoder
@@ -398,6 +404,21 @@ module HTTP2
         end
       end
 
+      # Unlike the reader-start `unless @state.closed?` guard below, this
+      # grant needs no closed-state check of its own — not because
+      # nothing could have closed the connection by this point (under
+      # `-Dpreview_mt` the writer/transport-closer fibers just spawned
+      # above run concurrently with this method, so that is not a safe
+      # assumption to make on scheduling grounds alone), but because
+      # queuing credit on an already-closing connection is harmless
+      # either way: `queue_connection_credit_unlocked` just increments a
+      # counter nothing will ever read again, and `wake_flow_control`
+      # already tolerates a closed `@flow_control_wakeup` channel (see
+      # its own `rescue Channel::ClosedError`). The reader-start guard
+      # below exists for a different reason — to avoid spawning a new
+      # fiber at all once `initial_command.wait`'s `rescue` has already
+      # torn the connection down — not because skipping it here would be
+      # unsafe.
       delta = @configuration.connection_receive_window.to_i64 -
               SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
       if delta > 0
@@ -521,6 +542,20 @@ module HTTP2
             "new streams require a handshaking or active connection"
           )
         end
+        # Counts every registered stream regardless of state — idle,
+        # active, or reserved — not just ones this admission bound is
+        # meant to police. That includes a narrow, bounded case of
+        # terminated-stream orphans: a pushed stream this connection
+        # already auto-rejects (`reject_push_promise`/
+        # `cancel_rejected_promise`) or a stream failing a reader-detected
+        # protocol violation (`handle_stream_violation`) is RST via
+        # `#send_reset_nowait`, which enqueues the reset and returns
+        # immediately rather than waiting for the writer to apply it —
+        # so the doomed stream still counts here until that queued RST is
+        # actually processed. Caller-initiated closes (`Stream#cancel`/
+        # `#close`) do not have this gap: they block on `#send_reset`'s
+        # `#submit`, so by the time that call returns the entry is
+        # already gone.
         if @streams.size >= @configuration.max_open_streams
           raise OpenStreamLimitError.new(@configuration.max_open_streams)
         end
@@ -940,8 +975,8 @@ module HTTP2
     def release_receive_credit(stream_id : UInt32, amount : Int32) : Nil
       return if amount <= 0
 
-      wake, replenished = @mutex.synchronize do
-        next {false, false} if @state.closed?
+      replenished = @mutex.synchronize do
+        next false if @state.closed?
 
         queue_connection_credit_unlocked(amount.to_i64)
         if stream = @streams[stream_id]?
@@ -951,9 +986,9 @@ module HTTP2
               (@pending_stream_window_updates[stream_id]? || 0_i64) + amount
           end
         end
-        {true, replenishment_due_unlocked?(stream_id)}
+        replenishment_due_unlocked?(stream_id)
       end
-      wake_flow_control if wake && replenished
+      wake_flow_control if replenished
     end
 
     private def submit(command : WriteCommand) : Nil
@@ -1345,7 +1380,6 @@ module HTTP2
         @data_schedule << block.stream_id
       end
       queue << command
-      @pending_data_count += 1
     end
 
     private def next_scheduled_data_frame : Tuple(WriteCommand, Frame::Data)?
@@ -1357,7 +1391,6 @@ module HTTP2
 
         if error = data_command_error(command)
           queue.shift.complete(error)
-          @pending_data_count -= 1
           retain_data_stream(stream_id, queue)
           next
         end
@@ -1366,7 +1399,6 @@ module HTTP2
           frame = plan_scheduled_data_frame(command)
         rescue error
           queue.shift.complete(error)
-          @pending_data_count -= 1
           retain_data_stream(stream_id, queue)
           next
         end
@@ -1501,7 +1533,6 @@ module HTTP2
       queue = @pending_data[stream_id]
       if block.complete?
         queue.shift
-        @pending_data_count -= 1
         command.complete
       end
       retain_data_stream(stream_id, queue)
@@ -1524,7 +1555,6 @@ module HTTP2
       end
       @pending_data.clear
       @data_schedule.clear
-      @pending_data_count = 0
     end
 
     private def take_pending_window_updates : Array(Frames)?
@@ -2075,11 +2105,21 @@ module HTTP2
         release_receive_credit(stream.id, overhead) if overhead > 0
         if frame.end_stream?
           stream.finish_body
-          # The peer will send no more DATA on this stream, so whatever
-          # credit is still pending (this stream's, and any connection
-          # credit accumulated alongside it) has no further reads left to
-          # coalesce with — flush it now instead of waiting on a watermark
-          # that this stream can no longer help cross.
+          # END_STREAM: the peer will send no more DATA on this stream, so
+          # this stream's own reads can never accumulate further credit to
+          # cross `replenishment_due_unlocked?`'s watermark on their own.
+          # Wake the writer now instead: `take_pending_window_updates`
+          # flushes whatever CONNECTION-scope credit is pending (and any
+          # OTHER stream's, if that one is still `open?`/
+          # `half_closed_local?`), rather than leaving it stranded behind
+          # a watermark this stream can no longer help cross. This
+          # stream's OWN pending stream-scope credit, if it had any, is
+          # silently dropped here instead — by this point `stream.state`
+          # is `half_closed_remote?` or `closed?`, and
+          # `take_pending_window_updates` only ever sends stream-scope
+          # credit for `open?`/`half_closed_local?` streams — which is
+          # fine: a stream that will never receive more DATA has no
+          # future use for a WINDOW_UPDATE of its own anyway.
           wake_flow_control
         end
         wake_drain_monitor if stream.closed?
@@ -2171,6 +2211,18 @@ module HTTP2
       )
     end
 
+    # Unlike `#release_receive_credit`, this wakes the writer
+    # UNCONDITIONALLY (no `replenishment_due_unlocked?` watermark check).
+    # That eagerness is intentional, not an oversight: discarded credit
+    # comes from a stream that just reset, terminated, or otherwise
+    # stopped receiving DATA, so there may be no future read left to
+    # accumulate further credit and eventually cross the watermark on its
+    # own — waiting for one would mean never flushing at all. Specs
+    # depend on this: e.g. "retains a reset-tolerant closed stream past
+    # the count limit for late DATA" and "tolerates DATA that arrives
+    # after a peer RST_STREAM" both assert a prompt WINDOW_UPDATE after
+    # a single late frame's worth of discarded credit (4 bytes) — far
+    # below the half-window watermark a gated wake would require.
     private def release_discarded_connection_credit(amount : Int64) : Nil
       return if amount <= 0
 
@@ -2230,9 +2282,15 @@ module HTTP2
       if section = event.as?(FieldSection)
         if section.end_stream?
           stream.finish_body
-          # See the matching comment in `handle_inbound_data`: no more DATA
-          # can follow END_STREAM on this stream, so flush now rather than
-          # waiting on a watermark this stream can no longer help cross.
+          # END_STREAM (here, on a HEADERS/trailer field section rather
+          # than DATA) — see the matching comment in `handle_inbound_data`
+          # for the full reasoning, including why this wake flushes only
+          # CONNECTION-scope (and other-stream) credit: by this point
+          # `stream.state` is `half_closed_remote?`/`closed?`, so
+          # `take_pending_window_updates` silently drops rather than
+          # sends this stream's own pending stream-scope credit, if it
+          # had any — harmless, since this stream will never receive
+          # more DATA to need a WINDOW_UPDATE for anyway.
           wake_flow_control
         end
       end
@@ -2378,8 +2436,19 @@ module HTTP2
       error = StreamResetError.new(frame.stream_id, frame.error_code)
       emit_error(error, frame.stream_id, frame.error_code)
       discarded = stream.terminate(error)
+      # `release_discarded_connection_credit` already wakes the writer
+      # itself whenever it actually queues credit (`discarded > 0`), so
+      # the second, unconditional `wake_flow_control` this line used to
+      # have was a no-op in that case. It is NOT a no-op when `discarded`
+      # is 0 — `Stream#terminate` returns 0 whenever the body is already
+      # finished or has nothing buffered, the common case for a reset
+      # that lands before or between DATA frames — but the residual
+      # effect of dropping it there is only a deferral, not a loss: any
+      # OTHER stream's already-pending sub-watermark credit this reset
+      # would have opportunistically nudged early still flushes once its
+      # own half-window watermark is crossed, or at the next writer wake
+      # for any other reason.
       release_discarded_connection_credit(discarded.to_i64)
-      wake_flow_control
       wake_drain_monitor
     end
 
@@ -2730,17 +2799,33 @@ module HTTP2
     # `.start_tls` dialed, before TLS wrapping) directly, forcing the
     # underlying `send(2)`/`close(2)` to unwind promptly, and deliberately
     # does **not** additionally invoke anything on the TLS wrapper
-    # (`@transport`) itself: once the raw socket is closed,
-    # `SSL_shutdown`'s write would hit the wrapper's BIO callback
-    # (`openssl/bio.cr`'s `write_ex`/`write`, which call `bio.io.write`
-    # with no rescue at all), which would raise on the now-closed IO from
-    # inside a callback invoked by OpenSSL's C code — unsafe to attempt
-    # deliberately. The TLS wrapper's own `@ssl` handle is still freed
-    # (via `OpenSSL::SSL::Socket#finalize`, `LibSSL.ssl_free`, the same
-    # backstop Crystal's own `Socket#finalize` relies on) once this
-    # `Connection` is garbage-collected; skipping the close_notify
-    # handshake matches `#close`'s own documented, forceful semantics
-    # ("idempotently terminates the runtime"), not `#graceful_close`'s.
+    # (`@transport`) itself — not because doing so would be unsafe (it
+    # isn't: measured directly, calling `#close` on the wrapper after the
+    # raw socket is already closed underneath it returns normally in
+    # well under a millisecond. `openssl/bio.cr`'s `write_ex`/`write`
+    # call `bio.io.write` with no rescue of their own, so an `IO::Error`
+    # from the now-closed raw IO unwinds straight out through the
+    # libssl/libcrypto C frames that invoked that callback — ordinary
+    # Crystal exception propagation works through a callback frame
+    # regardless of who called it — and lands in
+    # `OpenSSL::SSL::Socket#unbuffered_close`'s own `rescue IO::Error`,
+    # exactly the way `IO::TimeoutError` already unwinds out of
+    # `SSL_connect`'s BIO *read* callback for
+    # `spec/connection_tls_spec.cr`'s own `handshake_read_timeout` spec)
+    # — but because it would accomplish nothing: `unbuffered_close`
+    # never calls `LibSSL.ssl_free` — that
+    # only happens in `OpenSSL::SSL::Socket#finalize` and the two
+    # handshake-failure `rescue` blocks in `openssl/ssl/socket.cr`, none
+    # of which this call would reach. The wrapper's `@ssl` handle is
+    # freed identically either way, once this `Connection` is garbage-
+    # collected, whether or not `@transport`'s own `#close` ever runs.
+    # All invoking it here would do is attempt one more close_notify
+    # write and an fd-close against a raw socket that is already gone —
+    # reaching no one, freeing nothing. (This applies equally whether
+    # `close_transport` was reached via `#close` or via a completed or
+    # timed-out `#graceful_close` — both funnel through `#terminate`
+    # here, so there is no forceful-vs-graceful distinction left to draw
+    # at this point.)
     private def close_transport : Nil
       if raw = @tls_raw_transport
         close_io_discarding_buffer(raw)

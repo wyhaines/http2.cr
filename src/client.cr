@@ -573,20 +573,40 @@ module HTTP2
     # Matches only the two BARE error classes the skip/rare-race paths
     # actually raise — `error.class ==`, not `#is_a?`, deliberately, so
     # every SUBCLASS is excluded: a `DrainingError` (`< InvalidStateError`),
-    # a genuinely closed/draining connection's `ClosedError` (from
-    # `Connection#terminate`), a peer GOAWAY (`UnprocessedStreamError`),
-    # an explicit cancel (`CanceledError`), a peer reset
-    # (`StreamResetError`), or a drain timeout (`DrainedError`) must all
-    # still propagate untouched — reallocating into any of those would
-    # spin against a connection that will accept no further streams.
-    # (Verified: every one of those subclasses already coincides with
-    # `connection.closed?` or `connection.draining?` being true by the
-    # time a waiter observes it — GOAWAY sets `Draining` before it ever
-    # touches a stream's terminal error, `Connection#terminate` sets
-    # `Closed` before any stream sees its error — so the connection-state
-    # check below is redundant with the exact-class check for those
-    # specific cases, not a substitute for it: relying on either signal
-    # alone was the wrong tradeoff, so both stay.)
+    # a peer GOAWAY (`UnprocessedStreamError`), an explicit cancel
+    # (`CanceledError`), a peer reset (`StreamResetError`), or a
+    # successfully completed drain (`DrainedError` — despite the name,
+    # NOT the timeout case; `DrainTimeoutError < TimeoutError` isn't
+    # reachable here at all, since it isn't a `ClosedError`/
+    # `InvalidStateError` subclass in the first place) must all still
+    # propagate untouched — reallocating into any of those would spin
+    # against a connection that will accept no further streams, or (for
+    # `CanceledError`/`StreamResetError`, which can occur on an
+    # otherwise perfectly live connection) simply retry a request that
+    # was already explicitly torn down.
+    #
+    # The connection-state check below is not simply a belt-and-
+    # suspenders duplicate of the exact-class check above: `error.class
+    # ==` cannot, on its own, tell a genuine skip's
+    # `ClosedError` (from `plan_skipped_local_streams_unlocked`) apart
+    # from `Connection#terminate`'s own bare `ClosedError` — e.g.
+    # `#close`'s `ClosedError.new("HTTP/2 connection closed")` — both are
+    # the identical class. Nor can the trailing
+    # `connection.stream?(current.id).nil?` check: `#terminate` clears
+    # `@streams` entirely BEFORE terminating each remaining stream, the
+    # same order a genuine skip uses, so a waiter's own stream looks
+    # exactly as "no longer registered" either way. `connection.closed?`
+    # (set by `#terminate` before any of that) is what actually tells
+    # them apart. `DrainingError` and `UnprocessedStreamError` similarly
+    # coincide with `connection.draining?` (set before either is ever
+    # raised), and `DrainedError` with `connection.closed?` (set by the
+    # same `#terminate` call that raises it) — but all three are ALSO
+    # distinct subclasses the exact-class check alone already excludes
+    # on its own, so the state check is genuinely redundant, not
+    # load-bearing, for those three specifically. Excluding them a
+    # second, independent way anyway is deliberate defense in depth for
+    # the ONE case above where it is not redundant, not evidence that
+    # either check could safely be dropped.
     private def recoverable_stream_skip?(
       connection : Connection,
       current : Stream,

@@ -155,9 +155,13 @@ on this connection") — and recovers by reserving a fresh stream and
 retrying within the same `stream_slot` budget. That recovery races the
 other opener too, so under sustained multi-opener contention `request`
 is not guaranteed to win eventually; it is guaranteed to never hang and
-to always either succeed or raise `Connection::ConcurrentStreamLimitError`
-once its own budget is exhausted. A single `Client` per `Connection`
-never encounters this at all.
+to always either succeed or raise once its own `stream_slot` budget is
+exhausted — the error raised is whichever one the exhausting attempt
+itself hit (`Connection::ConcurrentStreamLimitError` if it was still
+waiting for a slot; `Connection::ClosedError` or
+`Connection::InvalidStateError` if it was mid-recovery from a skip),
+not necessarily the former. A single `Client` per `Connection` never
+encounters this at all.
 
 A `Response` the caller abandons — never reads, never closes — would
 otherwise hold its stream and connection-window credit open forever,

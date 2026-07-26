@@ -33,9 +33,10 @@ module HTTP2
       # section limit), so even a maximally degenerate all-empty-valued
       # section already fits roughly 65_536 / 32 = 2_048 fields under the
       # ~64 KiB `max_decoded_field_section_size` default *regardless* of
-      # this setting — a peer could already force that many small
-      # allocations through a handful of large-valued fields totaling
-      # close to the byte cap. This getter's default (1_024) stays
+      # this setting — the byte cap alone already lets a peer reach that
+      # many fields, as long as each one stays near the fixed 32-byte
+      # floor; it takes many SMALL fields to get there, not a few
+      # large-valued ones. This getter's default (1_024) stays
       # comfortably under that implicit ~2_048 ceiling, not above it —
       # it does not, by itself, keep a large field count out; it only
       # avoids rejecting a legitimate, unusually field-heavy request
@@ -181,6 +182,17 @@ module HTTP2
         if @max_retained_closed_streams <= 0
           raise ArgumentError.new(
             "maximum retained closed-stream count must be positive"
+          )
+        end
+        # `Connection#retain_closed_stream_unlocked` multiplies this by 4
+        # to get its hard eviction cap; reject anything that would
+        # overflow `Int32` there instead of letting that multiplication
+        # raise `OverflowError` deep inside a hot path the first time a
+        # stream closes.
+        if @max_retained_closed_streams > Int32::MAX // 4
+          raise ArgumentError.new(
+            "maximum retained closed-stream count must leave room for " \
+            "the internal 4x hard cap (<= #{Int32::MAX // 4})"
           )
         end
         if @max_buffered_body_bytes <= 0

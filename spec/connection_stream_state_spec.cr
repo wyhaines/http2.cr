@@ -532,6 +532,79 @@ describe HTTP2::Connection do
     end
   end
 
+  it "evicts a non-tolerant closed stream once churn pushes retained " \
+     "metadata past the soft limit" do
+    UNIXSocket.pair do |client, peer|
+      churn_ids = Channel(Array(UInt32)).new(1)
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        ids = churn_ids.receive
+        ids.each do |churn_id|
+          read_client_headers(io, churn_id)
+          HTTP2::Frame::Headers.new(
+            HTTP2::Frame::Headers::Flags::END_HEADERS |
+            HTTP2::Frame::Headers::Flags::END_STREAM,
+            churn_id,
+            Bytes.empty
+          ).write(io)
+        end
+        io.flush
+
+        ping = HTTP2::Frame::Ping.new(0_u8, 0_u32, "still-ok")
+        ping.write(io)
+        io.flush
+        HTTP2::Frame.read(io).as(HTTP2::Frame::Ping).ack?.should be_true
+      end
+
+      # Every closure here is a clean, bidirectional END_STREAM (reason
+      # EndStream), which does NOT tolerate late frames -- unlike the
+      # LocalReset closures in the two retention examples above. With a
+      # limit of 2 (hard cap 8), the 3rd closure pushes the retained
+      # order's size to 3 -- over the soft limit but nowhere near the
+      # hard cap -- so `retain_closed_stream_unlocked`'s FIFO head must
+      # be evicted immediately instead of protected: this is the one
+      # case the age-aware protection above does NOT cover, and exactly
+      # what a `break if size <= hard_cap` regression (dropping the
+      # tolerant-entry check from that method's break condition
+      # entirely) would silently stop doing -- the two examples above
+      # never catch that regression, since their own hard-cap arithmetic
+      # happens to agree with it either way.
+      configuration = HTTP2::Connection::Configuration.new(
+        max_retained_closed_streams: 2
+      )
+      connection = HTTP2::Connection.start(client, configuration)
+      begin
+        connection.wait_until_active(1.second)
+        churn = (0...3).map do
+          stream = connection.new_stream
+          open_client_stream(stream)
+          stream
+        end
+        churn_ids.send(churn.map(&.id))
+
+        wait_for_peer(peer_result)
+        connection.active?.should be_true
+        connection.retained_closed_stream_count.should eq(2)
+      ensure
+        connection.close
+      end
+    end
+  end
+
+  it "rejects a max_retained_closed_streams that would overflow the " \
+     "internal 4x hard cap" do
+    expect_raises(ArgumentError, /max_retained_closed_streams|hard cap/) do
+      HTTP2::Connection::Configuration.new(
+        max_retained_closed_streams: (Int32::MAX // 4) + 1
+      )
+    end
+
+    # The boundary value itself (exactly at the ceiling) stays valid.
+    HTTP2::Connection::Configuration.new(
+      max_retained_closed_streams: Int32::MAX // 4
+    )
+  end
+
   it "tolerates DATA that arrives after a peer RST_STREAM (RFC 9113 " \
      "5.1)" do
     UNIXSocket.pair do |client, peer|

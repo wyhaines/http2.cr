@@ -100,6 +100,35 @@ class GateClosingConnection < HTTP2::Connection
   end
 end
 
+# Test-only: drives `#send_headers_awaiting_slot` directly, bypassing
+# `#request`/`#get` entirely. `#send_headers_awaiting_slot` is `private`,
+# but Crystal's privacy only forbids an explicit receiver -- a subclass
+# method can still call it, unqualified, on its own implicit `self`.
+#
+# This exists to reproduce the "shared connection's other opener wins and
+# skips it" recovery race WITHOUT any actual race: construct the skip
+# first (open a higher-ID stream while a lower one sits idle, which
+# synchronously and eagerly marks the lower one's terminal error, per
+# `Connection#plan_skipped_local_streams_unlocked`), THEN call this
+# directly on the already-skipped stream, all from one fiber. There is no
+# second opener to race against and nothing to wait on, so this is
+# 100% deterministic under both schedulers -- see the example below.
+class StreamSlotRetryProbe < HTTP2::Client
+  def probe_send_headers_awaiting_slot(
+    connection : HTTP2::Connection,
+    stream : HTTP2::Stream,
+  ) : HTTP2::Stream
+    send_headers_awaiting_slot(
+      connection,
+      stream,
+      "GET",
+      [] of HTTP2::HeaderField,
+      true,
+      nil
+    )
+  end
+end
+
 describe "HTTP2::Client recovery" do
   it "replays a proven-unprocessed owned POST only when explicitly allowed" do
     server = TCPServer.new("127.0.0.1", 0)
@@ -1054,15 +1083,20 @@ describe HTTP2::Client do
   # parallel scheduling, not a bug in the fix (see the task report for
   # the full methodology and the other constructions tried). Per the
   # plan's "any -Dpreview_mt flake: stop and investigate" constraint,
-  # this example only runs under the default scheduler; the recovery
-  # code path it exercises is ALSO covered, deterministically under
-  # both schedulers, by connection_stream_state_spec.cr's extended
-  # "closes lower idle streams when a higher ID opens" example, which
-  # pins the exact `Connection::ClosedError` shape `#send_headers`
-  # raises for a skipped stream without depending on any live race.
-  {% if flag?(:preview_mt) %}
-    pending "recovers a stream_slot wait after a shared connection's other opener wins and skips it (skipped under -Dpreview_mt: not reproducible without a live scheduler race — see comment above and the task report)"
-  {% else %}
+  # this INTEGRATION-level example — driven through the public
+  # `#request` API, with two independently scheduled fibers genuinely
+  # racing for the freed slot — only runs under the default scheduler.
+  # The recovery LOGIC it exercises is separately covered,
+  # deterministically under BOTH schedulers and with no race at all
+  # (single fiber, no waiting), by "recovers a stream_slot wait after a
+  # shared connection's other opener wins and skips it (deterministic
+  # construction)" below, which drives `#send_headers_awaiting_slot`
+  # directly via `StreamSlotRetryProbe` against a skip built
+  # synchronously rather than raced for. connection_stream_state_spec.cr's
+  # extended "closes lower idle streams when a higher ID opens" example
+  # further pins the exact `Connection::ClosedError` shape
+  # `#send_headers` raises for a skipped stream, independently of both.
+  {% unless flag?(:preview_mt) %}
     it "recovers a stream_slot wait after a shared connection's other opener wins and skips it" do
       UNIXSocket.pair do |client_io, peer|
         peer_result = scripted_peer(peer) do |io|
@@ -1162,6 +1196,62 @@ describe HTTP2::Client do
       end
     end
   {% end %}
+
+  it "recovers a stream_slot wait after a shared connection's other " \
+     "opener wins and skips it (deterministic construction)" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        read_client_headers(io, 3_u32)
+        read_client_headers(io, 5_u32)
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      connection.wait_until_active(1.second)
+
+      # Builds the exact same skip the racing example above relies on a
+      # live scheduler for, but synchronously in this one fiber: reserve
+      # `skipped` (id 1) first, then open `competitor` (id 3) while
+      # `skipped` is still idle. Opening a HIGHER local stream ID while a
+      # LOWER one is idle eagerly closes ("skips") the lower one before
+      # `#new_stream` even returns to this line — no waiting, no second
+      # fiber, no race (see `Connection#plan_skipped_local_streams_unlocked`
+      # and connection_stream_state_spec.cr's "closes lower idle streams
+      # when a higher ID opens", which pins the exact error shape this
+      # produces).
+      skipped = connection.new_stream
+      competitor = connection.new_stream
+      open_client_stream(competitor, end_stream: true)
+      skipped.closed?.should be_true
+      skipped.terminal_error.should be_a(HTTP2::Connection::ClosedError)
+      connection.stream?(skipped.id).should be_nil
+
+      # Now drive the private retry method directly against the
+      # already-skipped stream: its first `#send_headers` call inside
+      # `#send_headers_awaiting_slot` raises the `ClosedError` immediately
+      # (from `Stream#send_headers`'s own `raise_terminal!` guard), and
+      # `#recoverable_stream_skip?` recognizes it (a `stream_slot` budget
+      # is configured below, the connection is neither closed nor
+      # draining, and `skipped`'s ID is no longer registered) — reliably,
+      # every time, under both schedulers.
+      probe = StreamSlotRetryProbe.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(stream_slot: 2.seconds)
+      )
+      begin
+        recovered = probe.probe_send_headers_awaiting_slot(
+          connection,
+          skipped
+        )
+        recovered.id.should_not eq(skipped.id)
+        recovered.id.should eq(5_u32)
+        wait_for_peer(peer_result)
+      ensure
+        probe.close
+      end
+    end
+  end
 
   it "does not retry a stream_slot wait into a connection the peer is draining" do
     UNIXSocket.pair do |client_io, peer|
@@ -2133,7 +2223,10 @@ describe HTTP2::Client do
 
         # A later read must RAISE, not return a silent EOF — this is a
         # library-initiated reclamation, distinguishable from the
-        # caller's own (deliberately silent) Response#close.
+        # caller's own `Response#close` (which also makes a later read
+        # raise, but a generic `IO::Error` ("Closed stream") rather than
+        # this stream's own terminal error) by exception type, not by
+        # whether reading raises at all.
         expect_raises(HTTP2::RequestTimeoutError, /abandoned/) do
           response.body.read(Bytes.new(1))
         end

@@ -65,10 +65,18 @@ describe HTTP2::Connection do
         stream = connection.new_stream
         open_client_stream(stream)
         stream_id.send(stream.id)
-        data_sent.receive
+        select
+        when data_sent.receive
+        when timeout(2.seconds)
+          fail("did not receive the data_sent signal")
+        end
 
         eventually { stream.body.buffered_bytes == 3 }
-        overhead_credited.receive
+        select
+        when overhead_credited.receive
+        when timeout(2.seconds)
+          fail("did not receive the overhead_credited signal")
+        end
         stream.receive_window.should eq(2_i64)
 
         buffer = Bytes.new(3)
@@ -116,7 +124,11 @@ describe HTTP2::Connection do
         stream = connection.new_stream
         open_client_stream(stream)
         stream_id.send(stream.id)
-        data_sent.receive
+        select
+        when data_sent.receive
+        when timeout(2.seconds)
+          fail("did not receive the data_sent signal")
+        end
 
         eventually { stream.body.buffered_bytes == 8 }
         buffer = Bytes.new(4)
@@ -175,7 +187,11 @@ describe HTTP2::Connection do
         stream = connection.new_stream
         open_client_stream(stream)
         stream_id.send(stream.id)
-        first_chunk_sent.receive
+        select
+        when first_chunk_sent.receive
+        when timeout(2.seconds)
+          fail("did not receive the first_chunk_sent signal")
+        end
 
         eventually { stream.body.buffered_bytes == 20_000 }
         first_buffer = Bytes.new(20_000)
@@ -250,7 +266,11 @@ describe HTTP2::Connection do
         open_client_stream(first, end_stream: false)
         open_client_stream(second, end_stream: false)
         stream_ids.send({first.id, second.id})
-        peer_ready.receive
+        select
+        when peer_ready.receive
+        when timeout(2.seconds)
+          fail("did not receive the peer_ready signal")
+        end
 
         first_result = Channel(Exception?).new(1)
         second_result = Channel(Exception?).new(1)
@@ -402,7 +422,11 @@ describe HTTP2::Connection do
         open_client_stream(first)
         open_client_stream(second)
         stream_ids.send({first.id, second.id})
-        initial_sent.receive
+        select
+        when initial_sent.receive
+        when timeout(2.seconds)
+          fail("did not receive the initial_sent signal")
+        end
 
         eventually do
           first.body.buffered_bytes == 4 &&
@@ -516,7 +540,11 @@ describe HTTP2::Connection do
           end
         end
 
-        reduced.receive
+        select
+        when reduced.receive
+        when timeout(2.seconds)
+          fail("did not receive the reduced signal")
+        end
         eventually { stream.send_window == -10_i64 }
         allow_first_update.send(nil)
         eventually { stream.send_window == -5_i64 }
@@ -801,6 +829,65 @@ describe HTTP2::Connection do
       stream = connection.new_stream
       open_client_stream(stream)
       stream_id.send(stream.id)
+
+      connection.wait_closed(1.second)
+      error = connection.terminal_error.as(HTTP2::ProtocolError)
+      error.error_code.should eq(HTTP2::ErrorCode::FLOW_CONTROL_ERROR)
+      error.scope.connection?.should be_true
+      wait_for_peer(peer_result)
+    end
+  end
+
+  it "enforces the connection-scope FLOW_CONTROL_ERROR at the default " \
+     "1 MiB window" do
+    UNIXSocket.pair do |client, peer|
+      stream_ids = Channel(Array(UInt32)).new(1)
+
+      # Unlike the shrunk-window example above, this uses a completely
+      # default `Configuration` — the real 1_048_576-byte
+      # `connection_receive_window` default, never otherwise exercised
+      # end-to-end in this suite. Flooding a SINGLE stream can't reach
+      # it: the per-stream receive window (`max_buffered_body_bytes`,
+      # 65_535 by default) is far smaller, so a single-stream flood trips
+      # the STREAM-scope check first (see "uses stream scope..." above).
+      # Spreading DATA across 22 streams, up to 3 full-size (16_384-byte)
+      # frames each, caps every individual stream at 49_152 bytes —
+      # comfortably under its own 65_535 limit — while the 65th frame
+      # overall (65 x 16_384 = 1_064_960) pushes the shared CONNECTION
+      # total 16_384 bytes past the 1_048_576 default. That 65th frame
+      # trips the connection-scope check specifically, because
+      # `accept_inbound_data` charges the connection window before it
+      # ever looks at the receiving stream's own window.
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        ids = stream_ids.receive
+        ids.each { |id| read_client_headers(io, id) }
+
+        payload = Bytes.new(HTTP2::FrameHeader::DEFAULT_MAX_PAYLOAD)
+        frames_sent = 0
+        ids.each do |id|
+          frames_for_stream = Math.min(3, 65 - frames_sent)
+          frames_for_stream.times do
+            HTTP2::Frame::Data.new(0_u8, id, payload).write(io)
+            frames_sent += 1
+          end
+        end
+        io.flush
+
+        goaway = HTTP2::Frame.read(io).as(HTTP2::Frame::GoAway)
+        goaway.error_code.should eq(
+          HTTP2::ErrorCode::FLOW_CONTROL_ERROR.to_u32
+        )
+      end
+
+      connection = HTTP2::Connection.start(client)
+      connection.wait_until_active(1.second)
+      streams = (0...22).map do
+        stream = connection.new_stream
+        open_client_stream(stream)
+        stream
+      end
+      stream_ids.send(streams.map(&.id))
 
       connection.wait_closed(1.second)
       error = connection.terminal_error.as(HTTP2::ProtocolError)

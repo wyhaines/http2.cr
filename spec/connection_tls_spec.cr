@@ -312,17 +312,25 @@ describe HTTP2::Connection do
       end
     end
 
-    connection_one = HTTP2::Connection.connect_tls(
-      "127.0.0.1",
-      server_one.local_address.port,
-      server_name: "example.com",
-      context: context
-    )
     begin
-      connection_one.wait_until_active(2.seconds)
-      connection_one.active?.should be_true
+      connection_one = HTTP2::Connection.connect_tls(
+        "127.0.0.1",
+        server_one.local_address.port,
+        server_name: "example.com",
+        context: context
+      )
+      begin
+        connection_one.wait_until_active(2.seconds)
+        connection_one.active?.should be_true
+      ensure
+        connection_one.close
+      end
     ensure
-      connection_one.close
+      # Outside the inner `ensure` too: a regression that makes
+      # `connect_tls` itself raise (e.g. self-healing failing, so the
+      # server never sees "h2" and the handshake never completes) must
+      # still reap the peer fiber and close its listener, rather than
+      # leaking both because nothing after the failed call ever ran.
       wait_for_peer(peer_one_result)
       server_one.close
     end
@@ -352,17 +360,21 @@ describe HTTP2::Connection do
       end
     end
 
-    connection_two = HTTP2::Connection.connect_tls(
-      "127.0.0.1",
-      server_two.local_address.port,
-      server_name: "example.com",
-      context: context
-    )
     begin
-      connection_two.wait_until_active(2.seconds)
-      connection_two.active?.should be_true
+      connection_two = HTTP2::Connection.connect_tls(
+        "127.0.0.1",
+        server_two.local_address.port,
+        server_name: "example.com",
+        context: context
+      )
+      begin
+        connection_two.wait_until_active(2.seconds)
+        connection_two.active?.should be_true
+      ensure
+        connection_two.close
+      end
     ensure
-      connection_two.close
+      # See the matching comment on the first half above.
       wait_for_peer(peer_two_result)
       server_two.close
     end

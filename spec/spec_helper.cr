@@ -88,9 +88,20 @@ end
 # client sends in reaction to the peer's own handshake response. Scripted
 # peers that read "the client's next frame" right after the handshake must
 # tolerate that leading grant; this skips at most the one startup frame.
-def skip_startup_window_update(io : IO) : HTTP2::Frames
+#
+# `expected_increment` pins the grant's size: the library default
+# (1_048_576) minus the RFC default it grants on top of (65_535) =
+# 983_041. Callers that configure a non-default `connection_receive_window`
+# must pass the matching value — or, at the RFC-default window itself
+# (delta zero, so `Connection#start` sends no grant at all and this method
+# never enters the `if` below), the argument is simply never consulted.
+def skip_startup_window_update(
+  io : IO,
+  expected_increment : UInt32 = 983_041_u32,
+) : HTTP2::Frames
   frame = HTTP2::Frame.read(io)
   if frame.is_a?(HTTP2::Frame::WindowUpdate) && frame.stream_id.zero?
+    frame.window_size_increment.should eq(expected_increment)
     frame = HTTP2::Frame.read(io)
   end
   frame
@@ -99,13 +110,14 @@ end
 def complete_server_handshake(
   io : IO,
   settings : HTTP2::Frame::Settings = HTTP2::Frame::Settings.new([] of HTTP2::Frame::Settings::Setting),
+  expected_increment : UInt32 = 983_041_u32,
 ) : HTTP2::Frame::Settings
   client_settings = read_client_preface(io)
   settings.write(io)
   HTTP2::Frame::Settings.ack.write(io)
   io.flush
 
-  acknowledgement = skip_startup_window_update(io)
+  acknowledgement = skip_startup_window_update(io, expected_increment)
   acknowledgement.should be_a(HTTP2::Frame::Settings)
   acknowledgement.as(HTTP2::Frame::Settings).ack?.should be_true
   client_settings
@@ -185,15 +197,31 @@ class FailingWriteIO < IO
 end
 
 class StallingWriteIO < IO
-  getter written_bytes : Int32 = 0
+  # `@written_bytes` is written from the connection's writer fiber
+  # (`#write`) and read from the test/main fiber (this getter) — the
+  # same cross-fiber (and, under `-Dpreview_mt`, cross-OS-thread)
+  # visibility concern `@stalled` and `@closed` below have, so it is an
+  # `Atomic(Int32)` rather than a plain `Int32` for the same reason.
+  def written_bytes : Int32
+    @written_bytes.get
+  end
 
   @read_data : Bytes
   @read_offset = 0
   @read_mutex = Mutex.new
-  @closed = false
+  # Written from whichever fiber tears down the transport (reader,
+  # writer, or the test's own main fiber, depending on which side
+  # detects the failure) and read from `#read`/`#write`/`#close`
+  # themselves, on potentially different fibers/threads again — the
+  # same visibility concern as `@stalled`. `#close`'s own
+  # check-then-set is additionally made atomic via `#compare_and_set`
+  # below, not just visible, so two concurrent `#close` calls can't both
+  # proceed and double-close the channels (which would raise).
+  @closed = Atomic(Bool).new(false)
   @closed_signal = Channel(Nil).new
   @stall = Channel(Nil).new
-  @stalled = false
+  @stalled = Atomic(Bool).new(false)
+  @written_bytes = Atomic(Int32).new(0)
   @gated_data : Bytes
   @gate = Channel(Nil).new(1)
 
@@ -213,8 +241,12 @@ class StallingWriteIO < IO
   end
 
   # After this call every write blocks until the transport is closed.
+  # `@stalled` is an `Atomic(Bool)` rather than a plain `Bool`: this is set
+  # from the test/main fiber and read from the connection's writer fiber,
+  # which under `-Dpreview_mt` can be a genuinely different OS thread —
+  # a plain `Bool` gives no cross-thread visibility guarantee.
   def stall! : Nil
-    @stalled = true
+    @stalled.set(true)
   end
 
   # Appends the bytes supplied to the constructor to the readable stream and
@@ -269,7 +301,7 @@ class StallingWriteIO < IO
   end
 
   def read(slice : Bytes) : Int32
-    return 0 if @closed
+    return 0 if @closed.get
 
     loop do
       available = @read_mutex.synchronize do
@@ -292,24 +324,24 @@ class StallingWriteIO < IO
   end
 
   def write(slice : Bytes) : Nil
-    if @stalled
+    if @stalled.get
       @stall.receive?
       raise IO::Error.new("transport closed while a write was stalled")
     end
-    @written_bytes += slice.size
+    @written_bytes.add(slice.size)
   end
 
   def close : Nil
-    return if @closed
+    _, succeeded = @closed.compare_and_set(false, true)
+    return unless succeeded
 
-    @closed = true
     @stall.close
     @closed_signal.close
     @gate.close
   end
 
   def closed?
-    @closed
+    @closed.get
   end
 end
 
