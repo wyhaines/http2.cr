@@ -238,12 +238,34 @@ class StallingWriteIO < IO
   # needs to be alive and eventually call `#read` at least once more; it
   # does not need to be parked there yet, and now it does not even need to
   # ever call `#read` again at all.
+  #
+  # Safe to call exactly once per instance. A second call before the
+  # first's buffered value has been received (by `#read`'s `@gate.receive?`
+  # branch) would itself block on the now-full capacity-1 buffer — the
+  # same hang this method exists to avoid, just moved to a caller that
+  # violates its own single-use contract. No caller in this suite does
+  # that; not defended against here.
   def release_gated_reads! : Nil
     combined = IO::Memory.new
     combined.write(@read_data)
     combined.write(@gated_data)
     @read_mutex.synchronize { @read_data = combined.to_slice }
     @gate.send(nil)
+  rescue Channel::ClosedError
+    # The transport closed (e.g. the connection independently
+    # terminated) in the narrow window between updating @read_data above
+    # and this send. Not a `select ... else` situation — Crystal's
+    # `Channel::SendAction` raises `ClosedError` as soon as `execute`
+    # observes a closed channel, before a select's non-blocking/`else`
+    # fallback is ever considered (verified against
+    # `channel/select.cr`'s `op.execute` -> `.closed?` ->
+    # `op.default_result` path), so only a rescue actually guards this.
+    # The wake this call exists to deliver is moot once closing has
+    # already started: `#read`'s `@closed_signal.receive?` branch covers
+    # waking a still-parked reader, and a reader that already exited (the
+    # connection-scoped-violation case this method's own comment above
+    # discusses) has nothing left to receive it either way. @read_data
+    # was already updated before this point, so nothing is lost.
   end
 
   def read(slice : Bytes) : Int32

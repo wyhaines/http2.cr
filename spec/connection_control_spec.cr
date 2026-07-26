@@ -240,6 +240,29 @@ describe HTTP2::Connection do
     end
   end
 
+  it "sanitizes control characters and truncates oversized GOAWAY " \
+     "debug data" do
+    injected = HTTP2::Frame::GoAway.new(
+      0_u32,
+      HTTP2::ErrorCode::INTERNAL_ERROR.to_u32,
+      "A \e[31mRED\a"
+    )
+    error = HTTP2::Connection::GoAwayTerminationError.new(injected)
+    message = error.message.to_s
+    message.should_not contain("\e")
+    message.should_not contain("\a")
+    message.should contain("RED")
+
+    oversized = HTTP2::Frame::GoAway.new(
+      0_u32,
+      HTTP2::ErrorCode::INTERNAL_ERROR.to_u32,
+      "x" * 500
+    )
+    truncated = HTTP2::Connection::GoAwayTerminationError
+      .new(oversized).message.to_s
+    truncated.split(": ").last.size.should eq(128)
+  end
+
   it "times out an unacknowledged PING without closing the connection" do
     UNIXSocket.pair do |client, peer|
       peer_result = scripted_peer(peer) do |io|

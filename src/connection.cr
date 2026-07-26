@@ -962,12 +962,11 @@ module HTTP2
       @submission_mutex.synchronize { enqueue(command) }
     end
 
-    # Enqueues a command and waits up to `timeout` (total, covering both
-    # admission onto @write_queue and the writer's flush) for it to
-    # complete, then returns either way. Used only by #send_goaway from the
-    # reader fiber: a bare #submit_nowait would race the GOAWAY against
-    # the reader's own #terminate on a HEALTHY connection — #terminate
-    # closes @write_queue and the transport without flushing, and
+    # Enqueues a command and waits up to `timeout` for it to complete,
+    # then returns either way. Used only by #send_goaway from the reader
+    # fiber: a bare #submit_nowait would race the GOAWAY against the
+    # reader's own #terminate on a HEALTHY connection — #terminate closes
+    # @write_queue and the transport without flushing, and
     # #process_write_command completes-with-error once a terminal error is
     # set, so a nowait-then-terminate sequence can drop the GOAWAY even
     # when the peer was reading fine, trading RFC 9113 5.4.1's "send
@@ -986,12 +985,28 @@ module HTTP2
     # ever sending it. A peer that stalled its own reads forfeits the
     # courtesy frame instead of hanging the connection indefinitely.
     #
-    # Admission is bounded too (via #enqueue_bounded), not just the flush:
-    # @write_queue has finite capacity, and a stalled writer leaves nothing
-    # to drain it, so a plain #enqueue's blocking send could by itself
-    # consume the entire deadline (or more — it has none of its own)
-    # before #command.wait ever runs, silently reopening the same
-    # unbounded-wait failure this method exists to close.
+    # `timeout` bounds the two steps THIS method performs: admission onto
+    # @write_queue (#enqueue_bounded) and the flush wait (#command.wait).
+    # It does NOT bound acquiring @submission_mutex itself, one level
+    # further out — #submit/#submit_nowait hold that mutex across
+    # #enqueue's own *unbounded* `@write_queue.send`, so if another fiber
+    # is already parked there (requires a stalled writer AND @write_queue
+    # already full at `writer_queue_capacity`, default 32, AND that other
+    # fiber having entered #enqueue first) this method's own
+    # `@submission_mutex.synchronize` call can itself block indefinitely
+    # before #enqueue_bounded — and thus this method's own deadline logic
+    # — ever runs. Not a regression: this mutex-held-across-a-blocking-
+    # send shape predates this task and is shared by #submit/
+    # #submit_nowait; not fixed here (would mean changing what
+    # @submission_mutex actually is, e.g. a capacity-1 Channel used as an
+    # acquire/release gate with its own select-with-timeout, touching
+    # every caller of #submit/#submit_nowait, not just this one — a
+    # larger, riskier change than this task's scope). The deadline is a
+    # hard guarantee when the reader is the sole (or first) contender for
+    # @submission_mutex — true for the single-stalled-write scenario this
+    # method exists to fix and this file's own regression spec exercises
+    # — not guaranteed under concurrent submission pressure compounded
+    # with an already-saturated queue.
     private def submit_bounded(
       command : WriteCommand,
       timeout : Time::Span,

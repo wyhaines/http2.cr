@@ -123,20 +123,39 @@ module HTTP2
         debug = @goaway.debug_data
         unless debug.empty?
           truncated = debug[0, Math.min(debug.size, MaxDebugDataBytes)]
-          # `String.new` never raises on invalid UTF-8 (it wraps the bytes
-          # as given); truncation can itself split a multibyte sequence at
-          # the boundary above regardless of whether the peer's original
-          # bytes were valid. `#scrub` replaces any resulting invalid byte
-          # sequences with the Unicode replacement character, so untrusted
-          # peer bytes (NULs, control characters, non-UTF-8 data) never
-          # reach a message verbatim.
-          message += ": #{String.new(truncated).scrub}"
+          message += ": #{self.class.sanitize_debug_data(truncated)}"
         end
         super(message)
       end
 
       def error_code : UInt32
         @goaway.error_code
+      end
+
+      # `String.new` never raises on invalid UTF-8 (it wraps the bytes as
+      # given); truncation above can itself split a multibyte sequence at
+      # the boundary regardless of whether the peer's original bytes were
+      # valid. `#scrub` replaces any resulting invalid byte sequences with
+      # the Unicode replacement character — but it only touches *invalid*
+      # UTF-8. C0 controls (0x00-0x1F), DEL (0x7F), and C1 controls
+      # (0x80-0x9F) are all valid UTF-8 code points, so `#scrub` alone
+      # passes them through unchanged — including ESC and BEL, which let a
+      # peer-controlled debug string carry a live ANSI/terminal escape
+      # sequence into a message an application might log verbatim (a
+      # narrow log/terminal-injection vector, not just a display nit).
+      # Replaced with the same replacement character `#scrub` already
+      # uses, for the same reason and for one consistent visual marker.
+      def self.sanitize_debug_data(bytes : Bytes) : String
+        String.build do |io|
+          String.new(bytes).scrub.each_char do |char|
+            codepoint = char.ord
+            if codepoint < 0x20 || codepoint == 0x7f || (0x80 <= codepoint <= 0x9f)
+              io << Char::REPLACEMENT
+            else
+              io << char
+            end
+          end
+        end
       end
     end
 
