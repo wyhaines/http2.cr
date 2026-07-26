@@ -691,6 +691,16 @@ module HTTP2
     # background fibers with no timeout, so closing it while still
     # holding `@mutex` could wedge `#close`/`#closed?`/every other
     # request behind a stuck teardown.
+    #
+    # The `ensure`'s `redundant.try(&.close)` running after a `raise`
+    # inside the `synchronize` block (the `@closed` branch) means that,
+    # in the theoretical case where `Connection#close` itself raised, its
+    # exception would replace/mask the `ClosedError` already propagating
+    # rather than both surfacing. Accepted: `Connection#close` is
+    # designed not to raise under normal operation (its own internals
+    # guard/rescue around transport-close failures), and closing a
+    # redundant connection that was never handed to any caller is not a
+    # path a caller could otherwise observe or recover from differently.
     private def publish_dialed_connection(dialed : Connection) : Connection
       redundant = nil
       begin

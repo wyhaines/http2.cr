@@ -43,6 +43,63 @@ class HTTP2::Client
   end
 end
 
+# Test-only: `#connection_for_request`'s two-lock-acquisition race
+# (winner-publishes / loser-recovers) is otherwise only reachable by
+# racing real sockets and hoping the scheduler cooperates -- exactly
+# the flakiness this suite hit under `-Dpreview_mt` before this seam
+# existed. `#dial` is the ONE call that runs BETWEEN the two lock
+# acquisitions, so overriding it in a subclass lets a spec simulate
+# "another fiber already published a winner while this one was still
+# dialing" with zero timing dependence: arm it with the two connections
+# to use, and every `#dial` call (triggered indirectly through any
+# public request method) publishes `winner` as `@connection` and hands
+# back `fresh` as this fiber's own completed dial, exactly reproducing
+# the adversarial interleaving without needing a second fiber at all.
+class RaceSimulatingClient < HTTP2::Client
+  @simulated_fresh_dial : HTTP2::Connection?
+  @simulated_winner : HTTP2::Connection?
+
+  def arm_dial_race(
+    fresh : HTTP2::Connection,
+    winner : HTTP2::Connection,
+  ) : Nil
+    @simulated_fresh_dial = fresh
+    @simulated_winner = winner
+  end
+
+  private def dial : HTTP2::Connection
+    @connection = @simulated_winner
+    @simulated_fresh_dial || raise "RaceSimulatingClient used before #arm_dial_race"
+  end
+end
+
+# Test-only: a `Connection` whose `#close` blocks until released,
+# proving (or disproving) that a redundant dial's close runs outside
+# `@mutex` without depending on `Connection#close` ever actually taking
+# a long time in practice. `Connection.start` is `self.start(transport,
+# configuration) : self` (`new(...).start`), so a subclass is
+# constructible through the ordinary factory; `#close` is a plain,
+# overridable public method.
+class GateClosingConnection < HTTP2::Connection
+  @closing = false
+  @close_gate = Channel(Nil).new
+
+  def closing? : Bool
+    @closing
+  end
+
+  def release_close : Nil
+    @close_gate.close
+  rescue Channel::ClosedError
+  end
+
+  def close : Nil
+    @closing = true
+    @close_gate.receive?
+    super
+  end
+end
+
 describe "HTTP2::Client recovery" do
   it "replays a proven-unprocessed owned POST only when explicitly allowed" do
     server = TCPServer.new("127.0.0.1", 0)
@@ -364,6 +421,14 @@ describe "HTTP2::Client recovery" do
         # `#monitor_response` doc comment on the shared
         # `Connection::TimeoutError` rescue).
         elapsed.should be < 1.second
+
+        # Symmetric with the keepalive-timeout spec below: the response
+        # itself surfaces the connection's own DrainTimeoutError too,
+        # not just graceful_close's caller.
+        expect_raises(HTTP2::Connection::DrainTimeoutError) do
+          response.trailers
+        end
+
         wait_for_peer(peer_result)
       ensure
         http.close
@@ -1267,6 +1332,115 @@ describe HTTP2::Client do
     end
   end
 
+  it "recovers via its own fresh dial when a concurrent winner had " \
+     "already gone closed by the time this dialer re-checks" do
+    UNIXSocket.pair do |fresh_io, fresh_peer|
+      UNIXSocket.pair do |winner_io, winner_peer|
+        fresh_peer_result = scripted_peer(fresh_peer) do |io|
+          complete_server_handshake(io)
+          request = client_read_field_section(io, HPack::Decoder.new)
+          write_server_fields(
+            io,
+            HPack::Encoder.new,
+            request[:stream_id],
+            [{":status", "204"}],
+            end_stream: true
+          )
+        end
+        winner_peer_result = scripted_peer(winner_peer) do |io|
+          # The "winner" is already closed before this client ever
+          # touches it; nothing should ever cross this socket.
+          begin
+            loop { HTTP2::Frame.read(io) }
+          rescue
+          end
+        end
+
+        fresh = HTTP2::Connection.start(fresh_io)
+        winner = HTTP2::Connection.start(winner_io)
+        winner.close
+
+        http = RaceSimulatingClient.new("http://example.test")
+        http.arm_dial_race(fresh, winner)
+        begin
+          # `#dial` (overridden above) simulates: another fiber already
+          # published `winner` to `@connection`, and it has ALREADY gone
+          # closed, by the time this call's own dial (`fresh`) is ready
+          # to be checked against it. Pre-fix, `#connection_for_request`
+          # would hand back the closed `winner` unconditionally and
+          # discard `fresh` -- the request would fail with a bare
+          # `Connection::ClosedError` instead of succeeding.
+          response = http.get("/")
+          response.status.should eq(204)
+          fresh.closed?.should be_false
+          wait_for_peer(fresh_peer_result)
+        ensure
+          http.close
+          winner_peer.close rescue nil
+          wait_for_peer(winner_peer_result) rescue nil
+        end
+      end
+    end
+  end
+
+  it "closes a redundant connection outside its mutex, so #closed? " \
+     "is not blocked behind a slow teardown" do
+    UNIXSocket.pair do |hanging_io, hanging_peer|
+      UNIXSocket.pair do |winner_io, winner_peer|
+        hanging_peer_result = scripted_peer(hanging_peer) do |io|
+          begin
+            loop { HTTP2::Frame.read(io) }
+          rescue
+          end
+        end
+        winner_peer_result = scripted_peer(winner_peer) do |io|
+          begin
+            loop { HTTP2::Frame.read(io) }
+          rescue
+          end
+        end
+
+        hanging = GateClosingConnection.start(hanging_io)
+        winner = HTTP2::Connection.start(winner_io)
+
+        http = RaceSimulatingClient.new("http://example.test")
+        http.arm_dial_race(hanging, winner)
+        begin
+          # `winner` is live and usable, so `#connection_for_request`
+          # treats THIS call's own dial (`hanging`) as redundant and
+          # closes it -- `GateClosingConnection#close` (above) blocks
+          # until released, simulating a teardown that takes a long
+          # time. `#closed?` must not be blocked behind it.
+          spawn { http.get("/") rescue nil }
+          eventually(
+            message: "the redundant connection's close never started"
+          ) do
+            hanging.closing?
+          end
+
+          result = Channel(Bool).new(1)
+          spawn { result.send(http.closed?) }
+          outcome = select
+          when value = result.receive
+            value
+          when timeout(500.milliseconds)
+            fail(
+              "closed? blocked behind a wedged redundant Connection#close"
+            )
+          end
+          outcome.should be_false
+        ensure
+          hanging.release_close
+          http.close
+          hanging_peer.close rescue nil
+          winner_peer.close rescue nil
+          wait_for_peer(hanging_peer_result) rescue nil
+          wait_for_peer(winner_peer_result) rescue nil
+        end
+      end
+    end
+  end
+
   it "dials once per concurrent cold requester, but every loser " \
      "closes its own connection so exactly one survives" do
     server = TCPServer.new("127.0.0.1", 0)
@@ -1275,9 +1449,23 @@ describe HTTP2::Client do
     accepted = 0
     closed = 0
 
+    # Accepts until the listener itself closes (this example's `ensure`),
+    # rather than presupposing exactly `concurrency` connections arrive.
+    # Under a real (`-Dpreview_mt`) scheduler, `spawn` can start a fiber
+    # on another worker thread before this test's own spawn loop below
+    # even finishes enqueueing the rest, so an early dialer can publish
+    # `@connection` before a later fiber ever decides to dial at all --
+    # fewer than `concurrency` actual TCP connects is then a legitimate,
+    # scheduler-dependent outcome (measured: ~8% of `-Dpreview_mt` runs),
+    # not a bug. Asserting a hardcoded `accepted == concurrency` was
+    # this spec's original mistake.
     peer_result = scripted_peer(server) do |listener|
-      concurrency.times do
-        socket = listener.as(TCPServer).accept
+      loop do
+        socket = begin
+          listener.as(TCPServer).accept
+        rescue
+          break
+        end
         counts_mutex.synchronize { accepted += 1 }
         spawn do
           begin
@@ -1320,7 +1508,8 @@ describe HTTP2::Client do
       # scheduler does not run any of them until every one of these
       # `concurrency` fibers is already enqueued -- each independently
       # observes `@connection` as nil/unusable and dials, exactly the
-      # race `#connection_for_request`'s doc comment describes.
+      # race `#connection_for_request`'s doc comment describes (modulo
+      # the real-MT-scheduler caveat above).
       results = Channel(Exception?).new(concurrency)
       concurrency.times do |i|
         spawn do
@@ -1335,30 +1524,40 @@ describe HTTP2::Client do
         raise error if error
       end
 
-      eventually(message: "server never accepted #{concurrency} connections") do
-        counts_mutex.synchronize { accepted } == concurrency
+      # Every one of the `concurrency` requests above already completed
+      # successfully, and only a request can trigger a dial -- so
+      # whatever set of connections was EVER going to be dialed has
+      # already been fully decided by this point; nothing more will be
+      # attempted. What may still be catching up is purely server-side
+      # bookkeeping (`#accept` returning for an already-established TCP
+      # connection). Settle by requiring the SAME (accepted, closed)
+      # pair on two consecutive polls before trusting it -- this rules
+      # out asserting against a value caught mid-transition.
+      previous = {-1, -1}
+      settled = {0, 0}
+      eventually(message: "accept/close counts never settled") do
+        current = counts_mutex.synchronize { {accepted, closed} }
+        is_settled = current[0] > 0 && current == previous
+        previous = current
+        settled = current if is_settled
+        is_settled
       end
-      # All `concurrency` requests already completed successfully above,
-      # which -- since every loser is discarded before ever being handed
-      # to a caller -- could only happen by all of them sharing the SAME
-      # one surviving connection. The other `concurrency - 1` are
-      # therefore already closed by their losing fibers by this point,
-      # independent of the `#close` below.
-      eventually(
-        message: "expected exactly #{concurrency - 1} losing " \
-                 "connections closed before #close"
-      ) do
-        counts_mutex.synchronize { closed } == concurrency - 1
-      end
+      observed_accepted, observed_closed = settled
+      # However many connections were actually dialed (winners and
+      # losers alike), every one but the surviving winner must already
+      # be closed -- the scheduler-independent invariant, in place of
+      # the flaky hardcoded `concurrency` this spec started with.
+      observed_closed.should eq(observed_accepted - 1)
 
       http.close
       eventually(message: "the surviving connection never closed") do
-        counts_mutex.synchronize { closed } == concurrency
+        counts_mutex.synchronize { closed } == observed_accepted
       end
+      server.close
       wait_for_peer(peer_result)
     ensure
       http.close
-      server.close
+      server.close unless server.closed?
     end
   end
 
