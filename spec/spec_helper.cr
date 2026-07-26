@@ -189,12 +189,13 @@ class StallingWriteIO < IO
 
   @read_data : Bytes
   @read_offset = 0
+  @read_mutex = Mutex.new
   @closed = false
   @closed_signal = Channel(Nil).new
   @stall = Channel(Nil).new
   @stalled = false
   @gated_data : Bytes
-  @gate = Channel(Nil).new
+  @gate = Channel(Nil).new(1)
 
   # `gated_data` is served to readers only after `#release_gated_reads!` is
   # called, not from construction. This lets a caller open streams (so the
@@ -217,15 +218,31 @@ class StallingWriteIO < IO
   end
 
   # Appends the bytes supplied to the constructor to the readable stream and
-  # wakes a reader parked past the previously available data. `@gate` is
-  # unbuffered, so this blocks until a reader is parked in `#read` to receive
-  # the signal — safe as long as the reader fiber is alive and eventually
-  # reaches that point (it does not need to be parked there yet).
+  # wakes a reader parked past the previously available data.
+  #
+  # `@gate` is buffered (capacity 1), so this call itself never blocks —
+  # load-bearing, not cosmetic. A caller (e.g. a connection-scoped protocol
+  # violation) whose reader fiber permanently stops calling `#read` right
+  # after consuming the newly-released bytes must not be able to wedge this
+  # method: under real thread parallelism (`-Dpreview_mt`), the reader can
+  # observe the enlarged `@read_data` via `#read`'s own top-of-loop check on
+  # an ordinary, already-in-flight call — racing ahead of, and without ever
+  # reaching, the `@gate.receive?` branch below. With an unbuffered `@gate`
+  # (the prior implementation), a reader that then never calls `#read`
+  # again leaves this method's `@gate.send` permanently unreceived — an
+  # unbounded hang, reproduced under `-Dpreview_mt` thread-scheduling
+  # pressure. A buffered send can never block on a missing receiver, so
+  # that hang is structurally impossible regardless of which path the
+  # reader takes. This still wakes a reader that *is* parked in `#read`
+  # (the value sits in the buffer until received) — the reader fiber only
+  # needs to be alive and eventually call `#read` at least once more; it
+  # does not need to be parked there yet, and now it does not even need to
+  # ever call `#read` again at all.
   def release_gated_reads! : Nil
     combined = IO::Memory.new
     combined.write(@read_data)
     combined.write(@gated_data)
-    @read_data = combined.to_slice
+    @read_mutex.synchronize { @read_data = combined.to_slice }
     @gate.send(nil)
   end
 
@@ -233,12 +250,15 @@ class StallingWriteIO < IO
     return 0 if @closed
 
     loop do
-      if @read_offset < @read_data.size
-        count = Math.min(slice.size, @read_data.size - @read_offset)
-        slice[0, count].copy_from(@read_data[@read_offset, count])
-        @read_offset += count
-        return count
+      available = @read_mutex.synchronize do
+        if @read_offset < @read_data.size
+          count = Math.min(slice.size, @read_data.size - @read_offset)
+          slice[0, count].copy_from(@read_data[@read_offset, count])
+          @read_offset += count
+          count
+        end
       end
+      return available if available
 
       select
       when @closed_signal.receive?
@@ -263,6 +283,7 @@ class StallingWriteIO < IO
     @closed = true
     @stall.close
     @closed_signal.close
+    @gate.close
   end
 
   def closed?

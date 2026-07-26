@@ -109,13 +109,29 @@ module HTTP2
     # ones the peer promised to still finish — fail with the peer's own
     # diagnosis instead of an opaque "the socket closed."
     class GoAwayTerminationError < ClosedError
+      # RFC 9113 places no length limit on GOAWAY debug data beyond the
+      # frame size itself (up to several KB by default, more if the peer
+      # advertised a larger SETTINGS_MAX_FRAME_SIZE) — bound how much of
+      # it ends up in a message an application might log verbatim.
+      MaxDebugDataBytes = 128
+
       getter goaway : Frame::GoAway
 
       def initialize(@goaway : Frame::GoAway)
         message = "connection closed after peer GOAWAY with error code " \
                   "#{@goaway.error_code}"
         debug = @goaway.debug_data
-        message += ": #{String.new(debug)}" unless debug.empty?
+        unless debug.empty?
+          truncated = debug[0, Math.min(debug.size, MaxDebugDataBytes)]
+          # `String.new` never raises on invalid UTF-8 (it wraps the bytes
+          # as given); truncation can itself split a multibyte sequence at
+          # the boundary above regardless of whether the peer's original
+          # bytes were valid. `#scrub` replaces any resulting invalid byte
+          # sequences with the Unicode replacement character, so untrusted
+          # peer bytes (NULs, control characters, non-UTF-8 data) never
+          # reach a message verbatim.
+          message += ": #{String.new(truncated).scrub}"
+        end
         super(message)
       end
 

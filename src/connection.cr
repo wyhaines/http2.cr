@@ -962,8 +962,9 @@ module HTTP2
       @submission_mutex.synchronize { enqueue(command) }
     end
 
-    # Enqueues a command and waits up to `timeout` for the writer to flush
-    # it, then returns either way. Used only by #send_goaway from the
+    # Enqueues a command and waits up to `timeout` (total, covering both
+    # admission onto @write_queue and the writer's flush) for it to
+    # complete, then returns either way. Used only by #send_goaway from the
     # reader fiber: a bare #submit_nowait would race the GOAWAY against
     # the reader's own #terminate on a HEALTHY connection — #terminate
     # closes @write_queue and the transport without flushing, and
@@ -984,12 +985,27 @@ module HTTP2
     # command was in — completing it with the terminal error rather than
     # ever sending it. A peer that stalled its own reads forfeits the
     # courtesy frame instead of hanging the connection indefinitely.
+    #
+    # Admission is bounded too (via #enqueue_bounded), not just the flush:
+    # @write_queue has finite capacity, and a stalled writer leaves nothing
+    # to drain it, so a plain #enqueue's blocking send could by itself
+    # consume the entire deadline (or more — it has none of its own)
+    # before #command.wait ever runs, silently reopening the same
+    # unbounded-wait failure this method exists to close.
     private def submit_bounded(
       command : WriteCommand,
       timeout : Time::Span,
     ) : Nil
-      @submission_mutex.synchronize { enqueue(command) }
-      command.wait(timeout)
+      deadline = Time.instant + timeout
+      admitted = @submission_mutex.synchronize do
+        enqueue_bounded(command, deadline)
+      end
+      return unless admitted
+
+      remaining = deadline - Time.instant
+      return if remaining <= Time::Span.zero
+
+      command.wait(remaining)
     end
 
     private def submit_data(frame : Frame::Data) : Nil
@@ -1100,14 +1116,50 @@ module HTTP2
       end
     end
 
-    private def enqueue(command : WriteCommand) : Nil
+    private def check_enqueueable! : Nil
       current_state = state
       if current_state.new?
         raise InvalidStateError.new("connection has not been started")
       end
       raise_terminal_or_state! if current_state.closed?
+    end
+
+    private def enqueue(command : WriteCommand) : Nil
+      check_enqueueable!
 
       @write_queue.send(command)
+    rescue Channel::ClosedError
+      raise_terminal_or_state!
+    end
+
+    # Bounded counterpart of #enqueue, used only by #submit_bounded: waits
+    # up to `deadline` for `@write_queue` to accept the command instead of
+    # blocking indefinitely. `@write_queue` has finite capacity
+    # (`writer_queue_capacity`, default 32); against a stalled writer with
+    # that many commands already queued ahead of this one, a plain
+    # `@write_queue.send` (what #enqueue does, and what #submit_bounded
+    # relied on before this method existed) can block indefinitely on its
+    # own, before #submit_bounded's caller ever reaches the timeout-bounded
+    # `command.wait` — silently defeating the bound #send_goaway exists to
+    # provide. Returns `true` if the command was admitted, `false` if the
+    # deadline elapsed first (nothing was enqueued; there is nothing for
+    # the writer to complete later in this case, unlike a #command.wait
+    # timeout).
+    private def enqueue_bounded(
+      command : WriteCommand,
+      deadline : Time::Instant,
+    ) : Bool
+      check_enqueueable!
+
+      remaining = deadline - Time.instant
+      return false if remaining <= Time::Span.zero
+
+      select
+      when @write_queue.send(command)
+        true
+      when timeout(remaining)
+        false
+      end
     rescue Channel::ClosedError
       raise_terminal_or_state!
     end
