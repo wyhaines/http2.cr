@@ -169,12 +169,19 @@ module HTTP2
     # `x-csrf-token`, a bearer token carried under a non-standard name —
     # adds it here so it keeps the same literal-never-indexed treatment
     # RFC 7541 §7.1.3 reserves for that wire marker precisely so
-    # intermediaries cannot promote it. Comparison is case-insensitive
-    # (names are downcased when this client is constructed, and again
-    # wherever they are matched against a field). Empty by default: this
-    # is purely additive and cannot narrow the built-in four, which stay
-    # unconditional. Mutating the returned `Set` after construction takes
-    # effect on the next request this client sends.
+    # intermediaries cannot promote it. Comparison is case-insensitive:
+    # names are downcased once, here, when this client is constructed.
+    # Empty by default: this is purely additive and cannot narrow the
+    # built-in four, which stay unconditional.
+    #
+    # Treat the returned `Set` as fixed once this client starts sending
+    # requests. `#request` reads it directly on every call (no defensive
+    # copy, so a request-heavy connection is not paying a repeated
+    # allocation for a value that rarely changes) — mutating it
+    # concurrently with an in-flight request is a data race under
+    # `-Dpreview_mt`, and any entry added after construction must already
+    # be lowercase, since nothing downcases it a second time. Any
+    # mutation must happen before this client's first request.
     getter additional_never_indexed_fields : Set(String)
 
     @origin : Origin

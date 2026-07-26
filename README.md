@@ -52,6 +52,11 @@ Create one client per origin; it safely reuses that origin's HTTP/2 connection.
 Field names must already be lowercase. `HTTP2::Headers` preserves insertion
 order and repeated names.
 
+Ordinary header fields may compress into the connection's HPACK dynamic
+table on a later request; `authorization`, `proxy-authorization`, `cookie`,
+and `set-cookie` never do. Give a custom credential header (e.g.
+`x-api-key`) the same protection with `additional_never_indexed_fields:`.
+
 ```crystal
 require "http2"
 

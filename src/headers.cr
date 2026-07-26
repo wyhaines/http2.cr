@@ -35,9 +35,8 @@ module HTTP2
       fields.each { |field| @fields << field }
     end
 
-    # Names are downcased on insertion — see `#add`'s doc comment for why.
     def initialize(fields : Enumerable(Tuple(String, String)))
-      fields.each { |name, value| @fields << Header.new(name.downcase, value) }
+      fields.each { |name, value| @fields << Header.new(name, value) }
     end
 
     # `HTTP::Headers` field names are case-insensitive (RFC 9110 §5.1) but
@@ -56,25 +55,14 @@ module HTTP2
     end
 
     # Appends a field without replacing existing fields of the same name.
-    #
-    # The name is downcased on insertion, enforcing the "exactly matching
-    # lowercase name" contract `#[]`/`#get_all` below already document:
-    # every mutator (`#add`, `#[]=`, the tuple-based `#initialize`) stores
-    # lowercase names, so a caller cannot bypass case-sensitive logic
-    # elsewhere — most importantly `to_header_fields`'s never-index
-    # selection — merely by supplying a differently-cased name.
     def add(name : String, value : String) : self
-      @fields << Header.new(name.downcase, value)
+      @fields << Header.new(name, value)
       self
     end
 
-    # Replaces every existing field with this name (matched
-    # case-insensitively, via the downcasing `#add` performs) with a
-    # single field carrying *value*.
     def []=(name : String, value : String) : String
-      downcased_name = name.downcase
-      delete(downcased_name)
-      add(downcased_name, value)
+      delete(name)
+      add(name, value)
       value
     end
 
@@ -145,19 +133,29 @@ module HTTP2
     # (RFC 7541 6.2.3) and never inserts it into the dynamic table, on the
     # first request or any later one.
     #
-    # Both the field's own name and every entry of *extra_never_indexed*
-    # are downcased right here, immediately before comparison — every
-    # `Headers` mutator already stores lowercase names (see `#add`), but
-    # this decision does not rely on that holding true elsewhere. It is
-    # correct regardless of how the field reached `@fields` or how the
-    # caller cased *extra_never_indexed*.
+    # The field's own name is downcased right here, immediately before
+    # comparison. This is the library's one and only normalization point
+    # for *that* decision — `Headers`' own mutators (`#add`, `#[]=`, the
+    # tuple-based `#initialize`) do NOT downcase on insertion, so this
+    # method does not rely on, and must not come to rely on, anything
+    # upstream already being lowercase. It is correct regardless of how
+    # the field reached `@fields` (including a caller-supplied mixed-case
+    # name, via any construction path).
+    #
+    # *extra_never_indexed*, by contrast, is trusted pre-downcased: the
+    # caller (in practice, `Client#initialize` — see
+    # `Client#additional_never_indexed_fields`) normalizes it exactly
+    # once, and this method reads it as-is on every call rather than
+    # re-downcasing a fresh copy each time, so a request-heavy connection
+    # does not pay a repeated allocation for a value that does not change
+    # per field. A caller that bypasses `Client` and calls this directly
+    # is responsible for downcasing its own *extra_never_indexed* names.
     def to_header_fields(
-      extra_never_indexed : Enumerable(String) = [] of String,
+      extra_never_indexed : Set(String) = Set(String).new,
     ) : Array(HeaderField)
-      never_indexed = extra_never_indexed.map(&.downcase).to_set
       @fields.map do |field|
         name = field.name.downcase
-        indexing = if SENSITIVE_FIELD_NAMES.includes?(name) || never_indexed.includes?(name)
+        indexing = if SENSITIVE_FIELD_NAMES.includes?(name) || extra_never_indexed.includes?(name)
                      HeaderField::Indexing::Never
                    else
                      HeaderField::Indexing::Incremental

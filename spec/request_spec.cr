@@ -101,38 +101,50 @@ describe HTTP2::Headers do
     ordinary.indexing.should eq(HTTP2::HeaderField::Indexing::Incremental)
   end
 
-  it "downcases names inserted via the low-level add, []=, and tuple-constructor paths, so a mixed-case credential still selects Never" do
-    # Task 9 review, Finding 1: only the HTTP::Headers conversion
-    # constructor downcased on insertion. `#add`/`#[]=`/the tuple
-    # constructor did not, so `Headers.new.add("Authorization", ...)`
-    # stored the name verbatim and `to_header_fields`'s case-sensitive
-    # `case field.name` never matched it -- a mixed-case credential sent
-    # through the low-level `to_header_fields` + `Stream#send_headers`
-    # path (bypassing `Client`'s own request validation, which happens to
-    # reject uppercase field names first) reached HPACK
-    # `Indexing::Incremental` and the peer's dynamic table. Both layers are
-    # fixed and both are pinned here: `Headers` now downcases on every
-    # insertion path, AND `to_header_fields` downcases defensively again
-    # itself, so the selection is correct even if a future insertion path
-    # forgets to normalize.
+  it "still selects Never for a mixed-case credential, across every Headers construction path" do
+    # Task 9 review, Finding 1: `to_header_fields`'s case-sensitive
+    # `case field.name` never matched a credential whose name arrived
+    # differently cased than the sensitive-name literals -- e.g.
+    # `Headers.new.add("Authorization", ...)` stored the name verbatim
+    # (only the `HTTP::Headers` conversion constructor downcased), so
+    # `Indexing::Incremental` was selected instead of `Never`, and a
+    # mixed-case credential sent through the low-level `to_header_fields`
+    # + `Stream#send_headers` path (bypassing `Client`'s own request
+    # validation, which happens to reject uppercase field names first)
+    # reached the peer's HPACK dynamic table.
+    #
+    # Fix-round adjudication: `Headers`' mutators (`#add`, `#[]=`, the
+    # tuple constructor) deliberately do NOT normalize casing on
+    # insertion -- that native-path strictness is a separate, earlier
+    # reviewed design decision, unrelated to this boundary. Instead
+    # `to_header_fields` itself downcases defensively before comparing,
+    # making it the library's one and only normalization point for this
+    # decision: correct standing alone, regardless of how a field's name
+    # reached `@fields`. This spec pins exactly that -- every
+    # construction path below preserves the caller's original mixed-case
+    # name (nothing upstream of `to_header_fields` normalizes it) yet
+    # still selects `Never`.
     added = HTTP2::Headers.new.add("Authorization", "secret")
-    added.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
-    added_field = added.to_header_fields.first
-    added_field.name.should eq("authorization")
-    added_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+      .to_header_fields.first
+    added.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
 
-    assigned = HTTP2::Headers.new
-    assigned["Authorization"] = "secret"
-    assigned.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
-    assigned_field = assigned.to_header_fields.first
-    assigned_field.name.should eq("authorization")
-    assigned_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+    assigned_headers = HTTP2::Headers.new
+    assigned_headers["Authorization"] = "secret"
+    assigned = assigned_headers.to_header_fields.first
+    assigned.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
 
     tupled = HTTP2::Headers.new([{"Authorization", "secret"}])
-    tupled.to_a.should eq([HTTP2::Header.new("authorization", "secret")])
-    tupled_field = tupled.to_header_fields.first
-    tupled_field.name.should eq("authorization")
-    tupled_field.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+      .to_header_fields.first
+    tupled.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
+
+    # The rawest construction path -- a caller-built Header array via
+    # `initialize(fields : Enumerable(Header))` -- was never in scope for
+    # any normalization fix (it has exactly one real caller, `#dup`).
+    # Passing here confirms the never-index boundary stands entirely on
+    # `to_header_fields`'s own downcase, not on any upstream cooperation.
+    raw = HTTP2::Headers.new([HTTP2::Header.new("Authorization", "secret")])
+      .to_header_fields.first
+    raw.indexing.should eq(HTTP2::HeaderField::Indexing::Never)
 
     # Near-misses stay ordinary (Incremental) -- the fix must not overmatch.
     HTTP2::Headers.new.add("Authorization-Foo", "x")

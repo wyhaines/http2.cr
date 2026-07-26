@@ -1304,15 +1304,18 @@ describe HTTP2::Client do
       expect_raises(HTTP2::InvalidRequestError, /pseudo-fields/) do
         http.get("/", HTTP2::Headers{":path" => "/other"})
       end
-      # Task 9 review, Finding 1: Headers#[]=/#add/the tuple constructor
-      # now downcase on insertion (closing a case-sensitive bypass of
-      # to_header_fields' never-index selection), so an uppercase name
-      # supplied through the native Headers API is silently normalized
-      # rather than rejected here -- matching the HTTP::Headers-interop
-      # constructor's existing, unchanged behavior for the same casing.
-      # This sub-case now exercises a byte field_name_error still rejects
-      # regardless of case, so the "malformed field name" path stays
-      # covered.
+      expect_raises(HTTP2::InvalidRequestError, /field name/) do
+        http.get("/", HTTP2::Headers{"X-Upper" => "value"})
+      end
+      # Task 9 review, Finding 1 fix round: this native-Headers-API
+      # uppercase rejection above is unrelated to the never-index
+      # boundary fix (`to_header_fields` alone now closes that, by
+      # downcasing defensively before comparing -- see
+      # spec/request_spec.cr) and was deliberately preserved rather than
+      # reverted, so it stays pinned here unchanged. This second case is
+      # a genuine addition, not a substitute: it exercises a byte
+      # `field_name_error` rejects for a reason other than casing, so
+      # that part of the "malformed field name" path stays covered too.
       expect_raises(HTTP2::InvalidRequestError, /field name/) do
         http.get("/", HTTP2::Headers{"bad field" => "value"})
       end
