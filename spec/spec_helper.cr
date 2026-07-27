@@ -221,6 +221,7 @@ class StallingWriteIO < IO
   @closed_signal = Channel(Nil).new
   @stall = Channel(Nil).new
   @stalled = Atomic(Bool).new(false)
+  @entered_write = Channel(Nil).new(1)
   @written_bytes = Atomic(Int32).new(0)
   @gated_data : Bytes
   @gate = Channel(Nil).new(1)
@@ -247,6 +248,14 @@ class StallingWriteIO < IO
   # a plain `Bool` gives no cross-thread visibility guarantee.
   def stall! : Nil
     @stalled.set(true)
+  end
+
+  def wait_until_write_stalled(timeout : Time::Span) : Nil
+    select
+    when @entered_write.receive?
+    when timeout(timeout)
+      raise "no write ever reached the stalled transport"
+    end
   end
 
   # Appends the bytes supplied to the constructor to the readable stream and
@@ -325,6 +334,10 @@ class StallingWriteIO < IO
 
   def write(slice : Bytes) : Nil
     if @stalled.get
+      select
+      when @entered_write.send(nil)
+      else
+      end
       @stall.receive?
       raise IO::Error.new("transport closed while a write was stalled")
     end

@@ -118,10 +118,14 @@ origin-bound, streaming HTTP/2 client.
   reclaimed merely for going quiet.
 - Dialing now happens outside the client's internal mutex, so `#close`,
   `#closed?`, and other requests no longer block behind an in-progress
-  connect-and-TLS-handshake. As a consequence, concurrent cold requests that
-  all need to dial now each perform their own dial (N concurrent requests →
-  N connects, all but one discarded), where before they serialized behind a
-  single dial.
+  connect-and-TLS-handshake. Concurrent cold or reconnecting requests share
+  one in-flight dial, avoiding duplicate TCP connects and TLS handshakes
+  without putting the slow network operation back under the mutex.
+- If an owned connection terminates before a request can reserve a stream, the
+  client selects a fresh connection once. This is safe connection recovery,
+  not request replay: no request bytes have reached the peer, so it applies
+  even when automatic replay is disabled or the request body is caller-owned
+  `IO`.
 - `#graceful_close(timeout)` now shares one deadline across all of a
   client's connections instead of granting each connection its own full
   `timeout`.

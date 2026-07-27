@@ -141,6 +141,11 @@ Set `stream_slot` to wait up to the configured duration for another stream on
 the connection to close. The wait wakes when a slot becomes available rather
 than polling. If the timeout expires first, `request` raises the same error.
 
+The client currently keeps one connection available for new work. Connections
+retired by `GOAWAY` remain owned only while they drain; the client does not
+open additional connections to scale past a saturated
+`MAX_CONCURRENT_STREAMS` limit.
+
 While a request waits for a slot, the client does not open another stream.
 Other `request` calls on the same `Client` queue behind it, including calls
 that would dial or use a different connection.
@@ -200,6 +205,13 @@ client does not read it until the peer returns a successful response. Once the
 tunnel is open, either direction can close independently.
 
 ## Recovery
+
+Concurrent requests that need a new owned connection share one in-flight
+dial, so a cold start or reconnect does not create a burst of redundant TCP
+connections and TLS handshakes. If that connection terminates before the
+request reserves a stream, the client makes one replacement attempt even when
+automatic replay is disabled. This is safe because no HEADERS or body bytes
+have been submitted yet.
 
 Automatic replay is disabled by default. With an `Idempotent` or `AnyRequest`
 replay policy, the client retries only requests identified as unprocessed by a

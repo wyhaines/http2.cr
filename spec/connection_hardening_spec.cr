@@ -14,6 +14,53 @@ private def encode_headers_frame(
   io.to_slice
 end
 
+# Test-only connection that reports each post-handshake entry into
+# `#enqueue`. Waiting for entry three proves that one command is stalled in
+# the writer, one fills the capacity-1 queue, and the third holds the
+# submission mutex while blocked on that full queue.
+class SubmissionProbeConnection < HTTP2::Connection
+  @probe_mutex = Mutex.new
+  @enqueue_probe_armed = false
+  @enqueue_probe_count = 0
+  @enqueue_entries = Channel(Int32).new(4)
+
+  def arm_enqueue_probe : Nil
+    @probe_mutex.synchronize do
+      @enqueue_probe_count = 0
+      @enqueue_probe_armed = true
+    end
+  end
+
+  def wait_for_enqueue_entry(
+    expected : Int32,
+    timeout : Time::Span = 1.second,
+  ) : Nil
+    deadline = Time.instant + timeout
+    loop do
+      remaining = deadline - Time.instant
+      raise "enqueue entry #{expected} was not reached" if remaining <= Time::Span.zero
+
+      observed = select
+      when value = @enqueue_entries.receive
+        value
+      when timeout(remaining)
+        raise "enqueue entry #{expected} was not reached"
+      end
+      return if observed >= expected
+    end
+  end
+
+  private def enqueue(command : HTTP2::Connection::WriteCommand) : Nil
+    entry = @probe_mutex.synchronize do
+      next unless @enqueue_probe_armed
+
+      @enqueue_probe_count += 1
+    end
+    @enqueue_entries.send(entry) if entry
+    super
+  end
+end
+
 describe HTTP2::Connection::Configuration do
   it "validates Phase 7 lifecycle and resource limits" do
     expect_raises(ArgumentError, /open-stream/) do
@@ -448,6 +495,59 @@ describe HTTP2::Connection do
       # write_timeout) can ever unblock it.
       connection.wait_closed(1.second)
       connection.terminal_error.should be_a(HTTP2::ProtocolError)
+    ensure
+      connection.close
+    end
+  end
+
+  it "includes submission-lock contention in the GOAWAY flush timeout" do
+    violation = wire_frame(
+      HTTP2::Frame::Ping::TypeCode,
+      0_u8,
+      1_u32,
+      Bytes.new(8, 0_u8)
+    )
+    configuration = HTTP2::Connection::Configuration.new(
+      writer_queue_capacity: 1,
+      goaway_flush_timeout: 100.milliseconds
+    )
+    transport = StallingWriteIO.new(violation)
+    connection = SubmissionProbeConnection.start(transport, configuration)
+    submissions = Channel(Exception?).new(3)
+
+    begin
+      connection.wait_until_active(1.second)
+      connection.arm_enqueue_probe
+      transport.stall!
+
+      3.times do |index|
+        spawn do
+          begin
+            payload = "queued0#{index + 1}"
+            connection.write_frame(
+              HTTP2::Frame::Ping.new(
+                0_u8,
+                0_u32,
+                payload
+              )
+            )
+            submissions.send(nil)
+          rescue error
+            submissions.send(error)
+          end
+        end
+
+        connection.wait_for_enqueue_entry(index + 1)
+        transport.wait_until_write_stalled(1.second) if index.zero?
+      end
+
+      # Entry three holds @submission_mutex inside an enqueue to the full
+      # capacity-1 queue. The reader must still give up acquiring that mutex
+      # at goaway_flush_timeout, terminate, and wake all three submitters.
+      transport.release_gated_reads!
+      connection.wait_closed(1.second)
+      connection.terminal_error.should be_a(HTTP2::ProtocolError)
+      3.times { submissions.receive.should_not be_nil }
     ensure
       connection.close
     end

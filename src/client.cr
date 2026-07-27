@@ -169,6 +169,42 @@ module HTTP2
       content_length : Int64?,
       connect : Bool
 
+    # One in-flight owned-connection dial shared by every concurrent caller.
+    # Completion is always performed while the client's mutex is held, so the
+    # error assignment and idempotence check do not need their own lock.
+    private class DialAttempt
+      getter error : Exception? = nil
+      getter signal = Channel(Nil).new
+
+      def complete(error : Exception? = nil) : Nil
+        return if @signal.closed?
+
+        @error = error
+        @signal.close
+      end
+
+      def wait : Nil
+        @signal.receive?
+        if failure = error
+          raise failure
+        end
+      end
+    end
+
+    # Marks a failure that happened before the request reserved a stream.
+    # Retrying this is connection recovery, not request replay: no request
+    # fields or body bytes can have reached the peer yet.
+    private class PreRequestConnectionError < Exception
+      getter connection_error : Exception
+
+      def initialize(@connection_error : Exception)
+        super(
+          "HTTP/2 connection failed before the request opened a stream",
+          @connection_error
+        )
+      end
+    end
+
     getter timeouts : Timeouts
     getter connection_configuration : Connection::Configuration
     getter replay_policy : ReplayPolicy
@@ -201,6 +237,7 @@ module HTTP2
     @origin : Origin
     @connection : Connection?
     @retired_connections = [] of Connection
+    @dial_attempt : DialAttempt?
     @supplied_connection : Bool
     @closed = false
     @mutex = Mutex.new
@@ -316,13 +353,19 @@ module HTTP2
       end
 
       replay_attempts = 0
-      draining_retries = 0
+      pre_request_retries = 0
       loop do
         begin
           return perform_request(request, cancellation)
         rescue error : Connection::DrainingError
-          draining_retries += 1
-          raise error if @supplied_connection || draining_retries > 1
+          pre_request_retries += 1
+          raise error if @supplied_connection || pre_request_retries > 1
+          check_cancellation!(cancellation)
+        rescue error : PreRequestConnectionError
+          pre_request_retries += 1
+          if @supplied_connection || pre_request_retries > 1
+            raise error.connection_error
+          end
           check_cancellation!(cancellation)
         rescue error : Connection::UnprocessedStreamError
           unless should_replay?(request, error, replay_attempts, cancellation)
@@ -456,7 +499,7 @@ module HTTP2
     ) : Stream
       @stream_open_mutex.synchronize do
         check_cancellation!(cancellation)
-        stream = connection.new_stream
+        stream = reserve_request_stream(connection)
         begin
           stream.inbound_validator = ResponseValidator.new(
             stream.id,
@@ -491,6 +534,24 @@ module HTTP2
           raise error
         end
       end
+    end
+
+    # Reserves a stream before any request bytes are submitted. If the
+    # selected owned connection closes in the narrow gap after
+    # `#ready_connection` checked it, preserving the ordinary connection
+    # error as `PreRequestConnectionError` lets `#request` safely select a
+    # replacement once. Errors after this method returns are deliberately
+    # not wrapped: HEADERS may already have reached the peer by then, so the
+    # normal explicit replay policy must remain authoritative.
+    private def reserve_request_stream(connection : Connection) : Stream
+      connection.new_stream
+    rescue error : Connection::DrainingError
+      raise error
+    rescue error
+      if !@supplied_connection && connection.closed?
+        raise PreRequestConnectionError.new(error)
+      end
+      raise error
     end
 
     # Sends `stream`'s request HEADERS, waiting for a peer-imposed
@@ -651,72 +712,89 @@ module HTTP2
     end
 
     # Returns the connection to use for the next request, dialing a fresh
-    # one if necessary. The dial itself (`#dial`'s connect-plus-TLS-
+    # one if necessary. The dial itself (`#dial`'s connect-plus-TLS
     # handshake) deliberately runs OUTSIDE `@mutex` — it can take a
     # connect-timeout's worth of wall-clock time against a slow or
     # unresponsive origin, and holding `@mutex` for that whole span would
-    # serialize `#close`/`#closed?`/every other concurrent `#request`
-    # call behind it. Only the bookkeeping before and after the dial —
-    # deciding WHETHER to dial, and publishing the result — runs locked.
+    # serialize `#close`/`#closed?` behind it.
     #
-    # That split means two fibers can legitimately decide to dial at the
-    # same time (both saw `@connection` as nil/unusable before either had
-    # dialed). Both dial in full, unlocked; whichever RE-ACQUIRES `@mutex`
-    # first publishes its connection to `@connection` and wins — UNLESS
-    # the winner's connection has ALREADY gone closed/draining by the
-    # time a slower dialer checks (a real window: the loser's dial can
-    # take arbitrarily longer than the winner's), in which case the
-    # slower dialer retires it exactly as the fast path above would and
-    # promotes ITS OWN freshly-dialed connection instead, rather than
-    # hand back a connection that would immediately fail
-    # `#wait_until_active`/raise on first use. A dial that turns out to
-    # be redundant (a genuine loser, or one that arrives after `#close`)
-    # is closed AFTER releasing `@mutex` — `Connection#close` joins
-    # several background fibers with no timeout, so closing it while
-    # still holding `@mutex` could wedge `#close`/`#closed?`/every other
-    # request behind a stuck teardown, exactly the failure mode this
-    # whole split exists to avoid.
-    #
-    # Concurrent cold dials are the one cost of this: N simultaneous
-    # requests against an idle client each perform their own full dial
-    # (N TCP connects, N TLS handshakes for `https`) before N-1 are
-    # discarded, where a fully-serialized dial would perform exactly
-    # one. Not addressed here — a "dial in progress, wait for it"
-    # latch would trade this for a different set of tradeoffs and is a
-    # candidate for a follow-up if the extra dials prove costly in
-    # practice.
+    # Exactly one caller owns an in-flight dial. Concurrent cold requests
+    # wait on its `DialAttempt`, then re-check the published connection;
+    # they do not perform duplicate TCP connects or TLS handshakes. A dial
+    # failure is shared by those waiters as well, preventing a failed
+    # attempt from immediately turning into a reconnect stampede. `#close`
+    # completes the attempt with `Client::ClosedError`, so waiters wake
+    # promptly even though the owning fiber's underlying socket operation
+    # may still need its configured timeout to unwind.
     private def connection_for_request : Connection
-      @mutex.synchronize do
-        raise ClosedError.new("HTTP/2 client is closed") if @closed
+      loop do
+        attempt = nil
+        dialer = false
+        @mutex.synchronize do
+          raise ClosedError.new("HTTP/2 client is closed") if @closed
 
-        @retired_connections.reject!(&.closed?)
-        if current = @connection
-          return current unless current.closed? || current.draining?
-          if @supplied_connection
-            raise(
-              current.terminal_error ||
-              Connection::DrainingError.new(
-                "supplied HTTP/2 connection is draining or closed"
+          @retired_connections.reject!(&.closed?)
+          if current = @connection
+            return current unless current.closed? || current.draining?
+            if @supplied_connection
+              raise(
+                current.terminal_error ||
+                Connection::DrainingError.new(
+                  "supplied HTTP/2 connection is draining or closed"
+                )
               )
-            )
+            end
+            @retired_connections << current unless current.closed?
+            @connection = nil
           end
-          @retired_connections << current unless current.closed?
-          @connection = nil
-        end
-      end
 
-      publish_dialed_connection(dial)
+          if pending = @dial_attempt
+            attempt = pending
+          else
+            pending = DialAttempt.new
+            @dial_attempt = pending
+            attempt = pending
+            dialer = true
+          end
+        end
+
+        current_attempt = attempt ||
+                          raise "connection selection omitted its dial attempt"
+        unless dialer
+          current_attempt.wait
+          next
+        end
+
+        selected = begin
+          publish_dialed_connection(dial)
+        rescue error
+          finish_dial_attempt(current_attempt, error)
+          raise error
+        end
+        finish_dial_attempt(current_attempt)
+        return selected
+      end
     end
 
-    # Publishes a freshly-dialed connection as `@connection`, UNLESS
-    # either `#close` landed, or another fiber's dial already won, while
-    # this one was in flight — see `#connection_for_request`'s doc
-    # comment for the full race. `dialed` is closed AFTER `@mutex` is
-    # released whenever it turns out to be redundant (a genuine loser,
-    # or one arriving after `#close`): `Connection#close` joins several
-    # background fibers with no timeout, so closing it while still
-    # holding `@mutex` could wedge `#close`/`#closed?`/every other
-    # request behind a stuck teardown.
+    private def finish_dial_attempt(
+      attempt : DialAttempt,
+      error : Exception? = nil,
+    ) : Nil
+      @mutex.synchronize do
+        if current = @dial_attempt
+          @dial_attempt = nil if current.same?(attempt)
+        end
+        attempt.complete(error)
+      end
+    end
+
+    # Publishes a freshly-dialed connection as `@connection`, unless
+    # `#close` landed while it was in flight. The existing-current branch
+    # is defensive (and supports deterministic race probes); normal client
+    # operation permits only one `DialAttempt`, so no second dialer can
+    # publish a winner concurrently. A redundant connection is closed only
+    # AFTER `@mutex` is released: `Connection#close` joins background
+    # fibers, and a slow teardown must not wedge `#close`/`#closed?`.
     #
     # The `ensure`'s `redundant.try(&.close)` running after a `raise`
     # inside the `synchronize` block (the `@closed` branch) means that,
@@ -756,18 +834,37 @@ module HTTP2
 
     private def ready_connection : Connection
       connection = connection_for_request
-      connection.wait_until_active(@timeouts.read)
-      connection
-    rescue error : Connection::TimeoutError
-      raise RequestTimeoutError.new(
-        "waiting for the HTTP/2 handshake timed out",
-        error
-      )
-    rescue error : IO::TimeoutError
-      raise RequestTimeoutError.new(
-        "connecting to the HTTP/2 origin timed out",
-        error
-      )
+      begin
+        connection.wait_until_active(@timeouts.read)
+        connection
+      rescue error : Connection::TimeoutError
+        mapped = RequestTimeoutError.new(
+          "waiting for the HTTP/2 handshake timed out",
+          error
+        )
+        raise_ready_connection_error(connection, mapped)
+      rescue error : IO::TimeoutError
+        mapped = RequestTimeoutError.new(
+          "connecting to the HTTP/2 origin timed out",
+          error
+        )
+        raise_ready_connection_error(connection, mapped)
+      rescue error
+        raise_ready_connection_error(connection, error)
+      end
+    end
+
+    # A closed connection cannot become ready later. Because no stream has
+    # been reserved at this point, one replacement attempt is always safe,
+    # even for non-idempotent requests and caller-owned body IO.
+    private def raise_ready_connection_error(
+      connection : Connection,
+      error : Exception,
+    ) : NoReturn
+      if !@supplied_connection && connection.closed?
+        raise PreRequestConnectionError.new(error)
+      end
+      raise error
     end
 
     # Dials a new connection. Neither branch passes `read_timeout:`: a
@@ -1245,6 +1342,12 @@ module HTTP2
         next [] of Connection if @closed
 
         @closed = true
+        if attempt = @dial_attempt
+          @dial_attempt = nil
+          attempt.complete(
+            ClosedError.new("HTTP/2 client is closed")
+          )
+        end
         connections = @retired_connections
         if current = @connection
           connections << current

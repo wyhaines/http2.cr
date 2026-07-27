@@ -43,18 +43,12 @@ class HTTP2::Client
   end
 end
 
-# Test-only: `#connection_for_request`'s two-lock-acquisition race
-# (winner-publishes / loser-recovers) is otherwise only reachable by
-# racing real sockets and hoping the scheduler cooperates -- exactly
-# the flakiness this suite hit under `-Dpreview_mt` before this seam
-# existed. `#dial` is the ONE call that runs BETWEEN the two lock
-# acquisitions, so overriding it in a subclass lets a spec simulate
-# "another fiber already published a winner while this one was still
-# dialing" with zero timing dependence: arm it with the two connections
-# to use, and every `#dial` call (triggered indirectly through any
-# public request method) publishes `winner` as `@connection` and hands
-# back `fresh` as this fiber's own completed dial, exactly reproducing
-# the adversarial interleaving without needing a second fiber at all.
+# Test-only: single-flight dialing makes a concurrent winner impossible in
+# normal client operation, but `#publish_dialed_connection` still defends
+# against finding an existing connection when a dial returns. Overriding
+# `#dial` provides a deterministic probe for that branch without racing real
+# sockets: it installs `winner` as `@connection` and returns `fresh` as the
+# completed dial.
 class RaceSimulatingClient < HTTP2::Client
   @simulated_fresh_dial : HTTP2::Connection?
   @simulated_winner : HTTP2::Connection?
@@ -1352,6 +1346,67 @@ describe HTTP2::Client do
     end
   end
 
+  it "reconnects before consuming a caller-owned request body" do
+    server = TCPServer.new("127.0.0.1", 0)
+    peer_result = scripted_peer(server) do |listener|
+      first = listener.as(TCPServer).accept
+      begin
+        # Let the first dial finish and publish its Connection, then close
+        # without sending peer SETTINGS. The request has not reserved a
+        # stream, so selecting a replacement is always safe.
+        read_client_preface(first)
+      ensure
+        first.close
+      end
+
+      second = listener.as(TCPServer).accept
+      begin
+        complete_server_handshake(second)
+        request = client_read_field_section(second, HPack::Decoder.new)
+        field_pairs(request[:fields]).should contain({":method", "POST"})
+        request[:end_stream].should be_false
+
+        body = IO::Memory.new
+        ended = false
+        until ended
+          data = HTTP2::Frame.read(second).as(HTTP2::Frame::Data)
+          data.stream_id.should eq(request[:stream_id])
+          body.write(data.data)
+          ended = data.end_stream?
+        end
+        body.to_s.should eq("one-shot")
+
+        write_server_fields(
+          second,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      ensure
+        second.close
+      end
+    end
+
+    http = HTTP2::Client.new(
+      "http://127.0.0.1:#{server.local_address.port}",
+      timeouts: HTTP2::Client::Timeouts.new(
+        connect: 1.second,
+        read: 1.second,
+        write: 1.second
+      )
+    )
+    begin
+      body = IO::Memory.new("one-shot")
+      http.post("/after-reconnect", body: body).status.should eq(204)
+      body.pos.should eq(body.size)
+      wait_for_peer(peer_result)
+    ensure
+      http.close
+      server.close
+    end
+  end
+
   it "raises Client::ClosedError for a request made after #close" do
     http = HTTP2::Client.new("http://example.test")
     http.close
@@ -1539,24 +1594,15 @@ describe HTTP2::Client do
     end
   end
 
-  it "dials once per concurrent cold requester, but every loser " \
-     "closes its own connection so exactly one survives" do
+  it "shares one dial across concurrent cold requests" do
     server = TCPServer.new("127.0.0.1", 0)
     concurrency = 8
     counts_mutex = Mutex.new
     accepted = 0
     closed = 0
 
-    # Accepts until the listener itself closes (this example's `ensure`),
-    # rather than presupposing exactly `concurrency` connections arrive.
-    # Under a real (`-Dpreview_mt`) scheduler, `spawn` can start a fiber
-    # on another worker thread before this test's own spawn loop below
-    # even finishes enqueueing the rest, so an early dialer can publish
-    # `@connection` before a later fiber ever decides to dial at all --
-    # fewer than `concurrency` actual TCP connects is then a legitimate,
-    # scheduler-dependent outcome (measured: ~8% of `-Dpreview_mt` runs),
-    # not a bug. Asserting a hardcoded `accepted == concurrency` was
-    # this spec's original mistake.
+    # Accept until the listener closes so an unexpected redundant dial is
+    # observed rather than rejected by a one-shot accept script.
     peer_result = scripted_peer(server) do |listener|
       loop do
         socket = begin
@@ -1581,11 +1627,7 @@ describe HTTP2::Client do
               )
             end
           rescue
-            # A losing dial: the client closed this socket before (or
-            # partway through) the handshake, since `#connection_for_request`
-            # decided this connection was redundant. Or, for the one
-            # survivor, the eventual `#close` at the end of this
-            # example. Either way, falls through to the `ensure` below.
+            # The surviving connection reaches this when the client closes.
           ensure
             counts_mutex.synchronize { closed += 1 }
           end
@@ -1602,12 +1644,6 @@ describe HTTP2::Client do
       )
     )
     begin
-      # Spawned back-to-back, with no blocking call in between, so the
-      # scheduler does not run any of them until every one of these
-      # `concurrency` fibers is already enqueued -- each independently
-      # observes `@connection` as nil/unusable and dials, exactly the
-      # race `#connection_for_request`'s doc comment describes (modulo
-      # the real-MT-scheduler caveat above).
       results = Channel(Exception?).new(concurrency)
       concurrency.times do |i|
         spawn do
@@ -1622,15 +1658,9 @@ describe HTTP2::Client do
         raise error if error
       end
 
-      # Every one of the `concurrency` requests above already completed
-      # successfully, and only a request can trigger a dial -- so
-      # whatever set of connections was EVER going to be dialed has
-      # already been fully decided by this point; nothing more will be
-      # attempted. What may still be catching up is purely server-side
-      # bookkeeping (`#accept` returning for an already-established TCP
-      # connection). Settle by requiring the SAME (accepted, closed)
-      # pair on two consecutive polls before trusting it -- this rules
-      # out asserting against a value caught mid-transition.
+      # Every request has completed and only a request can initiate a dial.
+      # Settle the server-side accept bookkeeping before asserting the exact
+      # single-flight invariant.
       previous = {-1, -1}
       settled = {0, 0}
       eventually(message: "accept/close counts never settled") do
@@ -1641,15 +1671,12 @@ describe HTTP2::Client do
         is_settled
       end
       observed_accepted, observed_closed = settled
-      # However many connections were actually dialed (winners and
-      # losers alike), every one but the surviving winner must already
-      # be closed -- the scheduler-independent invariant, in place of
-      # the flaky hardcoded `concurrency` this spec started with.
-      observed_closed.should eq(observed_accepted - 1)
+      observed_accepted.should eq(1)
+      observed_closed.should eq(0)
 
       http.close
       eventually(message: "the surviving connection never closed") do
-        counts_mutex.synchronize { closed } == observed_accepted
+        counts_mutex.synchronize { closed } == 1
       end
       server.close
       wait_for_peer(peer_result)

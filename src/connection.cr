@@ -1051,37 +1051,50 @@ module HTTP2
     # ever sending it. A peer that stalled its own reads forfeits the
     # courtesy frame instead of hanging the connection indefinitely.
     #
-    # `timeout` bounds the two steps THIS method performs: admission onto
-    # @write_queue (#enqueue_bounded) and the flush wait (#command.wait).
-    # It does NOT bound acquiring @submission_mutex itself, one level
-    # further out — #submit/#submit_nowait hold that mutex across
-    # #enqueue's own *unbounded* `@write_queue.send`, so if another fiber
-    # is already parked there (requires a stalled writer AND @write_queue
-    # already full at `writer_queue_capacity`, default 32, AND that other
-    # fiber having entered #enqueue first) this method's own
-    # `@submission_mutex.synchronize` call can itself block indefinitely
-    # before #enqueue_bounded — and thus this method's own deadline logic
-    # — ever runs. Not a regression: this mutex-held-across-a-blocking-
-    # send shape predates this task and is shared by #submit/
-    # #submit_nowait; not fixed here (would mean changing what
-    # @submission_mutex actually is, e.g. a capacity-1 Channel used as an
-    # acquire/release gate with its own select-with-timeout, touching
-    # every caller of #submit/#submit_nowait, not just this one — a
-    # larger, riskier change than this task's scope). The deadline is a
-    # hard guarantee when the reader is the sole (or first) contender for
-    # @submission_mutex — true for the single-stalled-write scenario this
-    # method exists to fix and this file's own regression spec exercises
-    # — not guaranteed under concurrent submission pressure compounded
-    # with an already-saturated queue.
+    # The same deadline covers all three steps: acquiring
+    # `@submission_mutex`, admission onto `@write_queue`, and the flush
+    # wait. Ordinary submitters deliberately keep the simple mutex hot
+    # path. This rare reader-error path instead delegates mutex acquisition
+    # and bounded admission to a helper fiber and races its result against
+    # the deadline. If acquisition loses, cancellation makes the helper a
+    # no-op once it eventually acquires the mutex; the caller returns and
+    # terminates the connection, closing `@write_queue` and thereby waking
+    # whichever ordinary submitter was holding the mutex on a full queue.
     private def submit_bounded(
       command : WriteCommand,
       timeout : Time::Span,
     ) : Nil
       deadline = Time.instant + timeout
-      admitted = @submission_mutex.synchronize do
-        enqueue_bounded(command, deadline)
+      result = Channel(Bool | Exception).new(1)
+      canceled = Atomic(Bool).new(false)
+      ::spawn(name: "http2-bounded-submission") do
+        begin
+          admitted = @submission_mutex.synchronize do
+            next false if canceled.get
+
+            enqueue_bounded(command, deadline)
+          end
+          result.send(admitted)
+        rescue error
+          result.send(error)
+        end
       end
-      return unless admitted
+
+      remaining = deadline - Time.instant
+      if remaining <= Time::Span.zero
+        canceled.set(true)
+        return
+      end
+
+      outcome = select
+      when completed = result.receive
+        completed
+      when timeout(remaining)
+        canceled.set(true)
+        return
+      end
+      raise outcome if outcome.is_a?(Exception)
+      return unless outcome
 
       remaining = deadline - Time.instant
       return if remaining <= Time::Span.zero
