@@ -3,34 +3,18 @@
 
 # http2.cr
 
-`http2.cr` is a pure Crystal implementation of HTTP/2: a production-quality,
-origin-bound streaming client built on a reusable protocol core.
+`http2.cr` provides an origin-bound HTTP/2 client for Crystal. It supports
+concurrent requests, streaming request and response bodies, connection reuse,
+TLS, cancellation, timeouts, and request and response trailers. Its frame and
+connection types can also be used independently.
 
 ## Status
 
-The source tree is prepared as `1.0.0-rc.1`, the first release candidate.
-All implementation phases are complete, including an independent local
-nghttp2 matrix. The candidate is suitable for integration testing; validate
-it under your workload before production deployment and report API or
-protocol issues before the final 1.0 release.
-
-Development is organized in ordered phases:
-
-- [Implementation roadmap](design/http2-implementation-roadmap.md)
-- [Architecture decisions](design/architecture.md)
-- [Current implementation status](design/implementation-status.md)
-- [Changelog](CHANGELOG.md)
-- [Release and versioning policy](RELEASING.md)
-
-## Architecture
-
-One reader fiber parses and validates inbound frames. One ordered writer owns
-outbound HPACK state, field-block fragmentation, and fair flow-controlled DATA
-scheduling. Each connection has persistent HPACK contexts, bounded queues, and
-bounded per-stream response storage. `HTTP2::Client` adds HTTP semantics,
-timeouts, cancellation, safe origin reuse, and explicit replay policy above
-that protocol core. See the [architecture document](design/architecture.md)
-for ownership and shutdown details.
+Version `1.0.0-rc.1` is the first release candidate. All functionality planned
+for 1.0 has been implemented and checked against `nghttp2` in local
+interoperability tests. Test the candidate under your workload before
+deploying it in production, and report API or protocol issues before the final
+1.0 release.
 
 ## Installation
 
@@ -45,16 +29,17 @@ dependencies:
 
 Then run `shards install`.
 
-## Client Usage
+## Client usage
 
-Create one client per origin; it safely reuses that origin's HTTP/2 connection.
-Field names must already be lowercase. `HTTP2::Headers` preserves insertion
+Create one client per origin. The client reuses its HTTP/2 connection for that
+origin. Header names must be lowercase. `HTTP2::Headers` preserves insertion
 order and repeated names.
 
-Ordinary header fields may compress into the connection's HPACK dynamic
-table on a later request; `authorization`, `proxy-authorization`, `cookie`,
-and `set-cookie` never do. Give a custom credential header (e.g.
-`x-api-key`) the same protection with `additional_never_indexed_fields:`.
+Ordinary header fields may enter the connection's HPACK dynamic table, which
+improves compression when they recur. The client marks `authorization`,
+`proxy-authorization`, `cookie`, and `set-cookie` as never indexed. Use
+`additional_never_indexed_fields:` for custom credential headers such as
+`x-api-key`. The client keeps those fields out of the dynamic table too.
 
 ```crystal
 require "http2"
@@ -83,8 +68,10 @@ ensure
 end
 ```
 
+### Streaming request bodies and cancellation
+
 Pass an `IO` as a request body to stream it from its current position. A
-`Cancellation` can be shared with `#get`, `#post`, or `#request`; canceling it
+`Cancellation` can be shared with `#get`, `#post`, or `#request`. Canceling it
 resets only that request's stream:
 
 ```crystal
@@ -107,83 +94,97 @@ ensure
 end
 ```
 
-String and Bytes bodies have a known length and are owned by the request.
-Caller-supplied `IO` bodies stream once from their current position.
+`String` and `Bytes` bodies have a known length and are owned by the request.
+A caller-supplied `IO` body streams once from its current position. The caller
+remains responsible for closing it.
 
-## Timeouts and TLS
+## Timeouts
 
 Timeouts apply independently:
 
 | Setting | Covers |
 | --- | --- |
 | `connect` | DNS lookup and TCP connection |
-| `read` | The TLS and HTTP/2 handshakes (for `https`, the TLS handshake itself; then, for both schemes, waiting for the peer's SETTINGS after dialing) and each response-header wait |
-| `write` | Transport writes. An upload blocked on HTTP/2 flow control is not covered; it ends via cancellation, response-side timeouts, or connection failure |
-| `idle` | A blocked response-body read or trailer wait, and (see below) an abandoned response |
-| `stream_slot` | How long `request` waits for a peer concurrent-stream slot (nil by default; see below) |
+| `read` | TLS and HTTP/2 handshakes, then each response-header wait |
+| `write` | Writes to the transport |
+| `idle` | Response-body reads, trailer waits, and abandoned responses |
+| `stream_slot` | Waiting for a peer concurrent-stream slot (`nil` by default) |
 
-Nil disables one timeout. A request `Cancellation` remains active after
-response headers arrive, so it can interrupt body and trailer waits.
+Set an individual timeout to `nil` to disable it. A request `Cancellation`
+remains active after response headers arrive and can interrupt body and trailer
+waits.
 
-There is no persistent socket-level read timeout, so an idle pooled
-connection or a quiet long-lived stream (SSE, long-poll) is never killed
-merely for going quiet between waits. Liveness on an already-established
-connection is keepalive's job instead: `HTTP2::Client` enables it by
-default (`Connection::Configuration#keepalive_interval` 30 seconds,
-`#keepalive_timeout` 10 seconds); pass a `connection_configuration:` with
-`keepalive_interval: nil` to disable it.
+For HTTPS, `read` covers the TLS handshake. For both HTTP and HTTPS, it also
+covers the wait for the peer's SETTINGS after dialing and each response-header
+wait.
 
-If the peer's MAX_CONCURRENT_STREAMS limit is already reached, `request`
-raises `Connection::ConcurrentStreamLimitError` immediately — unless
-`stream_slot` is set, in which case it waits up to that long for some
-other stream on the connection to close (waking promptly rather than
-polling) before raising the same error. A configured wait holds this
-`Client`'s internal stream-open serialization for its full span: every
-other `request` call on the SAME `Client` — even one that will dial or is
-bound to a different connection — queues behind it until the wait
-resolves.
+The `write` timeout covers writes to the transport. It does not cover an upload
+waiting for HTTP/2 flow-control credit. End such a wait through cancellation,
+a response-side timeout, or connection failure.
 
-**Limitation when one `Connection` is shared by more than one opener**
-(more than one `Client` bound to it, or raw `Connection` use alongside a
-`Client` — not the common case): a different opener can win a freed slot
-first, and RFC 9113's increasing-stream-ID rule then implicitly closes
-("skips") this request's own reservation. `request` detects this —
-internally, `Connection::ClosedError` ("stream N was skipped by stream
-M") or, rarely, `Connection::InvalidStateError` ("stream N is not active
-on this connection") — and recovers by reserving a fresh stream and
-retrying within the same `stream_slot` budget. That recovery races the
-other opener too, so under sustained multi-opener contention `request`
-is not guaranteed to win eventually; it is guaranteed to never hang and
-to always either succeed or raise once its own `stream_slot` budget is
-exhausted — the error raised is whichever one the exhausting attempt
-itself hit (`Connection::ConcurrentStreamLimitError` if it was still
-waiting for a slot; `Connection::ClosedError` or
-`Connection::InvalidStateError` if it was mid-recovery from a skip),
-not necessarily the former. A single `Client` per `Connection` never
-encounters this at all.
+### Connection liveness
 
-A `Response` the caller abandons — never reads, never closes — would
-otherwise hold its stream and connection-window credit open forever,
-which can stall every other request on the connection. `idle` doubles as
-that safety net, but only once the body is actually pinning credit: each
-time `idle` elapses with unread buffered data present and no bytes read
-since the previous check, the response's stream is canceled — credit for
-that buffered data returned, RST_STREAM sent, and the body left with a
-terminal error so a later read raises that specific error (e.g.
-`RequestTimeoutError` here). A caller's own `Response#close` also makes a
-later read raise rather than return a silent EOF, but with a generic
-`IO::Error` ("Closed stream") instead of a stream's own terminal error —
-the two remain distinguishable by exception type, not by whether reading
-raises at all. Any consumption in that window re-arms the deadline
-instead, so a reader that is merely slow is never killed. A quiet stream
-with an EMPTY buffer
-— an SSE or long-poll response between events, a successful CONNECT
-tunnel sitting quiet while the app uploads — pins no credit and keeps
-running indefinitely, matching the "never killed merely for going quiet"
-promise above. Set `idle: nil` to disable both this and the per-read/
-trailer timeout.
+`HTTP2::Client` does not apply a persistent socket-level read timeout. An idle
+pooled connection or a quiet long-lived stream, such as SSE or long polling,
+can remain open between active waits.
 
-Cleartext `http` origins use direct HTTP/2 prior knowledge; HTTP/1.1 `Upgrade`
+Keepalive checks established connections for liveness. The client uses a
+30-second `keepalive_interval` and a 10-second `keepalive_timeout`. To disable
+keepalive, pass a `connection_configuration:` with
+`keepalive_interval: nil`.
+
+### Concurrent-stream limits
+
+If the peer's `MAX_CONCURRENT_STREAMS` limit has been reached,
+`Client#request` raises `Connection::ConcurrentStreamLimitError` immediately.
+Set `stream_slot` to wait up to the configured duration for another stream on
+the connection to close. The wait wakes when a slot becomes available rather
+than polling. If the timeout expires first, `request` raises the same error.
+
+While a request waits for a slot, the client does not open another stream.
+Other `request` calls on the same `Client` queue behind it, including calls
+that would dial or use a different connection.
+
+Sharing one `Connection` among several callers that can open streams introduces
+a race. This can happen when more than one `Client` uses the connection, or
+when code uses the raw `Connection` API alongside a client. Another caller may
+claim a freed slot first. Because HTTP/2 stream IDs must increase, opening that
+stream can skip the waiting request's reservation.
+
+`request` detects a skipped reservation and reserves a new stream within the
+original `stream_slot` budget. Sustained contention does not guarantee that it
+will win a slot. The request either opens a stream or raises once its budget is
+exhausted. Depending on the final attempt, it may raise
+`Connection::ConcurrentStreamLimitError`, `Connection::ClosedError`, or
+`Connection::InvalidStateError`. A single `Client` per `Connection` does not
+encounter this race.
+
+### Abandoned responses
+
+If a caller neither reads nor closes a `Response`, buffered body data may hold
+stream and connection-window credit. This can stall other requests on the
+connection. The `idle` timeout protects the connection once an unread body is
+holding that credit.
+
+If `idle` elapses while unread data is buffered and the caller has consumed no
+bytes since the previous check, the client cancels the stream. It returns the
+buffered-data credit, sends `RST_STREAM`, and records a terminal
+`RequestTimeoutError` on the body. A later read raises that error.
+
+Calling `Response#close` also makes a later read raise, rather than returning
+a silent EOF. In that case the read raises a generic `IO::Error` with the
+message `"Closed stream"` instead of the stream's terminal error.
+
+Reading any data re-arms the deadline, so a slow reader can continue making
+progress. A quiet stream with an empty buffer holds no receive-window credit
+and can remain open indefinitely. This includes an SSE or long-poll response
+between events and a successful CONNECT tunnel while the application uploads.
+Set `idle: nil` to disable both abandoned-response protection and the
+timeouts for body reads and trailers.
+
+## TLS and CONNECT
+
+Cleartext `http` origins use direct HTTP/2 prior knowledge. HTTP/1.1 `Upgrade`
 is not attempted. HTTPS verifies the certificate and hostname, sends SNI, and
 requires ALPN `h2`. Supply a configured `OpenSSL::SSL::Context::Client` to add
 a private trust root or client certificate:
@@ -194,55 +195,83 @@ tls.ca_certificates = "/etc/my-service/ca.pem"
 client = HTTP2::Client.new("https://service.internal", tls_context: tls)
 ```
 
-For ordinary CONNECT, a supplied `IO` is tunnel data and is not read until the
-peer returns a successful response; either tunnel direction can then close
-independently.
+For a standard CONNECT request, a supplied `IO` contains tunnel data. The
+client does not read it until the peer returns a successful response. Once the
+tunnel is open, either direction can close independently.
 
-## Recovery and Diagnostics
+## Recovery
 
-Automatic replay is disabled by default. `Idempotent` or `AnyRequest` retries
-only a request proven unprocessed by GOAWAY or `REFUSED_STREAM`, up to
-`max_replay_attempts`. Nil, String, and Bytes bodies can be reproduced;
-caller-owned streaming `IO` is never replayed.
+Automatic replay is disabled by default. With an `Idempotent` or `AnyRequest`
+replay policy, the client retries only requests identified as unprocessed by a
+`GOAWAY` frame or `REFUSED_STREAM`. It makes no more than
+`max_replay_attempts` replay attempts. Bodies represented by `nil`, `String`,
+or `Bytes` can be reproduced. A caller-owned streaming `IO` is not replayed.
 
-`Client#graceful_close` sends GOAWAY and waits for established streams until
-`Connection::Configuration#drain_timeout`; `#close` remains an immediate,
-idempotent cancellation. Connection configuration also bounds open streams,
-queued work, field sections, buffered bodies, control/empty-frame rates, and
-retained closed-stream state. The connection-level receive window
+`Client#graceful_close` sends `GOAWAY` and waits up to
+`Connection::Configuration#drain_timeout` for established streams to finish.
+`#close` cancels the connection immediately and is idempotent.
+
+Connection configuration bounds open streams, queued work, field sections,
+buffered bodies, control and empty-frame rates, and retained closed-stream
+state. The connection-level receive window
 (`Connection::Configuration#connection_receive_window`, default 1 MiB)
-governs aggregate download throughput per round trip; per-stream windows
-remain bounded separately by `max_buffered_body_bytes`. `HTTP2::Client`
-enables keepalive by default (`keepalive_interval` 30 seconds,
-`keepalive_timeout` 10 seconds); supply a `connection_configuration:` with
-`keepalive_interval: nil` to disable it.
+governs aggregate download throughput per round trip. Per-stream windows are
+bounded separately by `max_buffered_body_bytes`.
 
-Advanced users can consume `Connection#diagnostics`, a bounded channel of
-frame metadata, settings, lifecycle changes, and typed errors. Diagnostics
-exclude HTTP field values and GOAWAY debug data; check
-`#dropped_diagnostic_count` when the consumer is slower than the connection.
+## Diagnostics
+
+`Connection#diagnostics` is a bounded channel that reports frame metadata,
+settings, lifecycle changes, and typed errors. It excludes HTTP field values
+and GOAWAY debug data. Check `#dropped_diagnostic_count` to determine whether
+the consumer has fallen behind the connection.
+
+## Architecture
+
+Each connection uses one reader fiber to parse and validate inbound frames. A
+single ordered writer manages outbound HPACK state, field-block fragmentation,
+and fair scheduling of flow-controlled `DATA`. The connection retains its HPACK
+contexts across requests and bounds its queues and per-stream response
+storage.
+
+`HTTP2::Client` adds HTTP semantics, timeouts, cancellation, origin reuse, and
+replay policy to the protocol core. See the
+[architecture document](design/architecture.md) for ownership and shutdown
+details.
+
+## Low-level connection API
+
+Raw `Connection.connect_*`, `Connection.start`, and `Connection.start_tls`
+calls do not inherit the client's defaults. By default, they add neither
+transport timeouts nor keepalive. When dialing an untrusted peer, set
+`read_timeout:` and `write_timeout:` as appropriate. For a supplied transport,
+set the equivalent properties directly. You can also enable
+keepalive with `Configuration#keepalive_interval`. TLS callers can set
+`handshake_read_timeout:` on `connect_tls` and `start_tls`. `HTTP2::Client`
+applies the timeout and liveness behavior described above.
 
 ## Limitations
 
-The initial stable target is an HTTP/2 client. It does not provide:
+Version 1.0 focuses on the HTTP/2 client. It does not provide:
 
-- a server role, HTTP/1.1 fallback, or `h2c` upgrade;
-- server-push consumption or RFC 9218 priority scheduling;
-- extended CONNECT, ALTSVC/ORIGIN handling, or cross-origin coalescing;
-- redirect, cookie, proxy, decompression, or retry policy beyond the explicit
-  proven-unprocessed replay modes.
-- Raw `Connection.connect_*`/`Connection.start` default to no transport
-  timeouts and no keepalive; set `read_timeout:`/`write_timeout:` (and, for
-  `connect_tls`/`start_tls`, `handshake_read_timeout:`) or
-  `Configuration#keepalive_interval` when talking to untrusted peers.
-  `HTTP2::Client` sets a write timeout by default and bounds the TLS and
-  HTTP/2 handshakes and each response wait with `read`, but does not set a
-  persistent `read_timeout` on the socket; it enables keepalive by default
-  instead to detect a silent peer on an established connection.
+- A server role, HTTP/1.1 fallback, or `h2c` upgrade.
+- Server-push consumption or RFC 9218 priority scheduling.
+- Extended CONNECT, `ALTSVC` or `ORIGIN` handling, or cross-origin coalescing.
+- Redirect following, cookie management, proxy support, or decompression.
+- Retry policies other than the modes that replay requests known to be
+  unprocessed.
 
-A gRPC adapter belongs in a separate shard above the streaming API.
-See [Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope
-and suggested priority of possible follow-up protocol work.
+gRPC support is outside this shard's scope. It can be implemented in a
+separate shard above the streaming API. See
+[Deferred HTTP/2 Extensions](design/deferred-extensions.md) for the scope and
+suggested priority of possible protocol additions.
+
+## Project documents
+
+- [Implementation roadmap](design/http2-implementation-roadmap.md)
+- [Architecture decisions](design/architecture.md)
+- [Current implementation status](design/implementation-status.md)
+- [Changelog](CHANGELOG.md)
+- [Release and versioning policy](RELEASING.md)
 
 ## Development
 
@@ -263,17 +292,17 @@ crystal spec -Dpreview_mt -t -s
 crystal build src/http2.cr
 ```
 
-Deterministic property cases run with the ordinary specs. Increase their count
+Deterministic property cases run with the standard specs. Increase their count
 with `HTTP2_PROPERTY_CASES=5000 crystal spec spec/property_spec.cr`.
 
-Install `nghttpd`, then run the independent local interoperability matrix:
+Install `nghttpd`, then run the local interoperability tests:
 
 ```sh
 spec/interop/run_nghttp2.sh
 spec/interop/run_nghttp2.sh -Dpreview_mt
 ```
 
-Tests must be hermetic. Do not add public-network dependencies to the default
-spec suite; use supplied `IO` objects, scripted peers, or local TLS fixtures.
+Keep the default spec suite hermetic. Use supplied `IO` objects, scripted
+peers, or local TLS fixtures instead of public-network dependencies.
 
 See [AGENTS.md](AGENTS.md) for contributor conventions.
