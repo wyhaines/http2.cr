@@ -82,6 +82,8 @@ module HTTP2
     # per connection, immediately after `start`.
     @pre_ack_push_promise_count = 0
     @streams = {} of UInt32 => Stream
+    @request_reservations = {} of UInt64 => Bool
+    @next_request_reservation_id = 0_u64
     @closed_streams = {} of UInt32 => ClosedStream
     @closed_stream_order = [] of UInt32
     @stream_ids = StreamIDAllocator.new
@@ -101,6 +103,9 @@ module HTTP2
     @diagnostics : Channel(Diagnostic)
     @diagnostic_mutex = Mutex.new
     @dropped_diagnostic_count = 0_u64
+    @pool_state_subscription_mutex = Mutex.new
+    @pool_state_subscriptions = {} of UInt64 => Proc(Nil)
+    @next_pool_state_subscription_id = 0_u64
 
     def initialize(
       @transport : IO,
@@ -527,6 +532,13 @@ module HTTP2
       end
     end
 
+    # Returns an authoritative request-admission snapshot.
+    #
+    # :nodoc:
+    def request_capacity : RequestCapacity
+      @mutex.synchronize { request_capacity_unlocked }
+    end
+
     def send_window : Int64
       @mutex.synchronize { @connection_send_window }
     end
@@ -555,8 +567,120 @@ module HTTP2
       @mutex.synchronize { @streams[id]? }
     end
 
-    def new_stream : Stream
+    # Atomically admits one future client request without allocating a stream
+    # ID or sending bytes. Ordinary lack of capacity returns nil.
+    #
+    # :nodoc:
+    def try_reserve_request_slot : RequestSlotReservation?
       @mutex.synchronize do
+        next unless request_slot_available_unlocked?
+
+        @next_request_reservation_id += 1_u64
+        id = @next_request_reservation_id
+        @request_reservations[id] = true
+        RequestSlotReservation.new(self, id)
+      end
+    end
+
+    # Converts a request-slot reservation into an idle client stream without
+    # an admission-accounting gap.
+    #
+    # :nodoc:
+    def materialize_request_stream(
+      reservation : RequestSlotReservation,
+    ) : Stream
+      unless reservation.connection.same?(self)
+        raise ArgumentError.new(
+          "request-slot reservation belongs to another connection"
+        )
+      end
+
+      exhausted = false
+      stream = @mutex.synchronize do
+        unless @request_reservations.has_key?(reservation.id)
+          raise InvalidStateError.new(
+            "request-slot reservation is no longer pending"
+          )
+        end
+
+        validate_request_slot_materialization_unlocked!
+        @request_reservations.delete(reservation.id)
+        current = allocate_client_stream_unlocked
+        exhausted = @stream_ids.exhausted?
+        current
+      end
+      notify_pool_state if exhausted
+      stream
+    rescue error
+      release_request_slot(reservation)
+      raise error
+    end
+
+    # Idempotently releases a pending request-slot reservation.
+    #
+    # :nodoc:
+    def release_request_slot(
+      reservation : RequestSlotReservation,
+    ) : Nil
+      unless reservation.connection.same?(self)
+        raise ArgumentError.new(
+          "request-slot reservation belongs to another connection"
+        )
+      end
+
+      released = @mutex.synchronize do
+        !@request_reservations.delete(reservation.id).nil?
+      end
+      notify_pool_state if released
+    end
+
+    # Atomically claims and closes an active connection only if it has no
+    # registered streams or pending request reservations.
+    #
+    # :nodoc:
+    def close_if_idle : Bool
+      claimed = @mutex.synchronize do
+        if @state.active? &&
+           @streams.empty? &&
+           @request_reservations.empty?
+          @state = State::Draining
+          true
+        else
+          false
+        end
+      end
+      return false unless claimed
+
+      notify_pool_state
+      terminate(ClosedError.new("HTTP/2 idle connection closed"))
+      true
+    end
+
+    # Registers an independent, nonblocking pool-state listener.
+    #
+    # :nodoc:
+    def subscribe_pool_state(
+      &callback : -> Nil
+    ) : PoolStateSubscription
+      id = @pool_state_subscription_mutex.synchronize do
+        @next_pool_state_subscription_id += 1_u64
+        current = @next_pool_state_subscription_id
+        @pool_state_subscriptions[current] = callback
+        current
+      end
+      PoolStateSubscription.new(self, id)
+    end
+
+    # :nodoc:
+    def remove_pool_state_subscription(id : UInt64) : Nil
+      @pool_state_subscription_mutex.synchronize do
+        @pool_state_subscriptions.delete(id)
+      end
+    end
+
+    def new_stream : Stream
+      exhausted = false
+      stream = @mutex.synchronize do
         if @state.draining?
           raise DrainingError.new(
             "new streams cannot be opened on a draining connection"
@@ -585,17 +709,12 @@ module HTTP2
           raise OpenStreamLimitError.new(@configuration.max_open_streams)
         end
 
-        id = @stream_ids.allocate
-        stream = Stream.new(
-          self,
-          id,
-          @configuration.stream_event_capacity,
-          @peer_settings_state.initial_window_size.to_i64,
-          @effective_local_settings_state.initial_window_size.to_i64,
-          @configuration.max_buffered_body_bytes
-        )
-        @streams[id] = stream
+        current = allocate_client_stream_unlocked
+        exhausted = @stream_ids.exhausted?
+        current
       end
+      notify_pool_state if exhausted
+      stream
     end
 
     # Waits for a peer-imposed concurrent-stream slot to possibly have
@@ -604,8 +723,9 @@ module HTTP2
     # raising: the caller is expected to retry the `#send_headers` call
     # that raised `ConcurrentStreamLimitError` (and to check its own
     # cancellation/deadline), so a stale or spurious wakeup here is
-    # harmless — it costs at most one extra retry. Used by `HTTP2::Client`
-    # to implement `Timeouts#stream_slot`.
+    # harmless — it costs at most one extra retry. This remains available
+    # to raw `Connection` users; `HTTP2::Client` now performs pool-wide
+    # request-slot acquisition instead.
     #
     # :nodoc:
     def wait_for_stream_slot(
@@ -953,6 +1073,7 @@ module HTTP2
       terminal_error : Exception? = nil,
     ) : Nil
       error = terminal_error || CanceledError.new(stream.id, error_code)
+      idle_closed = false
       send_reset = @mutex.synchronize do
         current = @streams[stream.id]?
         unless current && current.same?(stream)
@@ -966,12 +1087,14 @@ module HTTP2
             current,
             error
           )
+          idle_closed = true
           false
         else
           !current.state.closed?
         end
       end
       unless send_reset
+        notify_pool_state if idle_closed
         wake_drain_monitor
         return
       end
@@ -1365,7 +1488,7 @@ module HTTP2
       end
 
       begin
-        prepare_outbound(command)
+        capacity_changed = prepare_outbound(command)
         if table_size = command.encoder_table_size
           @encoder.resize_table(table_size)
         end
@@ -1384,6 +1507,7 @@ module HTTP2
         @transport.flush
         command.complete
         @mutex.synchronize { @preface_sent = true } if command.preface?
+        notify_pool_state if capacity_changed
         wake_drain_monitor
       rescue error
         command.complete(error)
@@ -1840,6 +1964,7 @@ module HTTP2
       end
       @handshake_done.close if activated
       if activated
+        notify_pool_state
         emit_lifecycle("active")
         start_keepalive
       end
@@ -2160,7 +2285,10 @@ module HTTP2
           # future use for a WINDOW_UPDATE of its own anyway.
           wake_flow_control
         end
-        wake_drain_monitor if stream.closed?
+        if stream.closed?
+          notify_pool_state
+          wake_drain_monitor
+        end
       rescue error : ProtocolError
         release_discarded_connection_credit(flow_size) if error.stream?
         raise error
@@ -2332,7 +2460,10 @@ module HTTP2
           wake_flow_control
         end
       end
-      wake_drain_monitor if stream.closed?
+      if stream.closed?
+        notify_pool_state
+        wake_drain_monitor
+      end
     end
 
     # A single stream's bounded inbound queue filling up — either the
@@ -2401,6 +2532,7 @@ module HTTP2
       # flush or the drain deadline.
       emit_error(error, stream.id)
       @mutex.synchronize { terminate_stream_unlocked(stream, error) }
+      notify_pool_state
       wake_drain_monitor
     end
 
@@ -2487,6 +2619,7 @@ module HTTP2
       # own half-window watermark is crossed, or at the next writer wake
       # for any other reason.
       release_discarded_connection_credit(discarded.to_i64)
+      notify_pool_state
       wake_drain_monitor
     end
 
@@ -2536,6 +2669,8 @@ module HTTP2
       end
       wake_flow_control if previous.initial_window_size !=
                              updated.initial_window_size
+      notify_pool_state if previous.max_concurrent_streams !=
+                             updated.max_concurrent_streams
 
       return if previous.header_table_size == updated.header_table_size
 
@@ -2619,6 +2754,7 @@ module HTTP2
       end
       emit_lifecycle("draining after peer GOAWAY")
       unprocessed.each { |error| emit_error(error, error.stream_id) }
+      notify_pool_state
       wake_flow_control
       wake_drain_monitor
       start_drain_monitor(@configuration.drain_timeout)
@@ -2715,6 +2851,7 @@ module HTTP2
           @state = State::Closed
           streams = @streams.values
           @streams.clear
+          @request_reservations.clear
           streams.each(&.terminate(error))
           @pending_settings.clear
           @pending_pings.each_value do |waiters|
@@ -2727,6 +2864,7 @@ module HTTP2
       end
       return unless terminated
 
+      notify_pool_state
       emit_error(error)
       @write_queue.close
       @data_queue.close
@@ -3381,12 +3519,13 @@ module HTTP2
       wake_settings_timer if marked
     end
 
-    private def prepare_outbound(command : WriteCommand) : Nil
+    private def prepare_outbound(command : WriteCommand) : Bool
       @mutex.synchronize do
         raise_terminal_or_state_unlocked! if @state.closed?
 
         plans = {} of UInt32 => OutboundTransition
         next_highest_local_id = @highest_local_opened_stream_id
+        previous_state = @state
 
         if header_block = command.header_block
           next_highest_local_id = plan_outbound_header_block_unlocked(
@@ -3408,6 +3547,11 @@ module HTTP2
           apply_outbound_transition_unlocked(plan)
         end
         apply_outbound_goaway_unlocked(planned_goaway)
+
+        previous_state != @state ||
+          plans.any? do |id, plan|
+            id.odd? && plan.state.closed?
+          end
       end
     end
 
@@ -3813,6 +3957,106 @@ module HTTP2
       end
 
       raise InvalidStateError.new("connection is not active")
+    end
+
+    private def request_capacity_unlocked : RequestCapacity
+      active_client_streams = 0
+      idle_client_streams = 0
+      @streams.each do |id, stream|
+        next unless id.odd?
+
+        state = stream.state
+        if state.active?
+          active_client_streams += 1
+        elsif state.idle?
+          idle_client_streams += 1
+        end
+      end
+
+      RequestCapacity.new(
+        @state,
+        @streams.size,
+        active_client_streams,
+        idle_client_streams,
+        @request_reservations.size,
+        @peer_settings_state.max_concurrent_streams,
+        @stream_ids.exhausted?
+      )
+    end
+
+    private def request_slot_available_unlocked? : Bool
+      return false unless @state.active?
+
+      capacity = request_capacity_unlocked
+      local_committed = capacity.registered_streams.to_i64 +
+                        capacity.reservations.to_i64
+      return false if local_committed >=
+                        @configuration.max_open_streams.to_i64
+      if limit = capacity.peer_limit
+        return false if capacity.peer_committed >= limit.to_i64
+      end
+
+      @stream_ids.remaining > capacity.reservations.to_u64
+    end
+
+    private def validate_request_slot_materialization_unlocked! : Nil
+      if @state.closed?
+        raise_terminal_or_state_unlocked!
+      end
+      if @state.draining?
+        raise DrainingError.new(
+          "new streams cannot be opened on a draining connection"
+        )
+      end
+      unless @state.active?
+        raise InvalidStateError.new(
+          "request streams require an active connection"
+        )
+      end
+
+      capacity = request_capacity_unlocked
+      local_committed = capacity.registered_streams.to_i64 +
+                        capacity.reservations.to_i64
+      if local_committed > @configuration.max_open_streams.to_i64
+        raise OpenStreamLimitError.new(@configuration.max_open_streams)
+      end
+      if limit = capacity.peer_limit
+        if capacity.peer_committed > limit.to_i64
+          raise ConcurrentStreamLimitError.new(limit)
+        end
+      end
+      if @stream_ids.remaining < capacity.reservations.to_u64
+        raise StreamIDExhaustedError.new(
+          "HTTP/2 client stream IDs are exhausted"
+        )
+      end
+    end
+
+    private def allocate_client_stream_unlocked : Stream
+      id = @stream_ids.allocate
+      stream = Stream.new(
+        self,
+        id,
+        @configuration.stream_event_capacity,
+        @peer_settings_state.initial_window_size.to_i64,
+        @effective_local_settings_state.initial_window_size.to_i64,
+        @configuration.max_buffered_body_bytes
+      )
+      @streams[id] = stream
+      stream
+    end
+
+    private def notify_pool_state : Nil
+      callbacks = @pool_state_subscription_mutex.synchronize do
+        @pool_state_subscriptions.values
+      end
+      callbacks.each do |callback|
+        begin
+          callback.call
+        rescue
+          # Pool notifications are best-effort control-plane signals.
+        end
+      end
     end
 
     private def raise_terminal_or_state_unlocked! : NoReturn

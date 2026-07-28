@@ -28,6 +28,13 @@ module HTTP2
       def exhausted?
         @exhausted
       end
+
+      def remaining : UInt64
+        return 0_u64 if @exhausted
+
+        ((FrameHeader::MAX_STREAM_ID.to_u64 - @next_id.to_u64) // 2_u64) +
+          1_u64
+      end
     end
   end
 end

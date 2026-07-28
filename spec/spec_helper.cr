@@ -1,6 +1,13 @@
 require "spec"
 require "../src/http2"
 
+class HTTP2::Connection
+  # :nodoc:
+  def test_only_next_client_stream_id=(id : UInt32) : Nil
+    @mutex.synchronize { @stream_ids = StreamIDAllocator.new(id) }
+  end
+end
+
 def wire_frame(
   type_code : UInt8,
   flags : UInt8,

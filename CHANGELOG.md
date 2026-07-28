@@ -3,6 +3,30 @@
 All notable changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Added a lazy, origin-bound elastic connection pool. It grows when every
+  eligible connection is saturated, defaults to four eligible connections,
+  retains at most two idle connections for 90 seconds, and supports
+  `max_connections: nil` for no hard eligible-connection limit.
+- Added atomic per-connection request-slot reservations, pool-wide capacity
+  notifications, value-only `Client#pool_state`, and
+  `Client::PoolSaturatedError`.
+- Added bounded GOAWAY and stream-ID-exhaustion retirement, idle contraction,
+  and concurrent multi-connection graceful shutdown under one shared
+  deadline.
+
+### Changed
+
+- `Timeouts#stream_slot` now covers pool-wide acquisition, including shared
+  expansion dialing and SETTINGS capacity changes. Saturation at the pool
+  boundary raises `Client::PoolSaturatedError`.
+- Removed client-wide request-opening serialization. Each pooled connection
+  now has its own opening lock, so a blocked connection does not delay request
+  opening on another connection.
+
 ## 1.0.0-rc.1 — 2026-07-26
 
 This release candidate replaces the original frame-codec spike with an

@@ -31,9 +31,9 @@ Then run `shards install`.
 
 ## Client usage
 
-Create one client per origin. The client reuses its HTTP/2 connection for that
-origin. Header names must be lowercase. `HTTP2::Headers` preserves insertion
-order and repeated names.
+Create one client per origin. The client lazily reuses and scales a bounded
+pool of HTTP/2 connections for that origin. Header names must be lowercase.
+`HTTP2::Headers` preserves insertion order and repeated names.
 
 Ordinary header fields may enter the connection's HPACK dynamic table, which
 improves compression when they recur. The client marks `authorization`,
@@ -47,6 +47,9 @@ require "http2"
 client = HTTP2::Client.new(
   "https://example.com",
   replay_policy: HTTP2::Client::ReplayPolicy::Idempotent,
+  pool_configuration: HTTP2::Client::PoolConfiguration.new(
+    max_connections: 4
+  ),
   timeouts: HTTP2::Client::Timeouts.new(
     connect: 5.seconds,
     read: 30.seconds,
@@ -108,7 +111,7 @@ Timeouts apply independently:
 | `read` | TLS and HTTP/2 handshakes, then each response-header wait |
 | `write` | Writes to the transport |
 | `idle` | Response-body reads, trailer waits, and abandoned responses |
-| `stream_slot` | Waiting for a peer concurrent-stream slot (`nil` by default) |
+| `stream_slot` | Pool-wide request-capacity acquisition (`nil` by default) |
 
 Set an individual timeout to `nil` to disable it. A request `Cancellation`
 remains active after response headers arrive and can interrupt body and trailer
@@ -133,36 +136,62 @@ Keepalive checks established connections for liveness. The client uses a
 keepalive, pass a `connection_configuration:` with
 `keepalive_interval: nil`.
 
-### Concurrent-stream limits
+### Connection pooling and concurrent-stream limits
 
-If the peer's `MAX_CONCURRENT_STREAMS` limit has been reached,
-`Client#request` raises `Connection::ConcurrentStreamLimitError` immediately.
-Set `stream_slot` to wait up to the configured duration for another stream on
-the connection to close. The wait wakes when a slot becomes available rather
-than polling. If the timeout expires first, `request` raises the same error.
+The pool grows on demand. The first request opens one connection and subsequent
+requests reuse it while it has capacity. If every eligible connection reaches
+the peer's per-connection `MAX_CONCURRENT_STREAMS` limit or the configured
+local open-stream limit, concurrent demand starts one shared expansion dial.
+Requests assigned to different connections can open independently.
 
-The client currently keeps one connection available for new work. Connections
-retired by `GOAWAY` remain owned only while they drain; the client does not
-open additional connections to scale past a saturated
-`MAX_CONCURRENT_STREAMS` limit.
+`PoolConfiguration` defaults to:
 
-While a request waits for a slot, the client does not open another stream.
-Other `request` calls on the same `Client` queue behind it, including calls
-that would dial or use a different connection.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_connections` | `4` | Maximum eligible plus dialing connections |
+| `max_idle_connections` | `2` | Idle eligible connections retained |
+| `idle_timeout` | `90.seconds` | Maximum request-idle age |
+| `max_retired_connections` | `4` | Draining connections retained |
 
-Sharing one `Connection` among several callers that can open streams introduces
-a race. This can happen when more than one `Client` uses the connection, or
-when code uses the raw `Connection` API alongside a client. Another caller may
-claim a freed slot first. Because HTTP/2 stream IDs must increase, opening that
-stream can skip the waiting request's reservation.
+Set `max_connections: 1` to disable saturation scale-out. Set it to `nil` for
+no hard eligible-connection limit. Unlimited mode remains lazy, permits only
+one expansion dial at a time, and still enforces the idle, retired, and
+per-connection limits. Prefer a finite bound when request concurrency is
+untrusted: every connection has its own socket, HPACK tables, flow-control
+windows, queues, keepalive work, and stream registry.
 
-`request` detects a skipped reservation and reserves a new stream within the
-original `stream_slot` budget. Sustained contention does not guarantee that it
-will win a slot. The request either opens a stream or raises once its budget is
-exhausted. Depending on the final attempt, it may raise
-`Connection::ConcurrentStreamLimitError`, `Connection::ClosedError`, or
-`Connection::InvalidStateError`. A single `Client` per `Connection` does not
-encounter this race.
+With the default `stream_slot: nil`, the client still grows when it can, then
+raises `Client::PoolSaturatedError` immediately when no connection can admit
+the request and the pool cannot grow. A configured duration waits for capacity
+on any connection, a shared expansion dial, or a peer SETTINGS increase. The
+wait is generation-based rather than polled and does not hold a connection's
+request-opening mutex. Cancellation and `Client#close` interrupt it.
+
+Fresh connections that advertise zero request capacity still count toward a
+finite maximum while the triggering acquisition is in progress. Idle
+contraction cannot turn that finite probe into a dial-and-evict loop.
+
+The pool reserves request capacity atomically before allocating a stream ID.
+A waiting request does not preallocate a stream ID. If raw connection use wins
+a later stream-ID race, the reservation is safely revalidated before HEADERS
+are sent. Each connection retains its own ordered writer and request-opening
+lock, preserving stream-ID and HPACK ordering without a client-wide
+head-of-line block.
+
+Connections receiving `GOAWAY`, exhausting local stream IDs, or closing are
+removed from selection. Accepted streams may drain on a retired connection
+while new requests use a replacement. This does not broaden replay: only work
+proven unprocessed by GOAWAY or `REFUSED_STREAM` follows the configured replay
+policy.
+
+`PoolConfiguration#idle_timeout` controls connection retention. It is distinct
+from `Timeouts#idle`, which protects response-body reads, trailer waits, and
+abandoned responses. `Client#pool_state` exposes value-only eligible, idle,
+retired, and dialing counts.
+
+A client built with `connection:` is deliberately fixed to that connection. It
+does not dial, reconnect, or evict it for idleness; passing an explicit
+`pool_configuration:` with `connection:` raises `ArgumentError`.
 
 ### Abandoned responses
 
@@ -219,9 +248,11 @@ replay policy, the client retries only requests identified as unprocessed by a
 `max_replay_attempts` replay attempts. Bodies represented by `nil`, `String`,
 or `Bytes` can be reproduced. A caller-owned streaming `IO` is not replayed.
 
-`Client#graceful_close` sends `GOAWAY` and waits up to
-`Connection::Configuration#drain_timeout` for established streams to finish.
-`#close` cancels the connection immediately and is idempotent.
+`Client#graceful_close` starts `GOAWAY` drains on every eligible and retired
+connection concurrently and applies one shared
+`Connection::Configuration#drain_timeout` deadline. `#close` cancels every
+owned connection immediately. Both operations reject new requests at once and
+are idempotent.
 
 Connection configuration bounds open streams, queued work, field sections,
 buffered bodies, control and empty-frame rates, and retained closed-stream
@@ -245,8 +276,8 @@ and fair scheduling of flow-controlled `DATA`. The connection retains its HPACK
 contexts across requests and bounds its queues and per-stream response
 storage.
 
-`HTTP2::Client` adds HTTP semantics, timeouts, cancellation, origin reuse, and
-replay policy to the protocol core. See the
+`HTTP2::Client` adds HTTP semantics, timeouts, cancellation, an origin-bound
+elastic connection pool, and replay policy to the protocol core. See the
 [architecture document](design/architecture.md) for ownership and shutdown
 details.
 

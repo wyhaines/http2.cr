@@ -27,99 +27,22 @@ private def client_read_field_section(
   }
 end
 
-# Test-only: `@retired_connections` has no public setter, and there is
+# Test-only: the retired pool has no public mutator, and there is
 # no deterministic (sleep-free, non-networked-race) way to get a SECOND
 # entry into it through the public API alone -- that requires a real
 # peer GOAWAY racing a redial. Reopening the class to add a single
-# setter (Crystal has no Ruby-style `instance_variable_set`) keeps this
-# out of `src/client.cr`'s production surface while still only touching
-# `@retired_connections` through a normal, statically-typed method; see
+# helper keeps this out of `src/client.cr`'s production surface; see
 # "applies one shared deadline across every connection" below for the
 # one spec that uses it.
 class HTTP2::Client
   # :nodoc:
   def test_only_retired_connections=(connections : Array(Connection)) : Nil
-    @retired_connections = connections
-  end
-end
-
-# Test-only: single-flight dialing makes a concurrent winner impossible in
-# normal client operation, but `#publish_dialed_connection` still defends
-# against finding an existing connection when a dial returns. Overriding
-# `#dial` provides a deterministic probe for that branch without racing real
-# sockets: it installs `winner` as `@connection` and returns `fresh` as the
-# completed dial.
-class RaceSimulatingClient < HTTP2::Client
-  @simulated_fresh_dial : HTTP2::Connection?
-  @simulated_winner : HTTP2::Connection?
-
-  def arm_dial_race(
-    fresh : HTTP2::Connection,
-    winner : HTTP2::Connection,
-  ) : Nil
-    @simulated_fresh_dial = fresh
-    @simulated_winner = winner
-  end
-
-  private def dial : HTTP2::Connection
-    @connection = @simulated_winner
-    @simulated_fresh_dial || raise "RaceSimulatingClient used before #arm_dial_race"
-  end
-end
-
-# Test-only: a `Connection` whose `#close` blocks until released,
-# proving (or disproving) that a redundant dial's close runs outside
-# `@mutex` without depending on `Connection#close` ever actually taking
-# a long time in practice. `Connection.start` is `self.start(transport,
-# configuration) : self` (`new(...).start`), so a subclass is
-# constructible through the ordinary factory; `#close` is a plain,
-# overridable public method.
-class GateClosingConnection < HTTP2::Connection
-  @closing = false
-  @close_gate = Channel(Nil).new
-
-  def closing? : Bool
-    @closing
-  end
-
-  def release_close : Nil
-    @close_gate.close
-  rescue Channel::ClosedError
-  end
-
-  def close : Nil
-    @closing = true
-    @close_gate.receive?
-    super
-  end
-end
-
-# Test-only: drives `#send_headers_awaiting_slot` directly, bypassing
-# `#request`/`#get` entirely. `#send_headers_awaiting_slot` is `private`,
-# but Crystal's privacy only forbids an explicit receiver -- a subclass
-# method can still call it, unqualified, on its own implicit `self`.
-#
-# This exists to reproduce the "shared connection's other opener wins and
-# skips it" recovery race WITHOUT any actual race: construct the skip
-# first (open a higher-ID stream while a lower one sits idle, which
-# synchronously and eagerly marks the lower one's terminal error, per
-# `Connection#plan_skipped_local_streams_unlocked`), THEN call this
-# directly on the already-skipped stream, all from one fiber. There is no
-# second opener to race against and nothing to wait on, so this is
-# 100% deterministic under both schedulers -- see the example below.
-class StreamSlotRetryProbe < HTTP2::Client
-  def probe_send_headers_awaiting_slot(
-    connection : HTTP2::Connection,
-    stream : HTTP2::Stream,
-  ) : HTTP2::Stream
-    send_headers_awaiting_slot(
-      connection,
-      stream,
-      "GET",
-      [] of HTTP2::HeaderField,
-      true,
-      nil
-    )
+    entries = connections.map do |connection|
+      entry = new_pool_entry(connection)
+      entry.retired = true
+      entry
+    end
+    @mutex.synchronize { @pool_retired_entries = entries }
   end
 end
 
@@ -945,7 +868,7 @@ describe HTTP2::Client do
     end
   end
 
-  it "raises the peer concurrent-stream limit immediately without a configured stream_slot wait" do
+  it "raises pool saturation immediately without a configured stream_slot wait" do
     UNIXSocket.pair do |client_io, peer|
       first_seen = Channel(Nil).new(1)
       peer_result = scripted_peer(peer) do |io|
@@ -979,7 +902,7 @@ describe HTTP2::Client do
         end
 
         first_seen.receive
-        expect_raises(HTTP2::Connection::ConcurrentStreamLimitError) do
+        expect_raises(HTTP2::Client::PoolSaturatedError) do
           http.get("/second")
         end
       ensure
@@ -1064,34 +987,11 @@ describe HTTP2::Client do
     end
   end
 
-  # This ordering (reserve the competitor's stream ID, free the shared
-  # slot, then immediately open the competitor from the SAME test fiber)
-  # reproduces the skip-and-recover scenario deterministically under the
-  # default scheduler: 20/20 clean in isolation, plus repeated full-file
-  # runs, while preparing this spec. Under `-Dpreview_mt`'s genuine OS-
-  # thread parallelism it is NOT reliable — measured 1/15 in the same
-  # form — because the parked waiter's own wake-to-retry path is
-  # shorter than the competitor's (which needs an extra #new_stream
-  # call), so the waiter usually wins the freed slot itself instead of
-  # being skipped. That is a property of the scenario under true
-  # parallel scheduling, not a bug in the fix (see the task report for
-  # the full methodology and the other constructions tried). Per the
-  # plan's "any -Dpreview_mt flake: stop and investigate" constraint,
-  # this INTEGRATION-level example — driven through the public
-  # `#request` API, with two independently scheduled fibers genuinely
-  # racing for the freed slot — only runs under the default scheduler.
-  # The recovery LOGIC it exercises is separately covered,
-  # deterministically under BOTH schedulers and with no race at all
-  # (single fiber, no waiting), by "recovers a stream_slot wait after a
-  # shared connection's other opener wins and skips it (deterministic
-  # construction)" below, which drives `#send_headers_awaiting_slot`
-  # directly via `StreamSlotRetryProbe` against a skip built
-  # synchronously rather than raced for. connection_stream_state_spec.cr's
-  # extended "closes lower idle streams when a higher ID opens" example
-  # further pins the exact `Connection::ClosedError` shape
-  # `#send_headers` raises for a skipped stream, independently of both.
+  # Pool admission no longer allocates an idle stream before capacity is
+  # available. A raw opener can therefore use the next stream ID without
+  # skipping a pooled request that is waiting for capacity.
   {% unless flag?(:preview_mt) %}
-    it "recovers a stream_slot wait after a shared connection's other opener wins and skips it" do
+    it "does not preallocate a stream while waiting for pool capacity" do
       UNIXSocket.pair do |client_io, peer|
         peer_result = scripted_peer(peer) do |io|
           settings = HTTP2::Frame::Settings.new([
@@ -1109,9 +1009,8 @@ describe HTTP2::Client do
             occupying_request[:stream_id]
           )
 
-          # Whichever stream wins the freed slot first — "/second" itself
-          # (succeeding normally) or the test-fiber-driven "competitor"
-          # (skipping "/second"'s reservation) — respond to it.
+          # The raw competitor owns stream 3. The pooled request only
+          # allocates stream 5 after the competitor completes.
           winner_request = client_read_field_section(io, decoder)
           write_server_fields(
             io,
@@ -1121,8 +1020,6 @@ describe HTTP2::Client do
             end_stream: true
           )
 
-          # If "/second" was skipped, it recovers on a freshly reallocated
-          # stream once this slot frees too.
           second_request = client_read_field_section(io, decoder)
           write_server_fields(
             io,
@@ -1154,24 +1051,10 @@ describe HTTP2::Client do
             end
           end
 
-          # Wait for "/second" to have reserved its stream (id 3) and, in
-          # practice, to have already hit ConcurrentStreamLimitError once
-          # and parked — occupying is still active, so its first attempt
-          # cannot succeed yet.
-          eventually(1.second, "\"/second\" never reserved a stream") do
-            !connection.stream?(3_u32).nil?
-          end
-
-          # Reserve the "competitor" stream's ID *before* freeing the
-          # slot both it and "/second" will race for, then free it and
-          # immediately (same test fiber, no intervening code) attempt to
-          # open the competitor — deterministically reproduces this
-          # ordering under the default scheduler (verified 20/20 in
-          # isolation while preparing this spec; see the task report for
-          # the full methodology, including why this specific ordering —
-          # not a contrived sleep or Fiber.yield loop — is what makes it
-          # reproducible).
+          Fiber.yield
+          connection.stream?(3_u32).should be_nil
           competitor = connection.new_stream
+          competitor.id.should eq(3_u32)
           occupying.cancel
           competitor.send_headers([] of HTTP2::HeaderField, end_stream: true)
 
@@ -1191,62 +1074,6 @@ describe HTTP2::Client do
     end
   {% end %}
 
-  it "recovers a stream_slot wait after a shared connection's other " \
-     "opener wins and skips it (deterministic construction)" do
-    UNIXSocket.pair do |client_io, peer|
-      peer_result = scripted_peer(peer) do |io|
-        complete_server_handshake(io)
-        read_client_headers(io, 3_u32)
-        read_client_headers(io, 5_u32)
-      end
-
-      connection = HTTP2::Connection.start(client_io)
-      connection.wait_until_active(1.second)
-
-      # Builds the exact same skip the racing example above relies on a
-      # live scheduler for, but synchronously in this one fiber: reserve
-      # `skipped` (id 1) first, then open `competitor` (id 3) while
-      # `skipped` is still idle. Opening a HIGHER local stream ID while a
-      # LOWER one is idle eagerly closes ("skips") the lower one before
-      # `#new_stream` even returns to this line — no waiting, no second
-      # fiber, no race (see `Connection#plan_skipped_local_streams_unlocked`
-      # and connection_stream_state_spec.cr's "closes lower idle streams
-      # when a higher ID opens", which pins the exact error shape this
-      # produces).
-      skipped = connection.new_stream
-      competitor = connection.new_stream
-      open_client_stream(competitor, end_stream: true)
-      skipped.closed?.should be_true
-      skipped.terminal_error.should be_a(HTTP2::Connection::ClosedError)
-      connection.stream?(skipped.id).should be_nil
-
-      # Now drive the private retry method directly against the
-      # already-skipped stream: its first `#send_headers` call inside
-      # `#send_headers_awaiting_slot` raises the `ClosedError` immediately
-      # (from `Stream#send_headers`'s own `raise_terminal!` guard), and
-      # `#recoverable_stream_skip?` recognizes it (a `stream_slot` budget
-      # is configured below, the connection is neither closed nor
-      # draining, and `skipped`'s ID is no longer registered) — reliably,
-      # every time, under both schedulers.
-      probe = StreamSlotRetryProbe.new(
-        "http://example.test",
-        connection: connection,
-        timeouts: HTTP2::Client::Timeouts.new(stream_slot: 2.seconds)
-      )
-      begin
-        recovered = probe.probe_send_headers_awaiting_slot(
-          connection,
-          skipped
-        )
-        recovered.id.should_not eq(skipped.id)
-        recovered.id.should eq(5_u32)
-        wait_for_peer(peer_result)
-      ensure
-        probe.close
-      end
-    end
-  end
-
   it "does not retry a stream_slot wait into a connection the peer is draining" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|
@@ -1259,12 +1086,10 @@ describe HTTP2::Client do
         complete_server_handshake(io, settings)
         read_client_headers(io) # the occupying stream's request
 
-        # "/second" is now reserved (stream 3, still idle) and parked
-        # waiting for a slot. GOAWAY implicitly closes every still-idle
-        # local stream (RFC 9113 §6.8) without ever freeing a usable
-        # slot — the retry this triggers must recognize the connection
-        # is now draining and give up instead of trying to reallocate
-        # and spin against it.
+        # "/second" is waiting for pool capacity without allocating a
+        # stream. GOAWAY makes the supplied connection permanently
+        # ineligible, so the waiter must fail promptly instead of spinning
+        # or waiting out its full stream-slot deadline.
         HTTP2::Frame::GoAway.new(0_u32, HTTP2::ErrorCode::NO_ERROR).write(io)
         io.flush
       end
@@ -1482,115 +1307,6 @@ describe HTTP2::Client do
     ensure
       http.close
       server.close
-    end
-  end
-
-  it "recovers via its own fresh dial when a concurrent winner had " \
-     "already gone closed by the time this dialer re-checks" do
-    UNIXSocket.pair do |fresh_io, fresh_peer|
-      UNIXSocket.pair do |winner_io, winner_peer|
-        fresh_peer_result = scripted_peer(fresh_peer) do |io|
-          complete_server_handshake(io)
-          request = client_read_field_section(io, HPack::Decoder.new)
-          write_server_fields(
-            io,
-            HPack::Encoder.new,
-            request[:stream_id],
-            [{":status", "204"}],
-            end_stream: true
-          )
-        end
-        winner_peer_result = scripted_peer(winner_peer) do |io|
-          # The "winner" is already closed before this client ever
-          # touches it; nothing should ever cross this socket.
-          begin
-            loop { HTTP2::Frame.read(io) }
-          rescue
-          end
-        end
-
-        fresh = HTTP2::Connection.start(fresh_io)
-        winner = HTTP2::Connection.start(winner_io)
-        winner.close
-
-        http = RaceSimulatingClient.new("http://example.test")
-        http.arm_dial_race(fresh, winner)
-        begin
-          # `#dial` (overridden above) simulates: another fiber already
-          # published `winner` to `@connection`, and it has ALREADY gone
-          # closed, by the time this call's own dial (`fresh`) is ready
-          # to be checked against it. Pre-fix, `#connection_for_request`
-          # would hand back the closed `winner` unconditionally and
-          # discard `fresh` -- the request would fail with a bare
-          # `Connection::ClosedError` instead of succeeding.
-          response = http.get("/")
-          response.status.should eq(204)
-          fresh.closed?.should be_false
-          wait_for_peer(fresh_peer_result)
-        ensure
-          http.close
-          winner_peer.close rescue nil
-          wait_for_peer(winner_peer_result) rescue nil
-        end
-      end
-    end
-  end
-
-  it "closes a redundant connection outside its mutex, so #closed? " \
-     "is not blocked behind a slow teardown" do
-    UNIXSocket.pair do |hanging_io, hanging_peer|
-      UNIXSocket.pair do |winner_io, winner_peer|
-        hanging_peer_result = scripted_peer(hanging_peer) do |io|
-          begin
-            loop { HTTP2::Frame.read(io) }
-          rescue
-          end
-        end
-        winner_peer_result = scripted_peer(winner_peer) do |io|
-          begin
-            loop { HTTP2::Frame.read(io) }
-          rescue
-          end
-        end
-
-        hanging = GateClosingConnection.start(hanging_io)
-        winner = HTTP2::Connection.start(winner_io)
-
-        http = RaceSimulatingClient.new("http://example.test")
-        http.arm_dial_race(hanging, winner)
-        begin
-          # `winner` is live and usable, so `#connection_for_request`
-          # treats THIS call's own dial (`hanging`) as redundant and
-          # closes it -- `GateClosingConnection#close` (above) blocks
-          # until released, simulating a teardown that takes a long
-          # time. `#closed?` must not be blocked behind it.
-          spawn { http.get("/") rescue nil }
-          eventually(
-            message: "the redundant connection's close never started"
-          ) do
-            hanging.closing?
-          end
-
-          result = Channel(Bool).new(1)
-          spawn { result.send(http.closed?) }
-          outcome = select
-          when value = result.receive
-            value
-          when timeout(500.milliseconds)
-            fail(
-              "closed? blocked behind a wedged redundant Connection#close"
-            )
-          end
-          outcome.should be_false
-        ensure
-          hanging.release_close
-          http.close
-          hanging_peer.close rescue nil
-          winner_peer.close rescue nil
-          wait_for_peer(hanging_peer_result) rescue nil
-          wait_for_peer(winner_peer_result) rescue nil
-        end
-      end
     end
   end
 

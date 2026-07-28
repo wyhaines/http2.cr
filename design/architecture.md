@@ -36,8 +36,9 @@ Transport IO (TCP, TLS, or a test double)
 - `Stream` owns its state-machine position, stream windows, bounded inbound
   events/body storage, HTTP validator hook, and cancellation state. It never
   reads from or writes directly to the socket.
-- `Client` owns dialing, TLS policy, origin-based connection reuse, request
-  validation, timeout policy, and the public request API.
+- `Client` owns shared dialing, TLS policy, the origin-bound elastic
+  connection pool, request validation, timeout policy, and the public request
+  API.
 
 The client is bound to one normalized `http` or `https` origin. Absolute
 request targets must match that origin; ordinary CONNECT targets use authority
@@ -49,6 +50,20 @@ while the old connection drains streams at or below the peer's last processed
 ID. Automatic replay is opt-in and applies only to GOAWAY streams proven
 unprocessed or `REFUSED_STREAM`; caller-owned request-body IO is never rewound
 or replayed.
+
+Pool selection uses an atomic logical request-slot reservation on each
+connection. A reservation accounts for the peer concurrent-stream limit, the
+local registered-stream limit, and remaining client stream IDs before a stream
+ID is allocated. The pool scans eligible connections in creation order and
+starts at most one expansion dial when none can reserve. Each pool entry has
+its own request-opening lock, preserving per-connection stream-ID and writer
+ordering without serializing requests assigned to other connections.
+
+The default pool grows lazily to four eligible connections, retains at most
+two idle connections, and expires them after 90 seconds. A nil connection
+maximum removes only the eligible-connection bound; idle and retired limits
+remain. GOAWAY and stream-ID-exhausted connections are retired from selection
+while accepted streams drain.
 
 ## Concurrency Model
 

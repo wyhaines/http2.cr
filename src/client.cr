@@ -5,11 +5,27 @@ require "./connection"
 require "./http_semantics"
 require "./request"
 require "./response"
+require "./client/pool_configuration"
+require "./client/pool_state"
+require "./client/pool_entry"
 
 module HTTP2
   # A reusable, origin-bound HTTP/2 client.
   class Client
     class ClosedError < HTTPError
+    end
+
+    # No pooled connection could admit another request, and the pool could
+    # neither grow nor wait any longer under its configured policy.
+    class PoolSaturatedError < HTTPError
+      getter max_connections : Int32?
+
+      def initialize(
+        @max_connections : Int32?,
+        message : String = "HTTP/2 connection pool is saturated",
+      )
+        super(message)
+      end
     end
 
     # Opt-in policy for replaying only requests that the peer proves were not
@@ -67,41 +83,15 @@ module HTTP2
     # disable this safety net along with the per-read/trailer timeout it
     # shares the setting with.
     #
-    # `stream_slot` governs `request`'s reaction to the peer's
-    # MAX_CONCURRENT_STREAMS limit. `nil` (the default) preserves
-    # `Connection#new_stream`'s existing contract: hitting the limit
-    # raises `Connection::ConcurrentStreamLimitError` immediately, with no
-    # wait. A span instead waits up to that long for a slot — waking
-    # promptly when some other stream on the connection closes, not just
-    # polling — retrying until either a slot opens up (the request
-    # proceeds normally) or the span elapses, at which point the same
-    # `Connection::ConcurrentStreamLimitError` is raised. A configured
-    # wait holds this `Client`'s internal stream-open serialization for
-    # its full span: every other `request` call on the SAME `Client` —
-    # even one that will dial or is bound to a different connection —
-    # queues behind it until the wait resolves.
-    #
-    # **Limitation when a `Connection` is shared by more than one
-    # opener** (more than one `Client` bound to it, or raw `Connection`
-    # use alongside a `Client`): a freed slot can be won by a DIFFERENT
-    # opener first. RFC 9113 requires locally opened stream IDs to
-    # increase, so that opener's higher-ID stream implicitly closes
-    # ("skips") this request's still-reserved, lower-ID one. `request`
-    # detects this — surfaced internally as `Connection::ClosedError`
-    # ("stream N was skipped by stream M") or, rarely,
-    # `Connection::InvalidStateError` ("stream N is not active on this
-    # connection") — and recovers by reserving a fresh stream and
-    # retrying, within the same `stream_slot` budget, exactly as if it
-    # had lost the original wait. This recovery itself races the other
-    # opener for the NEXT freed slot, so under sustained multi-opener
-    # contention on one `Connection`, `request` is not guaranteed to win
-    # eventually within a bounded number of retries — only that it never
-    # hangs or corrupts connection state: it always either succeeds or
-    # raises once its own `stream_slot` budget is exhausted. A single
-    # `Client` per `Connection` (the common case; sharing one `Connection`
-    # across `Client`s is unusual) never hits this at all, since
-    # `request` calls on the SAME `Client` are already serialized against
-    # each other and cannot skip themselves.
+    # `stream_slot` is the pool-wide request-capacity budget. A request
+    # first tries every eligible connection and may start one shared,
+    # demand-driven expansion dial. `nil` (the default) performs that
+    # growth but raises `PoolSaturatedError` as soon as the pool can make
+    # no further progress. A span waits up to that long for any connection
+    # to gain capacity, for an expansion dial, or for a SETTINGS increase.
+    # Cancellation and client close interrupt the wait. Atomic logical
+    # reservations do not consume stream IDs while waiting, and opening on
+    # one connection does not serialize opening on another connection.
     struct Timeouts
       getter connect : Time::Span?
       getter read : Time::Span?
@@ -169,12 +159,18 @@ module HTTP2
       content_length : Int64?,
       connect : Bool
 
+    private record CloseSnapshot,
+      connections : Array(Connection),
+      in_flight : Connection?
+
     # One in-flight owned-connection dial shared by every concurrent caller.
     # Completion is always performed while the client's mutex is held, so the
     # error assignment and idempotence check do not need their own lock.
     private class DialAttempt
       getter error : Exception? = nil
       getter signal = Channel(Nil).new
+      property connection : Connection?
+      getter result_connection : Connection?
 
       def complete(error : Exception? = nil) : Nil
         return if @signal.closed?
@@ -183,11 +179,8 @@ module HTTP2
         @signal.close
       end
 
-      def wait : Nil
-        @signal.receive?
-        if failure = error
-          raise failure
-        end
+      def publish(connection : Connection) : Nil
+        @result_connection = connection
       end
     end
 
@@ -205,8 +198,19 @@ module HTTP2
       end
     end
 
+    private enum PoolWaitResult
+      PoolChanged
+      DialCompleted
+      Canceled
+      TimedOut
+    end
+
+    private class RetryPoolSelection < Exception
+    end
+
     getter timeouts : Timeouts
     getter connection_configuration : Connection::Configuration
+    getter pool_configuration : PoolConfiguration
     getter replay_policy : ReplayPolicy
     getter max_replay_attempts : Int32
 
@@ -235,16 +239,34 @@ module HTTP2
     getter additional_never_indexed_fields : Set(String)
 
     @origin : Origin
-    @connection : Connection?
-    @retired_connections = [] of Connection
+    @supplied_connection_value : Connection?
+    @pool_entries = [] of PoolEntry
+    @pool_retired_entries = [] of PoolEntry
     @dial_attempt : DialAttempt?
     @supplied_connection : Bool
     @closed = false
     @mutex = Mutex.new
-    @stream_open_mutex = Mutex.new
+    @next_pool_sequence = 0_u64
+    @pool_generation = 0_u64
+    @pool_signal = Channel(Nil).new
+    @pool_events = Channel(Nil).new(1)
+    @pool_coordinator_done = Channel(Nil).new
+    @pool_coordinator_started = false
+    @pool_waiters = 0
+    @pool_acquirers = 0
+    @unlimited_zero_capacity = false
+    @zero_capacity_entry : PoolEntry?
+    # Newly published connections stay protected from idle eviction while
+    # the acquisition that caused each dial is still selecting. This is a
+    # set, rather than one "fresh" pointer, because a finite acquisition may
+    # need to retain several zero-capacity probes until it reaches its bound.
+    @acquisition_retained_entries = Set(PoolEntry).new
 
-    # Creates a client bound to one `http` or `https` origin. A supplied
-    # connection is used as-is and is owned by this client.
+    # Creates a client bound to one `http` or `https` origin. Owned
+    # connections are dialed lazily and scale under `pool_configuration`.
+    # A supplied connection is used as-is, is owned by this client, and
+    # remains fixed: it is not reconnected or evicted for idleness.
+    # Supplying both `connection` and `pool_configuration` is invalid.
     #
     # `tls_context`, whether supplied or defaulted, is used for every
     # `https` dial this client makes (`#dial`'s single `Connection.connect_tls`
@@ -267,6 +289,7 @@ module HTTP2
       @max_replay_attempts : Int32 = 1,
       additional_never_indexed_fields : Enumerable(String) = [] of String,
       connection : Connection? = nil,
+      pool_configuration : PoolConfiguration? = nil,
     )
       if @max_replay_attempts < 0
         raise ArgumentError.new(
@@ -277,8 +300,27 @@ module HTTP2
         additional_never_indexed_fields.map(&.downcase).to_set
       uri = origin.is_a?(URI) ? origin : URI.parse(origin)
       @origin = parse_origin(uri, require_origin_only: true)
-      @connection = connection
+      @supplied_connection_value = connection
       @supplied_connection = !connection.nil?
+      if connection && pool_configuration
+        raise ArgumentError.new(
+          "pool configuration cannot be used with a supplied connection"
+        )
+      end
+      @pool_configuration = if connection
+                              PoolConfiguration.supplied_connection
+                            else
+                              (pool_configuration || PoolConfiguration.new).effective
+                            end
+
+      start_pool_coordinator
+      if supplied = connection
+        entry = new_pool_entry(supplied)
+        @mutex.synchronize do
+          @pool_entries << entry
+          advance_pool_generation_unlocked
+        end
+      end
     end
 
     # Sends a GET request and waits for its final response fields.
@@ -386,11 +428,9 @@ module HTTP2
       cancellation : Cancellation?,
     ) : Response
       prepared = prepare(request)
-      connection = ready_connection
       check_cancellation!(cancellation)
       has_content = !prepared.body.nil? || !prepared.trailers.empty?
       stream = open_request_stream(
-        connection,
         request.method,
         prepared.fields,
         end_stream: !has_content,
@@ -441,17 +481,25 @@ module HTTP2
       end
     end
 
-    # Closes the reusable origin connection and cancels unfinished requests.
+    # Closes every reusable origin connection and cancels unfinished requests.
     def close : Nil
-      connections = take_connections_for_close
-      connections.each(&.close)
+      snapshot = take_connections_for_close
+      connections = snapshot.connections
+      if in_flight = snapshot.in_flight
+        connections.unshift(in_flight)
+      end
+      begin
+        connections.each(&.close)
+      ensure
+        wait_for_pool_coordinator
+      end
     end
 
     # Gracefully drains all connections currently owned by this client.
     #
     # `timeout` is a SHARED deadline across every connection, not a
     # per-connection budget: it is applied once, up front, and each
-    # connection in turn receives only whatever of it remains (floored
+    # connection receives only whatever of it remains (floored
     # at `MIN_GRACEFUL_CLOSE_TIMEOUT`), so N connections that each need
     # a full drain still take roughly `timeout` in total rather than
     # N times `timeout` — a client with several retired connections
@@ -464,19 +512,42 @@ module HTTP2
         raise ArgumentError.new("drain timeout must be positive")
       end
 
-      connections = take_connections_for_close
+      snapshot = take_connections_for_close
+      connections = snapshot.connections
       deadline = Time.instant + timeout
-      first_error = nil
-      connections.each do |connection|
-        begin
-          remaining = deadline - Time.instant
-          remaining = MIN_GRACEFUL_CLOSE_TIMEOUT if remaining < MIN_GRACEFUL_CLOSE_TIMEOUT
-          connection.graceful_close(remaining)
-        rescue error
-          first_error ||= error
+      errors = Array(Exception?).new(connections.size, nil)
+      outcomes = Channel(Tuple(Int32, Exception?)).new(connections.size)
+      begin
+        # A connection still being dialed or handshaken cannot contain an
+        # application stream. Abandon it immediately rather than making it
+        # participate in graceful GOAWAY draining.
+        snapshot.in_flight.try(&.close)
+        connections.each_with_index do |connection, index|
+          spawn(name: "http2-client-graceful-close") do
+            error : Exception? = nil
+            begin
+              remaining = deadline - Time.instant
+              if remaining < MIN_GRACEFUL_CLOSE_TIMEOUT
+                remaining = MIN_GRACEFUL_CLOSE_TIMEOUT
+              end
+              connection.graceful_close(remaining)
+            rescue exception
+              error = exception
+            ensure
+              outcomes.send({index, error})
+            end
+          end
         end
+        connections.size.times do
+          index, error = outcomes.receive
+          errors[index] = error
+        end
+      ensure
+        wait_for_pool_coordinator
       end
-      raise first_error if first_error
+      if first_error = errors.compact.first?
+        raise first_error
+      end
     end
 
     # True once `#close` or `#graceful_close` has been called — both set
@@ -489,390 +560,844 @@ module HTTP2
       @mutex.synchronize { @closed }
     end
 
+    # Returns a value-only snapshot of the current pool.
+    def pool_state : PoolState
+      @mutex.synchronize do
+        retained_entries = protected_idle_entries_unlocked
+        PoolState.new(
+          @pool_entries.size,
+          @pool_entries.count do |entry|
+            !entry.idle_since.nil? &&
+              !retained_entries.includes?(entry)
+          end,
+          @pool_retired_entries.size,
+          !@dial_attempt.nil?,
+          @pool_configuration.max_connections
+        )
+      end
+    end
+
+    # The branches keep every pre-HEADERS connection race recoverable while
+    # preserving distinct timeout, cancellation, and terminal error types.
+    # ameba:disable Metrics/CyclomaticComplexity
     private def open_request_stream(
-      connection : Connection,
       request_method : String,
       fields : Array(HeaderField),
       *,
       end_stream : Bool,
       cancellation : Cancellation?,
     ) : Stream
-      @stream_open_mutex.synchronize do
-        check_cancellation!(cancellation)
-        stream = reserve_request_stream(connection)
+      deadline = @timeouts.stream_slot.try { |span| Time.instant + span }
+      terminal_reselections = 0
+
+      loop do
+        selected = acquire_request_slot(cancellation, deadline)
+        connection = selected.entry.connection
+        stream = nil
         begin
-          stream.inbound_validator = ResponseValidator.new(
-            stream.id,
-            request_method
-          )
-          stream = send_headers_awaiting_slot(
-            connection,
-            stream,
-            request_method,
-            fields,
-            end_stream,
-            cancellation
-          )
-          check_cancellation!(cancellation)
-          stream
+          selected.entry.opening_mutex.synchronize do
+            check_cancellation!(cancellation)
+            stream = connection.materialize_request_stream(
+              selected.reservation
+            )
+            current = stream ||
+                      raise "request reservation did not materialize a stream"
+            current.inbound_validator = ResponseValidator.new(
+              current.id,
+              request_method
+            )
+            begin
+              current.send_headers(fields, end_stream: end_stream)
+            rescue error : Connection::ConcurrentStreamLimitError | Connection::DrainingError
+              abort_stream(current, error) unless current.terminal_error
+              stream = nil
+              raise RetryPoolSelection.new(error.message, error)
+            rescue error : Connection::InvalidStateError
+              if error.class == Connection::InvalidStateError
+                abort_stream(current, error) unless current.terminal_error
+                stream = nil
+                raise RetryPoolSelection.new(error.message, error)
+              end
+              raise error
+            end
+            check_cancellation!(cancellation)
+          end
+          return stream ||
+            raise "request opening completed without a stream"
+        rescue Connection::ConcurrentStreamLimitError | Connection::OpenStreamLimitError | Connection::StreamIDExhaustedError
+          signal_pool_event
+          next
+        rescue error : Connection::DrainingError | Connection::ClosedError
+          terminal_reselections += 1
+          raise error if @supplied_connection || terminal_reselections > 1
+          signal_pool_event
+          next
+        rescue error : Connection::InvalidStateError
+          if stream.nil? && error.class == Connection::InvalidStateError
+            signal_pool_event
+            next
+          end
+          raise error
+        rescue RetryPoolSelection
+          signal_pool_event
+          next
         rescue error : Connection::TimeoutError
           timed_out = RequestTimeoutError.new(
             "HTTP/2 connection timed out while opening the request",
             error
           )
-          abort_stream(stream, timed_out)
+          abort_stream(stream, timed_out) if stream
           raise timed_out
         rescue error : IO::TimeoutError
           timed_out = RequestTimeoutError.new(
             "network I/O timed out while opening the request",
             error
           )
-          abort_stream(stream, timed_out)
+          abort_stream(stream, timed_out) if stream
           raise timed_out
         rescue error
-          abort_stream(stream, error) unless stream.terminal_error
+          if current = stream
+            abort_stream(current, error) unless current.terminal_error
+          end
           raise error
+        ensure
+          selected.reservation.release
         end
       end
     end
 
-    # Reserves a stream before any request bytes are submitted. If the
-    # selected owned connection closes in the narrow gap after
-    # `#ready_connection` checked it, preserving the ordinary connection
-    # error as `PreRequestConnectionError` lets `#request` safely select a
-    # replacement once. Errors after this method returns are deliberately
-    # not wrapped: HEADERS may already have reached the peer by then, so the
-    # normal explicit replay policy must remain authoritative.
-    private def reserve_request_stream(connection : Connection) : Stream
-      connection.new_stream
-    rescue error : Connection::DrainingError
-      raise error
-    rescue error
-      if !@supplied_connection && connection.closed?
-        raise PreRequestConnectionError.new(error)
-      end
-      raise error
-    end
+    # ameba:enable Metrics/CyclomaticComplexity
 
-    # Sends `stream`'s request HEADERS, waiting for a peer-imposed
-    # concurrent-stream slot when `Timeouts#stream_slot` is set, and
-    # returns the stream HEADERS were actually sent on (see below — it
-    # may differ from the `stream` argument). The default (`nil`)
-    # preserves `Connection#new_stream`'s immediate
-    # `Connection::ConcurrentStreamLimitError` raise. A span retries
-    # `#send_headers` each time the connection signals that some stream
-    # may have closed, or the wait times out, until either it succeeds or
-    # the span elapses — at which point the limit error from the final
-    # attempt propagates.
-    #
-    # Normally the retry reuses the SAME (still-idle) stream, keeping its
-    # reserved ID and place in line stable. But when a `Connection` is
-    # shared by more than one opener (more than one `Client`, or raw
-    # `Connection` use alongside a `Client`), a DIFFERENT opener can win a
-    # freed slot first with a higher stream ID — RFC 9113 requires locally
-    # opened stream IDs to increase, so opening that higher ID implicitly
-    # closes ("skips") this method's still-idle lower one out from under
-    # it (`Connection#new_stream`'s doc). `plan_skipped_local_streams_unlocked`
-    # stores a bare `Connection::ClosedError` as that skipped stream's
-    # terminal error EAGERLY — the instant the OTHER opener's HEADERS are
-    # planned, not lazily discovered later — so the COMMON outcome here is
-    # this waiter's own next `#send_headers` call raising that
-    # `ClosedError` straight out of `Stream#send_headers`'s own
-    # `raise_terminal!` guard, before `Connection#send_headers` even runs.
-    # A rarer race (both commands already enqueued at once) instead raises
-    # a bare `Connection::InvalidStateError` ("stream N is not active")
-    # from `Connection#plan_outbound_stream_event_unlocked`. Both are
-    # handled identically below (see `recoverable_stream_skip?`):
-    # allocating a fresh stream and retrying it (within the same
-    # remaining budget) recovers instead of surfacing a hard,
-    # non-replayable error for what is, from the caller's perspective,
-    # still just "waiting for a slot."
-    private def send_headers_awaiting_slot(
-      connection : Connection,
-      stream : Stream,
-      request_method : String,
-      fields : Array(HeaderField),
-      end_stream : Bool,
+    # Pool acquisition is an explicit state machine whose branches correspond
+    # to selection, reconciliation, dialing, waiting, and terminal outcomes.
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def acquire_request_slot(
       cancellation : Cancellation?,
-    ) : Stream
-      current = stream
-      deadline = @timeouts.stream_slot.try { |span| Time.instant + span }
-      loop do
-        begin
-          current.send_headers(fields, end_stream: end_stream)
-          return current
-        rescue error : Connection::ConcurrentStreamLimitError
-          remaining = remaining_stream_slot_budget(deadline, error)
-          check_cancellation!(cancellation)
-          connection.wait_for_stream_slot(
-            remaining,
-            cancellation.try(&.signal)
-          )
-          check_cancellation!(cancellation)
-        rescue error : Connection::ClosedError | Connection::InvalidStateError
-          raise error unless recoverable_stream_skip?(
-                               connection,
-                               current,
-                               deadline,
-                               error
-                             )
-          remaining_stream_slot_budget(deadline, error)
+      deadline : Time::Instant?,
+    ) : ReservedConnection
+      supplied_ready_deadline = if @supplied_connection
+                                  @timeouts.read.try do |span|
+                                    Time.instant + span
+                                  end
+                                end
 
-          check_cancellation!(cancellation)
-          current = connection.new_stream
-          current.inbound_validator = ResponseValidator.new(
-            current.id,
-            request_method
-          )
-        end
+      @mutex.synchronize do
+        @pool_acquirers += 1
+        @pool_waiters += 1 if deadline
       end
-    rescue error
-      abort_leftover_stream_slot_attempt(current, stream, error)
-      raise error
-    end
 
-    # Whether `current`'s HEADERS attempt was refused not because the
-    # peer's concurrent-stream limit is still exhausted, but because a
-    # DIFFERENT opener on a shared `Connection` already won a freed slot
-    # with a higher stream ID, implicitly skipping `current` out from
-    # under this wait (see the doc comment above).
-    #
-    # Matches only the two BARE error classes the skip/rare-race paths
-    # actually raise — `error.class ==`, not `#is_a?`, deliberately, so
-    # every SUBCLASS is excluded: a `DrainingError` (`< InvalidStateError`),
-    # a peer GOAWAY (`UnprocessedStreamError`), an explicit cancel
-    # (`CanceledError`), a peer reset (`StreamResetError`), or a
-    # successfully completed drain (`DrainedError` — despite the name,
-    # NOT the timeout case; `DrainTimeoutError < TimeoutError` isn't
-    # reachable here at all, since it isn't a `ClosedError`/
-    # `InvalidStateError` subclass in the first place) must all still
-    # propagate untouched — reallocating into any of those would spin
-    # against a connection that will accept no further streams, or (for
-    # `CanceledError`/`StreamResetError`, which can occur on an
-    # otherwise perfectly live connection) simply retry a request that
-    # was already explicitly torn down.
-    #
-    # The connection-state check below is not simply a belt-and-
-    # suspenders duplicate of the exact-class check above: `error.class
-    # ==` cannot, on its own, tell a genuine skip's
-    # `ClosedError` (from `plan_skipped_local_streams_unlocked`) apart
-    # from `Connection#terminate`'s own bare `ClosedError` — e.g.
-    # `#close`'s `ClosedError.new("HTTP/2 connection closed")` — both are
-    # the identical class. Nor can the trailing
-    # `connection.stream?(current.id).nil?` check: `#terminate` clears
-    # `@streams` entirely BEFORE terminating each remaining stream, the
-    # same order a genuine skip uses, so a waiter's own stream looks
-    # exactly as "no longer registered" either way. `connection.closed?`
-    # (set by `#terminate` before any of that) is what actually tells
-    # them apart. `DrainingError` and `UnprocessedStreamError` similarly
-    # coincide with `connection.draining?` (set before either is ever
-    # raised), and `DrainedError` with `connection.closed?` (set by the
-    # same `#terminate` call that raises it) — but all three are ALSO
-    # distinct subclasses the exact-class check alone already excludes
-    # on its own, so the state check is genuinely redundant, not
-    # load-bearing, for those three specifically. Excluding them a
-    # second, independent way anyway is deliberate defense in depth for
-    # the ONE case above where it is not redundant, not evidence that
-    # either check could safely be dropped.
-    private def recoverable_stream_skip?(
-      connection : Connection,
-      current : Stream,
-      deadline : Time::Instant?,
-      error : Connection::Error,
-    ) : Bool
-      return false unless error.class == Connection::ClosedError ||
-                          error.class == Connection::InvalidStateError
-      return false unless deadline
-      return false if connection.closed? || connection.draining?
+      begin
+        loop do
+          check_cancellation!(cancellation)
+          entries = pool_selection_snapshot.first
 
-      connection.stream?(current.id).nil?
-    end
-
-    private def remaining_stream_slot_budget(
-      deadline : Time::Instant?,
-      error : Exception,
-    ) : Time::Span
-      raise error unless deadline
-
-      remaining = deadline - Time.instant
-      raise error if remaining <= Time::Span.zero
-
-      remaining
-    end
-
-    private def abort_leftover_stream_slot_attempt(
-      current : Stream?,
-      original : Stream,
-      error : Exception,
-    ) : Nil
-      return unless leftover = current
-      return if leftover.same?(original) || leftover.terminal_error
-
-      abort_stream(leftover, error)
-    end
-
-    # Returns the connection to use for the next request, dialing a fresh
-    # one if necessary. The dial itself (`#dial`'s connect-plus-TLS
-    # handshake) deliberately runs OUTSIDE `@mutex` — it can take a
-    # connect-timeout's worth of wall-clock time against a slow or
-    # unresponsive origin, and holding `@mutex` for that whole span would
-    # serialize `#close`/`#closed?` behind it.
-    #
-    # Exactly one caller owns an in-flight dial. Concurrent cold requests
-    # wait on its `DialAttempt`, then re-check the published connection;
-    # they do not perform duplicate TCP connects or TLS handshakes. A dial
-    # failure is shared by those waiters as well, preventing a failed
-    # attempt from immediately turning into a reconnect stampede. `#close`
-    # completes the attempt with `Client::ClosedError`, so waiters wake
-    # promptly even though the owning fiber's underlying socket operation
-    # may still need its configured timeout to unwind.
-    private def connection_for_request : Connection
-      loop do
-        attempt = nil
-        dialer = false
-        @mutex.synchronize do
-          raise ClosedError.new("HTTP/2 client is closed") if @closed
-
-          @retired_connections.reject!(&.closed?)
-          if current = @connection
-            return current unless current.closed? || current.draining?
-            if @supplied_connection
-              raise(
-                current.terminal_error ||
-                Connection::DrainingError.new(
-                  "supplied HTTP/2 connection is draining or closed"
-                )
-              )
-            end
-            @retired_connections << current unless current.closed?
-            @connection = nil
+          if selected = reserve_from_pool_entries(entries)
+            return selected
           end
 
-          if pending = @dial_attempt
-            attempt = pending
+          if unlimited_zero_capacity? && deadline.nil?
+            raise_pool_saturated
+          end
+
+          if reconcile_pool
+            next
+          end
+
+          entries, generation, signal, attempt = pool_selection_snapshot
+          if selected = reserve_from_pool_entries(entries)
+            return selected
+          end
+          if @supplied_connection && entries.empty?
+            raise_supplied_connection_error
+          end
+
+          if @supplied_connection &&
+             entries.any?(&.connection.state.handshaking?)
+            result = wait_for_pool(
+              signal,
+              nil,
+              supplied_ready_deadline,
+              cancellation
+            )
+            case result
+            when .canceled?
+              check_cancellation!(cancellation)
+            when .timed_out?
+              raise RequestTimeoutError.new(
+                "waiting for the HTTP/2 handshake timed out"
+              )
+            else
+              next
+            end
+          end
+
+          unless attempt
+            attempt, start = claim_dial_attempt(generation)
+            if attempt && start
+              if selected = reserve_from_current_pool
+                cancel_unstarted_dial(attempt)
+                return selected
+              end
+              start_owned_dial(attempt)
+            elsif attempt.nil? && pool_generation_changed?(generation)
+              next
+            end
+          end
+
+          if attempt
+            result = wait_for_pool(
+              signal,
+              attempt,
+              deadline,
+              cancellation
+            )
+            case result
+            when .canceled?
+              check_cancellation!(cancellation)
+            when .timed_out?
+              raise_pool_saturated
+            else
+              if attempt.signal.closed?
+                if selected = reserve_from_current_pool
+                  return selected
+                end
+                if error = attempt.error
+                  raise error
+                end
+                if connection = attempt.result_connection
+                  capacity = connection.request_capacity
+                  if capacity.state.closed? ||
+                     capacity.state.draining?
+                    failure = connection.terminal_error ||
+                              Connection::DrainingError.new(
+                                "new HTTP/2 connection became ineligible"
+                              )
+                    raise PreRequestConnectionError.new(failure)
+                  end
+                end
+              end
+              next
+            end
+          end
+
+          if deadline
+            result = wait_for_pool(signal, nil, deadline, cancellation)
+            case result
+            when .canceled?
+              check_cancellation!(cancellation)
+            when .timed_out?
+              raise_pool_saturated
+            else
+            end
+            next
+          end
+
+          raise_pool_saturated
+        end
+      ensure
+        @mutex.synchronize do
+          @pool_acquirers -= 1
+          @pool_waiters -= 1 if deadline
+          @acquisition_retained_entries.clear if @pool_acquirers.zero?
+        end
+        signal_pool_event
+      end
+    end
+
+    # ameba:enable Metrics/CyclomaticComplexity
+
+    private def unlimited_zero_capacity? : Bool
+      @mutex.synchronize do
+        @pool_configuration.max_connections.nil? &&
+          @unlimited_zero_capacity
+      end
+    end
+
+    private def raise_supplied_connection_error : NoReturn
+      connection = @mutex.synchronize { @supplied_connection_value }
+      unless connection
+        raise ClosedError.new("supplied HTTP/2 connection is unavailable")
+      end
+      if error = connection.terminal_error
+        raise error
+      end
+      if connection.draining?
+        raise Connection::DrainingError.new(
+          "supplied HTTP/2 connection is draining"
+        )
+      end
+
+      raise PoolSaturatedError.new(@pool_configuration.max_connections)
+    end
+
+    private def pool_selection_snapshot : Tuple(
+      Array(PoolEntry),
+      UInt64,
+      Channel(Nil),
+      DialAttempt?,
+    )
+      @mutex.synchronize do
+        raise ClosedError.new("HTTP/2 client is closed") if @closed
+
+        {
+          @pool_entries.dup,
+          @pool_generation,
+          @pool_signal,
+          @dial_attempt,
+        }
+      end
+    end
+
+    private def reserve_from_current_pool : ReservedConnection?
+      entries = @mutex.synchronize do
+        raise ClosedError.new("HTTP/2 client is closed") if @closed
+
+        @pool_entries.dup
+      end
+      reserve_from_pool_entries(entries)
+    end
+
+    private def reserve_from_pool_entries(
+      entries : Array(PoolEntry),
+    ) : ReservedConnection?
+      entries.each do |entry|
+        reservation = entry.connection.try_reserve_request_slot
+        next unless reservation
+
+        retained = @mutex.synchronize do
+          if @closed || !@pool_entries.includes?(entry)
+            false
           else
-            pending = DialAttempt.new
-            @dial_attempt = pending
-            attempt = pending
-            dialer = true
+            entry.mark_busy
+            @unlimited_zero_capacity = false
+            @zero_capacity_entry = nil
+            @acquisition_retained_entries.delete(entry)
+            true
           end
         end
-
-        current_attempt = attempt ||
-                          raise "connection selection omitted its dial attempt"
-        unless dialer
-          current_attempt.wait
+        unless retained
+          reservation.release
+          raise ClosedError.new("HTTP/2 client is closed") if closed?
           next
         end
 
-        selected = begin
-          publish_dialed_connection(dial)
-        rescue error
-          finish_dial_attempt(current_attempt, error)
-          raise error
+        return ReservedConnection.new(entry, reservation)
+      end
+      nil
+    end
+
+    private def claim_dial_attempt(
+      observed_generation : UInt64,
+    ) : Tuple(DialAttempt?, Bool)
+      @mutex.synchronize do
+        raise ClosedError.new("HTTP/2 client is closed") if @closed
+
+        if attempt = @dial_attempt
+          next {attempt, false}
         end
-        finish_dial_attempt(current_attempt)
-        return selected
+        next {nil, false} if observed_generation != @pool_generation
+        next {nil, false} unless pool_may_grow_unlocked?
+
+        attempt = DialAttempt.new
+        @dial_attempt = attempt
+        advance_pool_generation_unlocked
+        {attempt, true}
       end
     end
 
-    private def finish_dial_attempt(
+    private def cancel_unstarted_dial(attempt : DialAttempt) : Nil
+      @mutex.synchronize do
+        if current = @dial_attempt
+          if current.same?(attempt) && attempt.connection.nil?
+            @dial_attempt = nil
+            attempt.complete
+            advance_pool_generation_unlocked unless @closed
+          end
+        end
+      end
+    end
+
+    private def pool_generation_changed?(generation : UInt64) : Bool
+      @mutex.synchronize do
+        raise ClosedError.new("HTTP/2 client is closed") if @closed
+
+        generation != @pool_generation
+      end
+    end
+
+    private def pool_may_grow_unlocked? : Bool
+      return false if @supplied_connection
+      return false if @pool_configuration.max_connections.nil? &&
+                      @unlimited_zero_capacity
+
+      if maximum = @pool_configuration.max_connections
+        @pool_entries.size < maximum
+      else
+        true
+      end
+    end
+
+    private def start_owned_dial(attempt : DialAttempt) : Nil
+      spawn(name: "http2-client-dial") do
+        dialed = nil
+        begin
+          dialed = dial
+          retain_dialed_connection(attempt, dialed)
+          dialed.wait_until_active(@timeouts.read)
+          unless dialed.active?
+            raise(
+              dialed.terminal_error ||
+              Connection::DrainingError.new(
+                "new HTTP/2 connection did not become eligible"
+              )
+            )
+          end
+          publish_pool_connection(attempt, dialed)
+          dialed = nil
+        rescue error : Connection::TimeoutError
+          failure = RequestTimeoutError.new(
+            "waiting for the HTTP/2 handshake timed out",
+            error
+          )
+          fail_dial_attempt(attempt, failure)
+        rescue error : IO::TimeoutError
+          failure = RequestTimeoutError.new(
+            "connecting to the HTTP/2 origin timed out",
+            error
+          )
+          fail_dial_attempt(attempt, failure)
+        rescue error
+          failure = if current = dialed
+                      if current.closed?
+                        PreRequestConnectionError.new(error)
+                      else
+                        error
+                      end
+                    else
+                      error
+                    end
+          fail_dial_attempt(attempt, failure)
+        ensure
+          dialed.try(&.close)
+        end
+      end
+    end
+
+    private def publish_pool_connection(
       attempt : DialAttempt,
-      error : Exception? = nil,
+      connection : Connection,
+    ) : Nil
+      capacity = connection.request_capacity
+      unless capacity.state.active?
+        raise(
+          connection.terminal_error ||
+          Connection::DrainingError.new(
+            "new HTTP/2 connection became ineligible before publication"
+          )
+        )
+      end
+      entry = new_pool_entry(connection)
+      published = @mutex.synchronize do
+        current = @dial_attempt
+        if @closed || !current || !current.same?(attempt)
+          false
+        else
+          @pool_entries << entry
+          attempt.publish(connection)
+          @unlimited_zero_capacity =
+            @pool_configuration.max_connections.nil? &&
+              capacity.zero_peer_limit?
+          @zero_capacity_entry =
+            @unlimited_zero_capacity ? entry : nil
+          if @pool_acquirers > 0
+            @acquisition_retained_entries << entry
+          end
+          @dial_attempt = nil
+          attempt.connection = nil
+          attempt.complete
+          advance_pool_generation_unlocked
+          true
+        end
+      end
+
+      unless published
+        entry.unsubscribe
+        connection.close
+        return
+      end
+      signal_pool_event
+    end
+
+    private def fail_dial_attempt(
+      attempt : DialAttempt,
+      error : Exception,
     ) : Nil
       @mutex.synchronize do
         if current = @dial_attempt
           @dial_attempt = nil if current.same?(attempt)
         end
+        attempt.connection = nil
         attempt.complete(error)
+        advance_pool_generation_unlocked unless @closed
       end
     end
 
-    # Publishes a freshly-dialed connection as `@connection`, unless
-    # `#close` landed while it was in flight. The existing-current branch
-    # is defensive (and supports deterministic race probes); normal client
-    # operation permits only one `DialAttempt`, so no second dialer can
-    # publish a winner concurrently. A redundant connection is closed only
-    # AFTER `@mutex` is released: `Connection#close` joins background
-    # fibers, and a slow teardown must not wedge `#close`/`#closed?`.
-    #
-    # The `ensure`'s `redundant.try(&.close)` running after a `raise`
-    # inside the `synchronize` block (the `@closed` branch) means that,
-    # in the theoretical case where `Connection#close` itself raised, its
-    # exception would replace/mask the `ClosedError` already propagating
-    # rather than both surfacing. Accepted: `Connection#close` is
-    # designed not to raise under normal operation (its own internals
-    # guard/rescue around transport-close failures), and closing a
-    # redundant connection that was never handed to any caller is not a
-    # path a caller could otherwise observe or recover from differently.
-    private def publish_dialed_connection(dialed : Connection) : Connection
-      redundant = nil
-      begin
-        @mutex.synchronize do
-          if @closed
-            redundant = dialed
-            raise ClosedError.new("HTTP/2 client is closed")
-          end
-
-          current = @connection
-          if current && connection_still_usable?(current)
-            redundant = dialed
-            next current
-          end
-
-          @retired_connections << current if current && !current.closed?
-          @connection = dialed
-        end
-      ensure
-        redundant.try(&.close)
-      end
-    end
-
-    private def connection_still_usable?(connection : Connection) : Bool
-      !connection.closed? && !connection.draining?
-    end
-
-    private def ready_connection : Connection
-      connection = connection_for_request
-      begin
-        connection.wait_until_active(@timeouts.read)
-        connection
-      rescue error : Connection::TimeoutError
-        mapped = RequestTimeoutError.new(
-          "waiting for the HTTP/2 handshake timed out",
-          error
-        )
-        raise_ready_connection_error(connection, mapped)
-      rescue error : IO::TimeoutError
-        mapped = RequestTimeoutError.new(
-          "connecting to the HTTP/2 origin timed out",
-          error
-        )
-        raise_ready_connection_error(connection, mapped)
-      rescue error
-        raise_ready_connection_error(connection, error)
-      end
-    end
-
-    # A closed connection cannot become ready later. Because no stream has
-    # been reserved at this point, one replacement attempt is always safe,
-    # even for non-idempotent requests and caller-owned body IO.
-    private def raise_ready_connection_error(
+    private def retain_dialed_connection(
+      attempt : DialAttempt,
       connection : Connection,
-      error : Exception,
-    ) : NoReturn
-      if !@supplied_connection && connection.closed?
-        raise PreRequestConnectionError.new(error)
+    ) : Nil
+      retained = @mutex.synchronize do
+        current = @dial_attempt
+        if @closed || !current || !current.same?(attempt)
+          false
+        else
+          attempt.connection = connection
+          true
+        end
       end
-      raise error
+      return if retained
+
+      connection.close
+      raise ClosedError.new("HTTP/2 client is closed")
+    end
+
+    # The explicit select matrix avoids helper fibers and covers every valid
+    # combination of dial, deadline, and cancellation signals.
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def wait_for_pool(
+      signal : Channel(Nil),
+      attempt : DialAttempt?,
+      deadline : Time::Instant?,
+      cancellation : Cancellation?,
+    ) : PoolWaitResult
+      remaining = deadline.try { |value| value - Time.instant }
+      return PoolWaitResult::TimedOut if remaining &&
+                                         remaining <= Time::Span.zero
+      canceled = cancellation.try(&.signal)
+
+      if attempt
+        if canceled
+          if remaining
+            select
+            when signal.receive?
+              PoolWaitResult::PoolChanged
+            when attempt.signal.receive?
+              PoolWaitResult::DialCompleted
+            when canceled.receive?
+              PoolWaitResult::Canceled
+            when timeout(remaining)
+              PoolWaitResult::TimedOut
+            end
+          else
+            select
+            when signal.receive?
+              PoolWaitResult::PoolChanged
+            when attempt.signal.receive?
+              PoolWaitResult::DialCompleted
+            when canceled.receive?
+              PoolWaitResult::Canceled
+            end
+          end
+        elsif remaining
+          select
+          when signal.receive?
+            PoolWaitResult::PoolChanged
+          when attempt.signal.receive?
+            PoolWaitResult::DialCompleted
+          when timeout(remaining)
+            PoolWaitResult::TimedOut
+          end
+        else
+          select
+          when signal.receive?
+            PoolWaitResult::PoolChanged
+          when attempt.signal.receive?
+            PoolWaitResult::DialCompleted
+          end
+        end
+      elsif canceled
+        if remaining
+          select
+          when signal.receive?
+            PoolWaitResult::PoolChanged
+          when canceled.receive?
+            PoolWaitResult::Canceled
+          when timeout(remaining)
+            PoolWaitResult::TimedOut
+          end
+        else
+          select
+          when signal.receive?
+            PoolWaitResult::PoolChanged
+          when canceled.receive?
+            PoolWaitResult::Canceled
+          end
+        end
+      elsif remaining
+        select
+        when signal.receive?
+          PoolWaitResult::PoolChanged
+        when timeout(remaining)
+          PoolWaitResult::TimedOut
+        end
+      else
+        signal.receive?
+        PoolWaitResult::PoolChanged
+      end
+    end
+
+    # ameba:enable Metrics/CyclomaticComplexity
+
+    private def raise_pool_saturated : NoReturn
+      raise PoolSaturatedError.new(
+        @pool_configuration.max_connections
+      )
+    end
+
+    private def new_pool_entry(connection : Connection) : PoolEntry
+      sequence = @mutex.synchronize do
+        @next_pool_sequence += 1_u64
+      end
+      entry = PoolEntry.new(connection, sequence)
+      entry.subscribe { signal_pool_event }
+      entry
+    end
+
+    private def signal_pool_event : Nil
+      select
+      when @pool_events.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
+      # Client teardown already wakes every pool waiter.
+    end
+
+    private def advance_pool_generation_unlocked : Nil
+      @pool_generation += 1_u64
+      previous = @pool_signal
+      @pool_signal = Channel(Nil).new
+      previous.close
+    end
+
+    private def start_pool_coordinator : Nil
+      start = @mutex.synchronize do
+        unless @pool_coordinator_started
+          @pool_coordinator_started = true
+          true
+        end
+      end
+      return unless start
+
+      spawn(name: "http2-pool-coordinator") { pool_coordinator_loop }
+    end
+
+    private def pool_coordinator_loop : Nil
+      loop do
+        delay = next_idle_maintenance_delay
+        if delay
+          select
+          when @pool_events.receive?
+          when timeout(delay)
+          end
+        else
+          @pool_events.receive?
+        end
+        break if @pool_events.closed?
+
+        @mutex.synchronize do
+          advance_pool_generation_unlocked unless @closed
+        end
+        reconcile_pool
+      end
+    rescue Channel::ClosedError
+      # Client teardown closes the control channel.
+    ensure
+      @pool_coordinator_done.close
+    end
+
+    private def next_idle_maintenance_delay : Time::Span?
+      timeout = @pool_configuration.idle_timeout
+      return unless timeout
+
+      deadline = @mutex.synchronize do
+        retained_entries = protected_idle_entries_unlocked
+        @pool_entries.reject { |entry| retained_entries.includes?(entry) }
+          .compact_map(&.idle_since)
+          .min?
+          .try { |idle_since| idle_since + timeout }
+      end
+      return unless deadline
+
+      remaining = deadline - Time.instant
+      remaining > Time::Span.zero ? remaining : Time::Span.zero
+    end
+
+    # Reconciliation applies one authoritative capacity snapshot across the
+    # eligible, retired, and idle policies before performing closes outside
+    # the client mutex.
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def reconcile_pool : Bool
+      entries, retired, activity_generations = @mutex.synchronize do
+        return false if @closed
+
+        entries = @pool_entries.dup
+        generations = {} of PoolEntry => UInt64
+        entries.each do |entry|
+          generations[entry] = entry.activity_generation
+        end
+        {entries, @pool_retired_entries.dup, generations}
+      end
+      capacities = {} of PoolEntry => Connection::RequestCapacity
+      (entries + retired).each do |entry|
+        capacities[entry] = entry.connection.request_capacity
+      end
+
+      now = Time.instant
+      unsubscribe = [] of PoolEntry
+      force_close = [] of PoolEntry
+      idle_close = [] of PoolEntry
+      changed = false
+
+      @mutex.synchronize do
+        return false if @closed
+
+        entries.each do |entry|
+          next unless @pool_entries.includes?(entry)
+          capacity = capacities[entry]
+          if capacity.state.closed?
+            @pool_entries.delete(entry)
+            if entry.same?(@zero_capacity_entry)
+              @zero_capacity_entry = nil
+              @unlimited_zero_capacity = false
+            end
+            @acquisition_retained_entries.delete(entry)
+            unsubscribe << entry
+            changed = true
+          elsif capacity.state.draining? ||
+                capacity.stream_ids_exhausted
+            @pool_entries.delete(entry)
+            if entry.same?(@zero_capacity_entry)
+              @zero_capacity_entry = nil
+              @unlimited_zero_capacity = false
+            end
+            @acquisition_retained_entries.delete(entry)
+            entry.retired = true
+            entry.idle_since = nil
+            @pool_retired_entries << entry
+            changed = true
+          elsif entry.activity_generation !=
+                  activity_generations[entry]
+            next
+          elsif capacity.state.active? && capacity.empty?
+            unless entry.idle_since
+              entry.idle_since = now
+              changed = true
+            end
+          elsif entry.idle_since
+            entry.idle_since = nil
+            changed = true
+          end
+        end
+
+        retired.each do |entry|
+          next unless @pool_retired_entries.includes?(entry)
+          capacity = capacities[entry]
+          if capacity.state.closed?
+            @pool_retired_entries.delete(entry)
+            unsubscribe << entry
+            changed = true
+          elsif capacity.empty? && capacity.state.active?
+            idle_close << entry
+          end
+        end
+
+        while @pool_retired_entries.size >
+                @pool_configuration.max_retired_connections
+          oldest = @pool_retired_entries.shift
+          unsubscribe << oldest
+          force_close << oldest
+          changed = true
+        end
+
+        retained_entries = protected_idle_entries_unlocked
+        all_idle_entries = @pool_entries.select(&.idle_since)
+        idle_entries = all_idle_entries.reject do |entry|
+          retained_entries.includes?(entry)
+        end
+        idle_entries.sort_by! { |entry| entry.idle_since || now }
+        excess = all_idle_entries.size -
+                 @pool_configuration.max_idle_connections
+        if excess > 0
+          idle_close.concat(
+            idle_entries.first(Math.min(excess, idle_entries.size))
+          )
+        end
+        if timeout = @pool_configuration.idle_timeout
+          idle_entries.each do |entry|
+            if idle_since = entry.idle_since
+              idle_close << entry if now - idle_since >= timeout
+            end
+          end
+        end
+
+        if sentinel = @zero_capacity_entry
+          capacity = capacities[sentinel]?
+          if !capacity || !@pool_entries.includes?(sentinel)
+            @zero_capacity_entry = nil
+            @unlimited_zero_capacity = false
+            changed = true
+          elsif !capacity.zero_peer_limit?
+            @unlimited_zero_capacity = false
+            if @pool_waiters.zero?
+              @zero_capacity_entry = nil
+            end
+            changed = true
+          end
+        end
+
+        advance_pool_generation_unlocked if changed
+      end
+
+      unsubscribe.uniq!.each(&.unsubscribe)
+      force_close.uniq!.each(&.connection.close)
+      retained_entries = @mutex.synchronize do
+        protected_idle_entries_unlocked
+      end
+      idle_close.uniq!.each do |entry|
+        next if retained_entries.includes?(entry)
+
+        if entry.connection.close_if_idle
+          changed = true
+        else
+          signal_pool_event
+        end
+      end
+      changed
+    end
+
+    # ameba:enable Metrics/CyclomaticComplexity
+
+    private def protected_idle_entries_unlocked : Array(PoolEntry)
+      retained_entries = [] of PoolEntry
+      if @pool_waiters > 0
+        if sentinel = @zero_capacity_entry
+          retained_entries << sentinel
+        end
+      end
+      if @pool_acquirers > 0
+        @acquisition_retained_entries.each do |entry|
+          retained_entries << entry unless retained_entries.includes?(entry)
+        end
+      end
+      retained_entries
     end
 
     # Dials a new connection. Neither branch passes `read_timeout:`: a
     # persistent socket-level read deadline would kill idle pooled
     # connections and quiet long-lived streams once active. The HTTP/2
-    # handshake wait is instead bounded by `ready_connection`'s
-    # `wait_until_active(@timeouts.read)` call above, and liveness after
-    # that is keepalive's job, not a transport read timeout.
+    # handshake wait is instead bounded by the shared dial worker's
+    # `wait_until_active(@timeouts.read)` call, and liveness after that is
+    # keepalive's job, not a transport read timeout.
     # `write_timeout:` still bounds transport writes throughout the
     # connection's life. The HTTPS branch also passes
     # `handshake_read_timeout: @timeouts.read`, which bounds only the TLS
@@ -1337,26 +1862,45 @@ module HTTP2
       end
     end
 
-    private def take_connections_for_close : Array(Connection)
-      @mutex.synchronize do
-        next [] of Connection if @closed
+    private def take_connections_for_close : CloseSnapshot
+      entries = [] of PoolEntry
+      in_flight = nil
+      snapshot = @mutex.synchronize do
+        if @closed
+          next CloseSnapshot.new([] of Connection, nil)
+        end
 
         @closed = true
         if attempt = @dial_attempt
           @dial_attempt = nil
+          in_flight = attempt.connection
           attempt.complete(
             ClosedError.new("HTTP/2 client is closed")
           )
         end
-        connections = @retired_connections
-        if current = @connection
-          connections << current
-        end
-        @retired_connections = [] of Connection
-        @connection = nil
-        connections.uniq!
-        connections
+        entries = @pool_entries + @pool_retired_entries
+        entries.sort_by!(&.sequence)
+        @pool_entries = [] of PoolEntry
+        @pool_retired_entries = [] of PoolEntry
+        @acquisition_retained_entries.clear
+        collected = [] of Connection
+        entries.each { |entry| collected << entry.connection }
+        @supplied_connection_value = nil
+        advance_pool_generation_unlocked
+        CloseSnapshot.new(collected.uniq!, in_flight)
       end
+      entries.each(&.unsubscribe)
+      begin
+        @pool_events.close
+      rescue Channel::ClosedError
+      end
+      snapshot
+    end
+
+    private def wait_for_pool_coordinator : Nil
+      return unless @pool_coordinator_started
+
+      @pool_coordinator_done.receive?
     end
 
     private def await_response(

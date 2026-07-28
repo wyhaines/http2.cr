@@ -284,10 +284,8 @@ describe HTTP2::Connection do
         connection.stream?(opened.id).should be(opened)
 
         # The same terminal error also surfaces from #send_headers
-        # (not just #receive) — this is the exact shape
-        # HTTP2::Client#send_headers_awaiting_slot's stream_slot-skip
-        # recovery must catch: Connection::ClosedError, not
-        # Connection::InvalidStateError.
+        # (not just #receive), preserving the raw connection API's
+        # distinction between a skipped stream and another invalid state.
         error = expect_raises(HTTP2::Connection::ClosedError, /skipped/) do
           skipped.send_headers([] of HTTP2::HeaderField, end_stream: true)
         end
