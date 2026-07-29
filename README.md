@@ -268,6 +268,11 @@ settings, lifecycle changes, and typed errors. It excludes HTTP field values
 and GOAWAY debug data. Check `#dropped_diagnostic_count` to determine whether
 the consumer has fallen behind the connection.
 
+Capture starts at the moment `#diagnostics` is first called, not at
+connection start; call it before issuing any requests (you don't have to
+start receiving from the returned channel right away) if you need events
+from the very beginning, including the handshake.
+
 ## Architecture
 
 Each connection uses one reader fiber to parse and validate inbound frames. A
