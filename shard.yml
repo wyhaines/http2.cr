@@ -1,5 +1,5 @@
 name: http2
-version: 1.0.0-rc.1
+version: 1.4.1
 description: A streaming, origin-bound HTTP/2 client for Crystal
 
 authors:
