@@ -16,7 +16,19 @@ describe HTTP2::Request do
       HTTP2::Header.new("x-value", "two"),
     ])
     request.body.should be_nil
-    request.body_length.should eq(0)
+    request.body_length.should be_nil
+  end
+
+  it "reports nil body_length for nil bodies" do
+    HTTP2::Request.new("GET", "/").body_length.should be_nil
+  end
+
+  it "does not copy string bodies" do
+    s = "x" * 1024
+    request = HTTP2::Request.new("POST", "/u", body: s)
+    request.body_length.should eq 1024
+    # Same backing memory as the string -- no dup:
+    request.owned_body.not_nil!.to_unsafe.should eq s.to_slice.to_unsafe
   end
 
   it "owns buffer bodies and records their known length" do

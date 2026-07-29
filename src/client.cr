@@ -155,6 +155,7 @@ module HTTP2
       fields : Array(HeaderField),
       trailers : Array(HeaderField),
       body : IO?,
+      owned_body : Bytes?,
       body_length : Int64?,
       content_length : Int64?,
       connect : Bool
@@ -475,14 +476,23 @@ module HTTP2
       prepared : PreparedRequest,
       cancellation : Cancellation?,
     ) : Response
-      # Only the body is attempt-dependent (a replay needs a fresh read of
-      # an owned String/Bytes body, from the start -- see
-      # `Request#body_for_attempt`); everything else `prepare` computed is
-      # reused verbatim via `copy_with`, which is a cheap struct copy, not
-      # a rebuild.
-      attempt = prepared.copy_with(body: request.body_for_attempt)
+      # Only a caller-supplied IO body is attempt-dependent (a replay
+      # needs a fresh read of it from the start -- see
+      # `Request#body_for_attempt`). An owned String/Bytes body is
+      # carried once, by reference, in `prepared.owned_body` (set by
+      # `#prepare` from `Request#owned_body`) and never rebuilt: it is
+      # immutable and the same bytes are valid for every attempt, so the
+      # upload fast path (`#send_request_content`) reads it directly
+      # instead of through `attempt.body`, which stays `nil` for an owned
+      # body on every attempt, including replays -- not just the first.
+      attempt = if request.owned_body
+                  prepared
+                else
+                  prepared.copy_with(body: request.body_for_attempt)
+                end
       check_cancellation!(cancellation)
-      has_content = !attempt.body.nil? || !attempt.trailers.empty?
+      has_content = !attempt.body.nil? || !attempt.owned_body.nil? ||
+                    !attempt.trailers.empty?
       stream = open_request_stream(
         request.method,
         attempt.fields,
@@ -1640,6 +1650,14 @@ module HTTP2
         end
       end
 
+      # `request.body_length` is `nil` for every bodyless request and
+      # non-nil (0 or more) for every actual String/Bytes body, including
+      # an empty one -- a uniform, unambiguous signal now that `Nil`
+      # bodies no longer report `0_i64` (their old value collided with a
+      # genuine empty owned body's length). That means a non-nil
+      # `known_length` here always means "there is a body", so unlike
+      # before this no longer needs a second guard on `request.body`
+      # just to tell those two zero-length cases apart.
       synthesized_length : Int64? = nil
       if !connect && (known_length = request.body_length)
         if content_length
@@ -1649,7 +1667,7 @@ module HTTP2
               "content-length #{content_length}"
             )
           end
-        elsif request.body
+        else
           synthesized_length = known_length
           content_length = known_length
         end
@@ -1658,12 +1676,18 @@ module HTTP2
       PreparedRequest.new(
         build_request_fields(request, connect, authority, path, synthesized_length),
         request.trailers.to_header_fields(@additional_never_indexed_fields),
-        # `body` is left `nil` here, not `request.body_for_attempt`:
-        # `#perform_request` always calls `copy_with(body: ...)` on every
-        # attempt, including the first, before this `PreparedRequest` is
-        # ever read -- so computing a body here would just be discarded
-        # unread, wasting an `IO::Memory` allocation per bodied request.
+        # `body` is left `nil` here, not `request.body_for_attempt`. For a
+        # caller-supplied IO body, `#perform_request` calls
+        # `copy_with(body: ...)` on every attempt, including the first,
+        # before this `PreparedRequest` is ever read -- so computing a
+        # body here would just be discarded unread, wasting an
+        # `IO::Memory` allocation per bodied request. An owned
+        # String/Bytes body needs no such per-attempt rebuild at all: it
+        # is carried once, right here, as `owned_body`, and
+        # `#perform_request` skips `copy_with` for it entirely, reusing
+        # this very `PreparedRequest` unchanged on every attempt.
         nil,
+        request.owned_body,
         request.body_length,
         content_length,
         connect
@@ -1942,7 +1966,9 @@ module HTTP2
       request : PreparedRequest,
       cancellation : Cancellation?,
     ) : Nil
-      if body = request.body
+      if owned = request.owned_body
+        stream_owned_body(stream, owned, request.trailers, cancellation)
+      elsif body = request.body
         stream_body(
           stream,
           body,
@@ -1954,6 +1980,32 @@ module HTTP2
       else
         check_cancellation!(cancellation)
         stream.send_headers(request.trailers, end_stream: true)
+      end
+    end
+
+    # Uploads an owned String/Bytes body straight from its backing bytes
+    # -- no chunk buffer, no `IO#read`. `Stream#send_data(Bytes)` already
+    # splits a buffer larger than one wire frame into bounded writer
+    # commands and DATA frames (Task 3), so a single call here does
+    # everything `#stream_sized_body`'s read loop does, without the
+    # per-request buffer allocation or the read. The body's exact length
+    # is already known -- and, when the caller also gave an explicit
+    # `content-length` header, already validated against it in
+    # `#prepare` -- so unlike a streamed IO there is nothing to probe
+    # for afterward: an owned `Bytes` body can never run short or long.
+    private def stream_owned_body(
+      stream : Stream,
+      owned : Bytes,
+      trailers : Array(HeaderField),
+      cancellation : Cancellation?,
+    ) : Nil
+      check_cancellation!(cancellation)
+      if trailers.empty?
+        stream.send_data(owned, end_stream: true)
+      else
+        stream.send_data(owned, end_stream: false)
+        check_cancellation!(cancellation)
+        stream.send_headers(trailers, end_stream: true)
       end
     end
 
@@ -2067,8 +2119,8 @@ module HTTP2
       cancellation : Cancellation?,
     ) : Nil
       check_cancellation!(cancellation)
-      probe = Bytes.new(1)
-      extra = source.read(probe)
+      probe = uninitialized UInt8[1]
+      extra = source.read(probe.to_slice)
       check_cancellation!(cancellation)
       return if extra.zero?
 
@@ -2224,7 +2276,7 @@ module HTTP2
       upload : UploadState,
       cancellation : Cancellation?,
     ) : Nil
-      return unless request.connect && request.body
+      return unless request.connect && (request.body || request.owned_body)
 
       if (200..299).includes?(status) && !response_ended
         spawn_upload(stream, request, upload, cancellation)

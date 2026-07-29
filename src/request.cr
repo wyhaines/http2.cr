@@ -10,10 +10,16 @@ module HTTP2
     getter target : String
     getter headers : Headers
     getter trailers : Headers
-    getter body : IO?
     getter body_length : Int64?
 
-    @owned_body : Bytes?
+    # The backing bytes of a String/Bytes body, exposed so `Client`'s
+    # upload fast path can hand them straight to `Stream#send_data`
+    # without ever wrapping them in an `IO` -- not part of the public API.
+    # :nodoc:
+    getter owned_body : Bytes?
+
+    @io_body : IO?
+    @body_io : IO::Memory?
 
     # Creates a request. `target` is an origin-form path, an absolute URI for
     # the same client origin, `*` for OPTIONS, or authority form for CONNECT.
@@ -44,23 +50,28 @@ module HTTP2
     )
       case body
       when String
-        owned = body.to_slice.dup
-        @owned_body = owned
-        @body = IO::Memory.new(owned)
-        @body_length = owned.size.to_i64
+        # `String#to_slice` is a view over the string's own backing
+        # storage, which a Crystal `String` never mutates in place --
+        # no defensive dup is needed the way a caller-supplied `Bytes`
+        # needs one below.
+        @owned_body = body.to_slice
+        @io_body = nil
+        @body_length = body.bytesize.to_i64
       when Bytes
-        owned = body.dup
-        @owned_body = owned
-        @body = IO::Memory.new(owned)
-        @body_length = owned.size.to_i64
+        # `Bytes` is caller-owned and mutable: dup so a caller mutating
+        # their buffer after this call (or a retried request resending
+        # it) can't change what gets sent.
+        @owned_body = body.dup
+        @io_body = nil
+        @body_length = body.size.to_i64
       when IO
         @owned_body = nil
-        @body = body
+        @io_body = body
         @body_length = nil
       when Nil
         @owned_body = nil
-        @body = nil
-        @body_length = 0_i64
+        @io_body = nil
+        @body_length = nil
       end
     end
 
@@ -80,10 +91,20 @@ module HTTP2
       )
     end
 
+    # An `IO` view of the body, kept for API compatibility with callers
+    # that want to read it as a stream. For an owned String/Bytes body
+    # this wraps `@owned_body` in an `IO::Memory` only on first access,
+    # then memoizes it -- `Client`'s upload fast path never calls this;
+    # it reads `@owned_body` directly, so a request whose body is never
+    # inspected via this getter never allocates the wrapper at all.
+    def body : IO?
+      @io_body || (@body_io ||= @owned_body.try { |b| IO::Memory.new(b) })
+    end
+
     # Whether the client can reproduce this body for a proven-unprocessed
     # retry. String and Bytes bodies are owned; caller-supplied IO is not.
     def replayable_body? : Bool
-      @body.nil? || !@owned_body.nil?
+      @io_body.nil?
     end
 
     # :nodoc:
@@ -91,7 +112,7 @@ module HTTP2
       if owned = @owned_body
         IO::Memory.new(owned)
       else
-        @body
+        @io_body
       end
     end
   end
