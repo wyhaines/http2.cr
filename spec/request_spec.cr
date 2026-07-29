@@ -28,7 +28,10 @@ describe HTTP2::Request do
     request = HTTP2::Request.new("POST", "/u", body: s)
     request.body_length.should eq 1024
     # Same backing memory as the string -- no dup:
-    request.owned_body.not_nil!.to_unsafe.should eq s.to_slice.to_unsafe
+    owned = request.owned_body
+    owned.should_not be_nil
+    owned = owned.as(Bytes)
+    owned.to_unsafe.should eq s.to_slice.to_unsafe
   end
 
   it "owns buffer bodies and records their known length" do
