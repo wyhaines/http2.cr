@@ -111,16 +111,17 @@ module HTTP2
     @drain_started = false
     @keepalive_started = Atomic(Bool).new(false)
     @drain_deadline : Time::Instant?
-    # Monotonic nanoseconds (`Time.monotonic.total_nanoseconds.to_i64`), not
-    # `Time.instant` -- read lock-free from the per-frame path
-    # (`observe_inbound_frame`) with no mutex, unlike the rest of this
-    # connection's timing state. `Time.instant` and `Time.monotonic` share
-    # the same underlying clock reading (both delegate to
-    # `Crystal::System::Time.monotonic`), so ns arithmetic here stays
-    # comparable with `Time.instant`-based deadlines elsewhere.
-    @last_inbound_activity_ns = Atomic(Int64).new(
-      Time.monotonic.total_nanoseconds.to_i64
-    )
+    # Monotonic nanoseconds (`monotonic_ns`), not `Time.instant` -- read
+    # lock-free from the per-frame path (`observe_inbound_frame`) with no
+    # mutex, unlike the rest of this connection's timing state.
+    # `Time.instant` and `Time.monotonic` share the same underlying clock
+    # reading (both delegate to `Crystal::System::Time.monotonic`), so ns
+    # arithmetic here stays comparable with `Time.instant`-based deadlines
+    # elsewhere. Set in `initialize` (below), not as a class-body default,
+    # because `monotonic_ns` is a private instance method and class-body
+    # ivar defaults evaluate in the metaclass, where an unqualified call
+    # can't reach it.
+    @last_inbound_activity_ns : Atomic(Int64)
     @keepalive_sequence = 0_u32
     # Counts PUSH_PROMISE frames accepted while our own ENABLE_PUSH=0
     # SETTINGS has not yet been acknowledged (see `validate_push_promise!`).
@@ -196,6 +197,7 @@ module HTTP2
       @diagnostics = Channel(Diagnostic).new(
         @configuration.diagnostic_queue_capacity
       )
+      @last_inbound_activity_ns = Atomic(Int64).new(monotonic_ns)
     end
 
     # Creates and starts a connection over a caller-supplied duplex IO.
@@ -3806,15 +3808,27 @@ module HTTP2
       payload
     end
 
+    # Current monotonic clock reading, in nanoseconds, as an `Int64`.
+    # `Time.monotonic` is deprecated on this dev-branch compiler (in favor
+    # of `Time.instant`), but the callers here need raw ns for lock-free
+    # atomic storage/arithmetic (`@last_inbound_activity_ns`), not a
+    # `Time::Instant` wrapper. Centralized here instead of repeated at
+    # each of the three call sites so that whenever `Time.monotonic` is
+    # actually removed upstream, there is exactly one place in this file
+    # to update.
+    private def monotonic_ns : Int64
+      Time.monotonic.total_nanoseconds.to_i64
+    end
+
     # Returns the time remaining until `window` has elapsed since the last
     # inbound frame (`@last_inbound_activity_ns`), possibly negative if it
     # has already elapsed. This is a periodic poll from the drain monitor
     # and keepalive loops, not the per-frame write path, so an ordinary
-    # `Time.monotonic` read here costs nothing that matters -- unlike
+    # `monotonic_ns` read here costs nothing that matters -- unlike
     # `observe_inbound_frame`'s `.set`, which runs on every inbound frame
     # and stays lock-free.
     private def remaining_since_last_activity(window : Time::Span) : Time::Span
-      now_ns = Time.monotonic.total_nanoseconds.to_i64
+      now_ns = monotonic_ns
       Time::Span.new(
         nanoseconds: @last_inbound_activity_ns.get + window.total_nanoseconds.to_i64 - now_ns
       )
@@ -3825,7 +3839,7 @@ module HTTP2
       *,
       rate_limit : Bool = true,
     ) : Nil
-      @last_inbound_activity_ns.set(Time.monotonic.total_nanoseconds.to_i64)
+      @last_inbound_activity_ns.set(monotonic_ns)
       notify_keepalive_activity if @keepalive_started.get
       emit_frame(frame, Diagnostic::Direction::Inbound)
       @inbound_frame_rate_limiter.check(frame) if rate_limit
