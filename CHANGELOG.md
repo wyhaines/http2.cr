@@ -60,6 +60,12 @@ paired micro-verification during review, not an end-to-end benchmark.
 
 ### Fixed
 
+- Fixed a write stall: flush batching could leave a WINDOW_UPDATE-only
+  write, or a write in the middle of a DATA block, staged in a buffered
+  transport without ever being flushed — parking the writer fiber with
+  credit or payload bytes it had already accepted but never put on the
+  wire. See the writer flush-batching entry under Performance for the
+  batching change this fix landed alongside.
 - `Response#trailers` (with no explicit timeout argument) no longer
   aborts a request whose response body is still being actively, if
   slowly, consumed — it now re-arms the same way the body-side idle
@@ -85,6 +91,18 @@ paired micro-verification during review, not an end-to-end benchmark.
 
 ### Changed
 
+- `Connection#diagnostics` now only starts capturing frame, error, and
+  lifecycle events at the moment it is first called, instead of always
+  capturing from connection start. If you call `#diagnostics` after
+  traffic is already flowing, you will no longer see any events from
+  before that call — previously, up to `diagnostic_queue_capacity` of
+  those earlier events could still be sitting in the channel, waiting to
+  be received, even though `#diagnostics` hadn't been called yet. If you
+  need diagnostics from the very start of a connection (for example, to
+  capture the handshake), call `#diagnostics` before issuing any requests
+  on it; you don't have to start receiving from the returned channel
+  right away for capture to begin, only the call itself needs to happen
+  early.
 - `Request#body_length` is now `nil` (rather than a stale or synthesized
   value) whenever the request has no body.
 - `Connection#write_batch`'s validation now raises on the first invalid
