@@ -2253,7 +2253,7 @@ module HTTP2
       upload : UploadState,
       cancellation : Cancellation?,
     ) : Response
-      informational = [] of InformationalResponse
+      informational = nil
       loop do
         event = stream.receive(
           @timeouts.read,
@@ -2269,7 +2269,7 @@ module HTTP2
           parsed = event.parsed_response ||
                    HTTPSemantics.parse_response_section(event.fields, stream.id)
           if parsed.status < 200
-            informational << InformationalResponse.new(
+            (informational ||= [] of InformationalResponse) << InformationalResponse.new(
               parsed.status,
               parsed.headers
             )
@@ -2301,7 +2301,7 @@ module HTTP2
           return Response.new(
             parsed.status,
             parsed.headers,
-            informational,
+            informational || EMPTY_INFORMATIONAL,
             stream,
             metadata,
             @timeouts.idle,
@@ -2517,19 +2517,14 @@ module HTTP2
 
     # :nodoc:
     class UploadState
-      @done = false
-      @mutex = Mutex.new
+      @done = Atomic(Bool).new(false)
 
       def complete : Nil
-        @mutex.synchronize do
-          return if @done
-
-          @done = true
-        end
+        @done.set(true)
       end
 
       def done? : Bool
-        @mutex.synchronize { @done }
+        @done.get
       end
     end
 

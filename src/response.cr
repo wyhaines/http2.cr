@@ -6,6 +6,11 @@ require "./http_errors"
 module HTTP2
   record InformationalResponse, status : Int32, headers : Headers
 
+  # Shared placeholder for responses that never received a 1xx
+  # informational response, avoiding a per-response array allocation for
+  # that common case.
+  EMPTY_INFORMATIONAL = [] of InformationalResponse
+
   # A streaming HTTP response. Consume or close `body` before waiting for
   # trailers so flow control can continue.
   class Response
@@ -194,7 +199,7 @@ module HTTP2
     @signal = Channel(Nil).new
     @mutex = Mutex.new
 
-    def complete(trailers : Headers = Headers.new) : Nil
+    def complete(trailers : Headers? = nil) : Nil
       changed = @mutex.synchronize do
         next false if @done
 

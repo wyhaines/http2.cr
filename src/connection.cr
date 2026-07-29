@@ -4627,6 +4627,8 @@ module HTTP2
 
     private def notify_pool_state : Nil
       callbacks = @pool_state_subscription_mutex.synchronize do
+        return if @pool_state_subscriptions.empty?
+
         @pool_state_subscriptions.values
       end
       callbacks.each do |callback|

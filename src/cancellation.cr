@@ -2,21 +2,15 @@ module HTTP2
   # A shareable, idempotent cancellation signal for a request and its body.
   class Cancellation
     @signal = Channel(Nil).new
-    @mutex = Mutex.new
-    @canceled = false
+    @canceled = Atomic(Bool).new(false)
 
     def cancel : Nil
-      close = @mutex.synchronize do
-        next false if @canceled
-
-        @canceled = true
-        true
-      end
+      _, close = @canceled.compare_and_set(false, true)
       @signal.close if close
     end
 
     def canceled? : Bool
-      @mutex.synchronize { @canceled }
+      @canceled.get
     end
 
     # :nodoc:
