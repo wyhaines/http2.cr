@@ -849,12 +849,25 @@ module HTTP2
 
     # Sends application data through the flow-control scheduler.
     #
-    # `data` is sliced, not copied: `submit_data` (via `#command.wait`)
-    # blocks until each chunk's frame has been handed to the transport
-    # (successfully or not) before returning, so by the time this call
-    # returns, nothing internal to the connection still reads from `data`.
-    # The caller must leave `data` unmodified until this call returns; it
-    # is never retained afterward.
+    # Under the default single-threaded runtime, `data` is sliced, not
+    # copied: `submit_data` (via `#command.wait`) blocks until each
+    # chunk's frame has been handed to the transport (successfully or
+    # not) before returning, so by the time this call returns, nothing
+    # internal to the connection still reads from `data`. See
+    # `#write_scheduled_data`'s comment for the three invariants that
+    # guarantee this.
+    #
+    # Under `-Dpreview_mt`, `#owned_for_write` takes a private copy of
+    # each chunk instead: `#terminate` is reachable from fibers not
+    # pinned to the writer's thread (`#close`, and the drain-monitor,
+    # keepalive, and settings-timer loops, all plain `::spawn` unlike
+    # `#spawn_transport_fiber`'s pinned reader/writer fibers), and it
+    # can unblock this call's `#command.wait` on a different OS thread
+    # while the writer thread is still copying the chunk into the
+    # transport buffer.
+    #
+    # Either way, the caller must leave `data` unmodified until this
+    # call returns; it is never retained afterward.
     def send_data(
       stream_id : UInt32,
       data : Bytes,
@@ -888,7 +901,7 @@ module HTTP2
           Frame::Data.new(
             flags,
             stream_id,
-            data[offset, size]
+            owned_for_write(data[offset, size])
           )
         )
         offset += size
@@ -898,12 +911,15 @@ module HTTP2
     # Streams DATA from the source's current position without rewinding it.
     #
     # Reads into two reusable buffers instead of allocating one per chunk.
-    # This is safe only because `#send_data(Bytes)` is synchronous: it
-    # blocks until the chunk it was given has been handed to the transport
+    # This relies on `#send_data(Bytes)` being synchronous: it blocks
+    # until the chunk it was given has been handed to the transport
     # before returning, so a buffer is never refilled while a prior call
-    # might still be reading from it. `current` and `following` swap roles
-    # each iteration; the loop always reads into the buffer that was NOT
-    # just handed to `#send_data`.
+    # might still be reading from it (default single-threaded runtime),
+    # or is refilled only after `#owned_for_write` has already taken a
+    # private copy of the in-flight chunk (`-Dpreview_mt`; see
+    # `#send_data(Bytes)`'s doc comment). `current` and `following` swap
+    # roles each iteration; the loop always reads into the buffer that
+    # was NOT just handed to `#send_data`.
     def send_data(
       stream_id : UInt32,
       source : IO,
@@ -1280,6 +1296,31 @@ module HTTP2
       return if remaining <= Time::Span.zero
 
       command.wait(remaining)
+    end
+
+    # Returns a slice `#send_data(Bytes)` can hand to `#submit_data`
+    # without further copying, under the default single-threaded
+    # runtime — a synchronous chunk transfer where `#write_scheduled_data`
+    # (see its comment) guarantees the transport has already copied the
+    # bytes elsewhere before this method's caller can regain control.
+    #
+    # Under `-Dpreview_mt`, that guarantee doesn't hold: `#terminate` is
+    # reachable from fibers `#spawn_transport_fiber` never pins to the
+    # writer's thread (`#close`, and the drain-monitor, keepalive, and
+    # settings-timer loops). `#terminate` terminates every stream while
+    # holding `@mutex`, closing `stream.terminal_signal`; that can
+    # unblock `WriteCommand#wait(stream)` — and so this slice's caller —
+    # on a different OS thread while the writer thread is still inside
+    # `frame.write` → `IO::Buffered#write`'s copy of this same slice.
+    # A private copy here keeps that interleaving harmless, exactly as
+    # the `.dup` this method replaces did before the slice became
+    # caller-owned.
+    private def owned_for_write(slice : Bytes) : Bytes
+      {% if flag?(:preview_mt) %}
+        slice.dup
+      {% else %}
+        slice
+      {% end %}
     end
 
     private def submit_data(frame : Frame::Data) : Nil
@@ -1725,6 +1766,27 @@ module HTTP2
       end
     end
 
+    # The single-threaded zero-copy argument documented on `#send_data`
+    # and `#owned_for_write` rests on three invariants that meet here:
+    #   (a) `#spawn_transport_fiber` pins the reader, writer, and
+    #       transport-closer fibers to one OS thread under
+    #       `-Dpreview_mt` (irrelevant, but also harmless, when that
+    #       flag is off, since there is only one thread regardless);
+    #   (b) every writer code path that touches `@transport`
+    #       (`#process_write_command`, `#write_scheduled_frames`, and
+    #       this method) calls `@transport.flush` immediately after
+    #       writing, before the writer fiber can next block waiting
+    #       for work;
+    #   (c) `@transport`'s `buffer_size` is sized (see `.connect` /
+    #       `.start_tls`) to `>= outbound_data_chunk_size +
+    #       FrameHeader::SIZE`, so `IO::Buffered#write` always takes
+    #       its `slice.copy_to(...)` branch for a DATA payload — a
+    #       synchronous memcpy into the IO's own buffer, never
+    #       `unbuffered_write` directly on the caller's slice.
+    # Changing any of (a)-(c) reopens the caller-buffer race
+    # `#owned_for_write` exists to close under `-Dpreview_mt`, and
+    # would make the same race live under the default single-threaded
+    # runtime too.
     private def write_scheduled_data(
       command : WriteCommand,
       frame : Frame::Data,
