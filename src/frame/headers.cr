@@ -50,10 +50,6 @@ module HTTP2
       data
     end
 
-    def data_offset
-      padding_offset + (priority? ? 5 : 0)
-    end
-
     protected def validate!
       require_stream_id!("HEADERS")
       validate_padding!(priority? ? 5 : 0)

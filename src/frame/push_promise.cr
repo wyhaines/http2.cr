@@ -56,10 +56,6 @@ module HTTP2
       data
     end
 
-    def data_offset
-      padding_offset + 4
-    end
-
     protected def validate!
       require_stream_id!("PUSH_PROMISE")
       validate_padding!(4)
