@@ -5,7 +5,13 @@ module HTTP2
   class Stream
     # :nodoc:
     abstract class InboundValidator
-      abstract def validate(section : Connection::FieldSection) : Nil
+      # Returns the parsed result of *section* — a `ResponseSection` for
+      # a response's leading field section, `Headers` for its trailer
+      # section — so the caller can attach it to the delivered event
+      # instead of the client re-parsing the identical fields later.
+      abstract def validate(
+        section : Connection::FieldSection,
+      ) : HTTPSemantics::ResponseSection | Headers
       abstract def validate_data(size : Int32, end_stream : Bool) : Nil
     end
 
@@ -458,7 +464,9 @@ module HTTP2
     end
 
     # :nodoc:
-    def validate_inbound(section : Connection::FieldSection) : Nil
+    def validate_inbound(
+      section : Connection::FieldSection,
+    ) : (HTTPSemantics::ResponseSection | Headers)?
       validator = @mutex.synchronize { @inbound_validator }
       validator.try(&.validate(section))
     end

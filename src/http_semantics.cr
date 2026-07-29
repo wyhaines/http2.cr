@@ -271,11 +271,10 @@ module HTTP2
     )
     end
 
-    def validate(section : Connection::FieldSection) : Nil
-      if @final_status
-        validate_trailer_section(section)
-        return
-      end
+    def validate(
+      section : Connection::FieldSection,
+    ) : HTTPSemantics::ResponseSection | Headers
+      return validate_trailer_section(section) if @final_status
 
       parsed = HTTPSemantics.parse_response_section(
         section.fields,
@@ -286,6 +285,7 @@ module HTTP2
       else
         validate_final_section(section, parsed)
       end
+      parsed
     end
 
     private def validate_final_section(
@@ -348,15 +348,16 @@ module HTTP2
 
     private def validate_trailer_section(
       section : Connection::FieldSection,
-    ) : Nil
+    ) : Headers
       unless section.end_stream?
         malformed!("a trailer field section must end the stream")
       end
       if @no_content || @tunnel
         malformed!("this response cannot contain trailers")
       end
-      HTTPSemantics.validate_trailers(section.fields, @stream_id)
+      trailers = HTTPSemantics.validate_trailers(section.fields, @stream_id)
       validate_end!
+      trailers
     end
 
     private def validate_end! : Nil

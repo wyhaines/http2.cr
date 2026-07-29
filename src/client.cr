@@ -2077,10 +2077,13 @@ module HTTP2
         )
         case event
         when Connection::FieldSection
-          parsed = HTTPSemantics.parse_response_section(
-            event.fields,
-            stream.id
-          )
+          # The connection-side validator already parsed this section on
+          # the reader fiber and attached its result (see
+          # `Connection::FieldSection#parsed_response`); only re-parse
+          # here when that didn't happen (server mode or a validator-
+          # disabled connection never attaches one).
+          parsed = event.parsed_response ||
+                   HTTPSemantics.parse_response_section(event.fields, stream.id)
           if parsed.status < 200
             informational << InformationalResponse.new(
               parsed.status,
@@ -2240,11 +2243,7 @@ module HTTP2
 
             case event
             when Connection::FieldSection
-              trailers = HTTPSemantics.validate_trailers(
-                event.fields,
-                stream.id
-              )
-              metadata.complete(trailers)
+              metadata.complete(resolve_trailers(event, stream))
               stop_early_upload(stream, upload) if stop_upload_on_end
               break
             when Frame::Priority
@@ -2263,6 +2262,19 @@ module HTTP2
           metadata.fail(error)
         end
       end
+    end
+
+    # Consumes the connection-side validator's already-parsed trailers
+    # (see `Connection::FieldSection#parsed_trailers`) when present,
+    # falling back to parsing `event.fields` only when that didn't
+    # happen (server mode or a validator-disabled connection never
+    # attaches one).
+    private def resolve_trailers(
+      event : Connection::FieldSection,
+      stream : Stream,
+    ) : Headers
+      event.parsed_trailers ||
+        HTTPSemantics.validate_trailers(event.fields, stream.id)
     end
 
     # Stops an upload that is still in flight after its response has

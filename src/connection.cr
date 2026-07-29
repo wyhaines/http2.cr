@@ -2907,8 +2907,7 @@ module HTTP2
       stream_event : Stream::Event,
     ) : Nil
       if section = event.as?(FieldSection)
-        stream = @mutex.synchronize { @streams[section.stream_id]? }
-        stream.try(&.validate_inbound(section))
+        event = attach_parsed_result(event, section)
       end
 
       stream, ignored = @mutex.synchronize do
@@ -2964,6 +2963,29 @@ module HTTP2
       if stream.closed?
         notify_pool_state
         wake_drain_monitor
+      end
+    end
+
+    # Runs *section* through its stream's installed `ResponseValidator`
+    # (if any) and, when validation ran, returns a NEW `FieldSection`
+    # with the parse result attached — `FieldSection` is a struct with
+    # no mutators, so a validated section is attached by building a
+    # fresh event here rather than mutating *section* in place. Returns
+    # *event* unchanged when no validator is installed (server mode, or
+    # validation disabled): the client falls back to parsing `fields`
+    # itself in that case.
+    private def attach_parsed_result(
+      event : StreamEvent,
+      section : FieldSection,
+    ) : StreamEvent
+      stream = @mutex.synchronize { @streams[section.stream_id]? }
+      case result = stream.try(&.validate_inbound(section))
+      when HTTPSemantics::ResponseSection
+        FieldSection.new(section, parsed_response: result)
+      when Headers
+        FieldSection.new(section, parsed_trailers: result)
+      else
+        event
       end
     end
 

@@ -87,10 +87,32 @@ module HTTP2
       getter priority : FieldBlock::Priority?
       getter continuation_count : Int32
 
+      # The connection-side `ResponseValidator`'s already-parsed result
+      # for this section, attached (see the second `initialize` below)
+      # by `Connection#transition_and_deliver` once validation completes
+      # — `parsed_response` for a response's leading field section,
+      # `parsed_trailers` for its trailer section, never both. Both stay
+      # `nil` when no validator ran (server mode, or validation
+      # disabled) or for a PUSH_PROMISE section, which is never routed
+      # through the validator at all; the consumer (`Client#await_response`
+      # / its trailer counterpart) falls back to parsing `fields` itself
+      # in that case. Safe to read from a fiber other than the one that
+      # attached it: `HTTPSemantics::ResponseSection` is an immutable
+      # `record`, and the attached `Headers` is handed over only after
+      # `HTTPSemantics.validate_trailers` has finished building it and
+      # never mutated afterward — the validator that built it discards
+      # its own reference, and this struct exposes it via a read-only
+      # `getter` with no mutator, so there is no writer left to race the
+      # client's read.
+      getter parsed_response : HTTPSemantics::ResponseSection?
+      getter parsed_trailers : Headers?
+
       def initialize(
         block : FieldBlock,
         @fields : Array(DecodedHeaderField),
         @decoded_size : UInt64,
+        @parsed_response : HTTPSemantics::ResponseSection? = nil,
+        @parsed_trailers : Headers? = nil,
       )
         @kind = block.kind
         @stream_id = block.stream_id
@@ -98,6 +120,26 @@ module HTTP2
         @promised_stream_id = block.promised_stream_id
         @priority = block.priority
         @continuation_count = block.continuation_count
+      end
+
+      # Builds a copy of *section* with a validator's parse result
+      # attached. `FieldSection` is a struct that flows through the
+      # stream event channel, so the delivered event has to be built
+      # fresh here rather than mutated in place — every getter above is
+      # read-only, so there is nothing on the original to mutate anyway.
+      def initialize(
+        section : FieldSection,
+        @parsed_response : HTTPSemantics::ResponseSection? = nil,
+        @parsed_trailers : Headers? = nil,
+      )
+        @kind = section.kind
+        @stream_id = section.stream_id
+        @fields = section.fields
+        @decoded_size = section.decoded_size
+        @end_stream = section.end_stream?
+        @promised_stream_id = section.promised_stream_id
+        @priority = section.priority
+        @continuation_count = section.continuation_count
       end
     end
   end
