@@ -186,7 +186,10 @@ module HTTP2
     end
 
     # Marks the body terminal, discards buffered data, and returns the number
-    # of flow-controlled application octets that were discarded.
+    # of flow-controlled application octets that were discarded. Once the body
+    # is finished, closed, or terminal, this is a no-op returning 0 — the
+    # finished body's buffered data is deliberately preserved for the reader to
+    # drain to clean EOF, establishing an invariant against data loss.
     #
     # :nodoc:
     def terminate(error : Exception) : Int32
