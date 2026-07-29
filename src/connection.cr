@@ -981,6 +981,32 @@ module HTTP2
       submit_data(frame)
     end
 
+    # Enqueues one ordered field section onto the writer's FIFO
+    # `@write_queue` without waiting for it to reach the transport (the
+    # HPACK encoding itself is deferred further still — to the writer
+    # fiber, once it dequeues this command — so this method only ever
+    # does admission-order bookkeeping). Returns the `WriteCommand` so a
+    # caller that holds an external ordering lock across multiple
+    # same-connection submitters (see `Client#open_request_stream`'s
+    # `opening_mutex`) can release that lock once this command is
+    # admitted to `@write_queue` in the correct position, instead of
+    # holding it for the blocking wait too. `#send_headers` is the fused
+    # submit+wait convenience most callers want.
+    #
+    # :nodoc:
+    def submit_headers(
+      stream_id : UInt32,
+      fields : Enumerable(HeaderField),
+      *,
+      end_stream : Bool = false,
+    ) : WriteCommand
+      ensure_registered_stream!(stream_id)
+      materialized = fields.map { |field| field }
+      command = WriteCommand.headers(stream_id, materialized, end_stream)
+      submit_nowait(command)
+      command
+    end
+
     # HPACK-encodes one ordered field section on the writer fiber and sends
     # its complete HEADERS/CONTINUATION sequence atomically.
     def send_headers(
@@ -989,15 +1015,7 @@ module HTTP2
       *,
       end_stream : Bool = false,
     ) : Nil
-      ensure_registered_stream!(stream_id)
-      materialized = fields.map { |field| field }
-      submit(
-        WriteCommand.headers(
-          stream_id,
-          materialized,
-          end_stream
-        )
-      )
+      submit_headers(stream_id, fields, end_stream: end_stream).wait
     end
 
     # Encodes ordered name/value pairs with the default field policy.

@@ -868,6 +868,72 @@ describe HTTP2::Client do
     end
   end
 
+  # Regression coverage for the narrowed `opening_mutex` (see
+  # `Client#open_request_stream`): each request's stream ID is assigned
+  # under that mutex, but the blocking wait for its HEADERS write to reach
+  # the transport happens after the mutex is released, so several
+  # requests' materialize-and-enqueue steps can now interleave with each
+  # other's writer-flush waits. Unlike "reuses one origin connection for
+  # concurrent requests" above (which only checks the *set* of stream IDs
+  # used), this asserts the field sections arrive at the peer in strict
+  # stream-ID order — the invariant that makes narrowing the mutex safe.
+  it "sends concurrent HEADERS on one connection in stream-ID order" do
+    request_count = 8
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+        arrival_order = Array.new(request_count) do
+          client_read_field_section(io, decoder)[:stream_id]
+        end
+        arrival_order.should eq(
+          Array.new(request_count) { |index| (index * 2 + 1).to_u32 }
+        )
+
+        encoder = HPack::Encoder.new
+        arrival_order.each do |id|
+          write_server_fields(
+            io,
+            encoder,
+            id,
+            [{":status", "200"}, {"x-stream", id.to_s}],
+            end_stream: true
+          )
+        end
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        responses = Channel(HTTP2::Response | Exception).new(request_count)
+        request_count.times do |index|
+          spawn do
+            begin
+              responses.send(http.get("/#{index}"))
+            rescue error
+              responses.send(error)
+            end
+          end
+        end
+        request_count.times do
+          result = select
+          when value = responses.receive
+            value
+          when timeout(2.seconds)
+            fail("concurrent HTTP/2 requests did not complete")
+          end
+          raise result if result.is_a?(Exception)
+        end
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "raises pool saturation immediately without a configured stream_slot wait" do
     UNIXSocket.pair do |client_io, peer|
       first_seen = Channel(Nil).new(1)

@@ -595,7 +595,30 @@ module HTTP2
         connection = selected.entry.connection
         stream = nil
         begin
-          selected.entry.opening_mutex.synchronize do
+          # Wire-ordering invariant this narrowed critical section relies
+          # on: HEADERS for a lower stream ID must never reach the wire
+          # after HEADERS for a higher one opened on the same connection.
+          # `materialize_request_stream` assigns stream IDs monotonically
+          # under `Connection`'s own state mutex, and `@write_queue` is a
+          # single-reader FIFO channel whose enqueue side is fully
+          # serialized by `Connection#submit`/`#submit_headers` (via
+          # `@submission_mutex`) — so whichever fiber's command is
+          # admitted to that channel first is the one the sole writer
+          # fiber stages and flushes first. `opening_mutex` (one per
+          # pooled connection) therefore only has to keep "assign this
+          # fiber's stream ID" and "admit this fiber's HEADERS command to
+          # `@write_queue`" atomic with respect to every other fiber
+          # opening a request on the *same* connection: as long as no
+          # other same-connection materialize can run between this
+          # fiber's ID assignment and its own enqueue, admission order
+          # matches ID-assignment order, which the writer then preserves
+          # onto the wire. The blocking wait for that write to actually
+          # reach the socket (bounded only by `@timeouts.write`) plays no
+          # part in that ordering, so it does not need to share the lock —
+          # holding the lock across it (as this used to do) only adds
+          # head-of-line blocking, where one congested HEADERS write
+          # parked every other request racing for the same connection.
+          command = selected.entry.opening_mutex.synchronize do
             check_cancellation!(cancellation)
             stream = connection.materialize_request_stream(
               selected.reservation
@@ -606,22 +629,27 @@ module HTTP2
               current.id,
               request_method
             )
-            begin
-              current.send_headers(fields, end_stream: end_stream)
-            rescue error : Connection::ConcurrentStreamLimitError | Connection::DrainingError
+            current.submit_headers(fields, end_stream: end_stream)
+          end
+          begin
+            command.wait
+          rescue error : Connection::ConcurrentStreamLimitError | Connection::DrainingError
+            if current = stream
               abort_stream(current, error) unless current.terminal_error
+            end
+            stream = nil
+            raise RetryPoolSelection.new(error.message, error)
+          rescue error : Connection::InvalidStateError
+            if error.class == Connection::InvalidStateError
+              if current = stream
+                abort_stream(current, error) unless current.terminal_error
+              end
               stream = nil
               raise RetryPoolSelection.new(error.message, error)
-            rescue error : Connection::InvalidStateError
-              if error.class == Connection::InvalidStateError
-                abort_stream(current, error) unless current.terminal_error
-                stream = nil
-                raise RetryPoolSelection.new(error.message, error)
-              end
-              raise error
             end
-            check_cancellation!(cancellation)
+            raise error
           end
+          check_cancellation!(cancellation)
           return stream ||
             raise "request opening completed without a stream"
         rescue Connection::ConcurrentStreamLimitError | Connection::OpenStreamLimitError | Connection::StreamIDExhaustedError

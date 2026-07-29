@@ -245,6 +245,24 @@ module HTTP2
       end
     end
 
+    # Enqueues one ordered field section without waiting for the write to
+    # complete. Used only by `Client#open_request_stream` to release its
+    # per-connection `opening_mutex` before blocking on a write bounded by
+    # `@timeouts.write` — see that method's comment for the wire-ordering
+    # argument this depends on.
+    #
+    # :nodoc:
+    def submit_headers(
+      fields : Enumerable(HeaderField),
+      *,
+      end_stream : Bool = false,
+    ) : Connection::WriteCommand
+      raise_terminal! if terminal_error
+      @outbound_mutex.synchronize do
+        @connection.submit_headers(id, fields, end_stream: end_stream)
+      end
+    end
+
     # Encodes ordered name/value pairs with the default field policy.
     def send_headers(
       fields : Enumerable(Tuple(String, String)),
