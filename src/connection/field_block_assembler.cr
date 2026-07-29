@@ -52,7 +52,12 @@ module HTTP2
         check_size!(fragment.size)
 
         if frame.end_headers?
-          return build(frame, fragment.dup, 0)
+          # `fragment` is a subslice of `frame`'s own payload, freshly
+          # allocated by `Frame.read` for this frame alone and owned by
+          # nobody else — `decode_field_block` consumes it synchronously
+          # on this fiber and the block is never retained past that, so
+          # handing it out without a copy is safe. See `FieldBlock#encoded`.
+          return build(frame, fragment, 0)
         end
 
         @pending = Pending.new(frame, fragment)
@@ -141,7 +146,11 @@ module HTTP2
         end
 
         def to_slice : Bytes
-          output.to_slice.dup
+          # `@pending` is nulled by `continue` before this runs (see
+          # caller), so this `Pending` — and the `IO::Memory` it wraps —
+          # has no other owner; the caller doesn't touch `output` again.
+          # Safe to hand out the buffer itself without a copy.
+          output.to_slice
         end
       end
     end

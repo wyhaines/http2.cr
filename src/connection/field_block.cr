@@ -15,6 +15,12 @@ module HTTP2
 
       getter kind : Kind
       getter stream_id : UInt32
+
+      # May alias the opening frame's payload or the assembler's
+      # CONTINUATION accumulator buffer (see `FieldBlockAssembler`) rather
+      # than a defensive copy — valid only until this block is decoded,
+      # i.e. within the reader fiber's current dispatch of this frame.
+      # Do not retain it past that point.
       getter encoded : Bytes
       getter? end_stream : Bool
       getter promised_stream_id : UInt32?
