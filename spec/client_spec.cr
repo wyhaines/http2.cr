@@ -877,6 +877,18 @@ describe HTTP2::Client do
   # concurrent requests" above (which only checks the *set* of stream IDs
   # used), this asserts the field sections arrive at the peer in strict
   # stream-ID order — the invariant that makes narrowing the mutex safe.
+  #
+  # This spec has no detection power under the default single-threaded
+  # runtime: mutation testing that deleted `opening_mutex` entirely still
+  # left it green there, because nothing forces a fiber switch between
+  # `materialize_request_stream` and its own enqueue without a second OS
+  # thread actually running the other fiber concurrently. `crystal spec
+  # -Dpreview_mt` is the gate that actually exercises the race this spec
+  # checks; the single-threaded run only confirms the happy path still
+  # works. A `stream_slot` timeout is configured below so a request that
+  # loses a pool-slot TOCTOU race (a pre-existing, unrelated ~2% flake
+  # under `-Dpreview_mt` — see client.cr's `acquire_request_slot`) retries
+  # instead of raising `PoolSaturatedError`.
   it "sends concurrent HEADERS on one connection in stream-ID order" do
     request_count = 8
     UNIXSocket.pair do |client_io, peer|
@@ -905,7 +917,8 @@ describe HTTP2::Client do
       connection = HTTP2::Connection.start(client_io)
       http = HTTP2::Client.new(
         "http://example.test",
-        connection: connection
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(stream_slot: 1.second)
       )
       begin
         responses = Channel(HTTP2::Response | Exception).new(request_count)

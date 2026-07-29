@@ -993,6 +993,11 @@ module HTTP2
     # holding it for the blocking wait too. `#send_headers` is the fused
     # submit+wait convenience most callers want.
     #
+    # Takes its own defensive copy of `fields` (see `#submit_owned_headers`)
+    # because encoding happens later, on the writer fiber — a caller that
+    # mutated its own `Enumerable` after this method returns must not be
+    # able to change what eventually gets encoded.
+    #
     # :nodoc:
     def submit_headers(
       stream_id : UInt32,
@@ -1000,11 +1005,7 @@ module HTTP2
       *,
       end_stream : Bool = false,
     ) : WriteCommand
-      ensure_registered_stream!(stream_id)
-      materialized = fields.map { |field| field }
-      command = WriteCommand.headers(stream_id, materialized, end_stream)
-      submit_nowait(command)
-      command
+      submit_owned_headers(stream_id, fields.map { |field| field }, end_stream)
     end
 
     # HPACK-encodes one ordered field section on the writer fiber and sends
@@ -1028,7 +1029,29 @@ module HTTP2
       materialized = fields.map do |name, value|
         HeaderField.new(name, value)
       end
-      send_headers(stream_id, materialized, end_stream: end_stream)
+      # `materialized` is already a fresh, privately-owned array (built by
+      # the `.map` above, not aliased to anything the caller can still
+      # reach) -- goes straight to `#submit_owned_headers` instead of back
+      # through `#submit_headers`, which would just copy it a second time.
+      submit_owned_headers(stream_id, materialized, end_stream).wait
+    end
+
+    # Shared tail end of both `#submit_headers` overloads' paths: builds
+    # and enqueues the `WriteCommand` for a field section the caller
+    # already owns exclusively (no further copying needed here). Both
+    # `#submit_headers` (which takes its own defensive copy first) and
+    # `#send_headers`'s `Tuple(String, String)` overload (whose `.map`
+    # already produced a fresh array) route through this one spot instead
+    # of each doing their own admission bookkeeping.
+    private def submit_owned_headers(
+      stream_id : UInt32,
+      fields : Array(HeaderField),
+      end_stream : Bool,
+    ) : WriteCommand
+      ensure_registered_stream!(stream_id)
+      command = WriteCommand.headers(stream_id, fields, end_stream)
+      submit_nowait(command)
+      command
     end
 
     # Sends a SETTINGS update and tracks its ordered acknowledgement.

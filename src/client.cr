@@ -618,6 +618,21 @@ module HTTP2
           # holding the lock across it (as this used to do) only adds
           # head-of-line blocking, where one congested HEADERS write
           # parked every other request racing for the same connection.
+          #
+          # This isn't the only backstop: `Connection`'s
+          # `plan_local_stream_open_unlocked` (see its `stream_id <=
+          # highest_local_id` check) re-verifies monotonicity again at
+          # write-staging time, on the writer fiber, immediately before a
+          # HEADERS command's frames are written into the transport
+          # buffer. If the argument above ever had a hole — or a future
+          # change reintroduced one — that staging-time check is what
+          # would actually catch a would-be out-of-order write: it fails
+          # *that one* `WriteCommand` with `InvalidStateError` (handled
+          # below, converting to a local retry) rather than letting
+          # mis-ordered bytes reach the peer. That downgrades any such
+          # bug from protocol-fatal (the peer sees stream IDs go backward
+          # and tears down the connection) to a single failed or retried
+          # local request.
           command = selected.entry.opening_mutex.synchronize do
             check_cancellation!(cancellation)
             stream = connection.materialize_request_stream(
@@ -629,7 +644,16 @@ module HTTP2
               current.id,
               request_method
             )
-            current.submit_headers(fields, end_stream: end_stream)
+            begin
+              current.submit_headers(fields, end_stream: end_stream)
+            rescue error : Connection::InvalidStateError
+              if error.class == Connection::InvalidStateError
+                abort_stream(current, error) unless current.terminal_error
+                stream = nil
+                raise RetryPoolSelection.new(error.message, error)
+              end
+              raise error
+            end
           end
           begin
             command.wait
