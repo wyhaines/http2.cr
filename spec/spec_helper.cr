@@ -8,6 +8,13 @@ class HTTP2::Connection
   end
 end
 
+class HTTP2::Stream
+  # :nodoc:
+  def test_only_events_closed? : Bool
+    @events.closed?
+  end
+end
+
 def wire_frame(
   type_code : UInt8,
   flags : UInt8,

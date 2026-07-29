@@ -331,8 +331,15 @@ module HTTP2
     ) : StreamEvent?
       if @body.completed?
         select
-        when event = @events.receive
-          return event
+        when event = @events.receive?
+          # `receive?` returns nil once `@events` is closed and drained
+          # (always true post-`#terminate`, since only `#terminate` closes
+          # it) — fall through to the same terminal handling as an empty,
+          # still-open mailbox rather than let a raw `receive` raise
+          # `Channel::ClosedError` past this select.
+          return event if event
+          return if @body.finished?
+          raise_terminal!
         else
           return if @body.finished?
           raise_terminal!
@@ -469,6 +476,11 @@ module HTTP2
         false
       end
     rescue Channel::ClosedError
+      # The live path for a frame racing `#terminate`: the mailbox closed
+      # between the `terminal_error` check above and this send (`#terminate`
+      # closes `@events` to release buffered events promptly). Not dead
+      # code — this is the intended outcome, matching `deliver`'s existing
+      # failure convention.
       false
     end
 
@@ -487,6 +499,15 @@ module HTTP2
 
       discarded = @body.terminate(error)
       @terminal_signal.close
+
+      # Release every buffered `StreamEvent` (each potentially holding a
+      # frame payload) promptly instead of letting them live in the
+      # mailbox until this `Stream` is collected. `receive?` returns nil
+      # once the channel is both closed and drained, ending the loop.
+      @events.close
+      while @events.receive?
+      end
+
       discarded
     end
 
@@ -500,8 +521,12 @@ module HTTP2
 
     private def receive_after_body_completion : StreamEvent?
       select
-      when event = @events.receive
-        event
+      when event = @events.receive?
+        # See the identically-shaped select in `#receive_until_remote_end`:
+        # a nil here means the closed-and-drained mailbox, not fresh data.
+        return event if event
+        return if @body.finished?
+        raise_terminal!
       else
         return if @body.finished?
         raise_terminal!
@@ -513,8 +538,12 @@ module HTTP2
       cancellation : Channel(Nil),
     ) : StreamEvent?
       select
-      when event = @events.receive
-        event
+      when event = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        event || raise_terminal!
       when @body.completion_signal.receive?
         receive_after_body_completion
       when @terminal_signal.receive?
@@ -532,8 +561,12 @@ module HTTP2
       duration : Time::Span,
     ) : StreamEvent?
       select
-      when event = @events.receive
-        event
+      when event = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        event || raise_terminal!
       when @body.completion_signal.receive?
         receive_after_body_completion
       when @terminal_signal.receive?
@@ -549,8 +582,12 @@ module HTTP2
       cancellation : Channel(Nil),
     ) : StreamEvent?
       select
-      when event = @events.receive
-        event
+      when event = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        event || raise_terminal!
       when @body.completion_signal.receive?
         receive_after_body_completion
       when @terminal_signal.receive?
@@ -562,8 +599,12 @@ module HTTP2
 
     private def receive_until_remote_end_without_deadline : StreamEvent?
       select
-      when event = @events.receive
-        event
+      when event = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        event || raise_terminal!
       when @body.completion_signal.receive?
         receive_after_body_completion
       when @terminal_signal.receive?
@@ -576,8 +617,12 @@ module HTTP2
       cancellation : Channel(Nil),
     ) : StreamEvent
       select
-      when frame = @events.receive
-        frame
+      when frame = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        frame || raise_terminal!
       when @terminal_signal.receive?
         raise_terminal!
       when cancellation.receive?
@@ -591,8 +636,12 @@ module HTTP2
 
     private def receive_with_timeout(duration : Time::Span) : StreamEvent
       select
-      when frame = @events.receive
-        frame
+      when frame = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        frame || raise_terminal!
       when @terminal_signal.receive?
         raise_terminal!
       when timeout(duration)
@@ -606,8 +655,12 @@ module HTTP2
       cancellation : Channel(Nil),
     ) : StreamEvent
       select
-      when frame = @events.receive
-        frame
+      when frame = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        frame || raise_terminal!
       when @terminal_signal.receive?
         raise_terminal!
       when cancellation.receive?
@@ -617,8 +670,12 @@ module HTTP2
 
     private def receive_without_deadline : StreamEvent
       select
-      when frame = @events.receive
-        frame
+      when frame = @events.receive?
+        # nil means the closed-and-drained mailbox (only `#terminate`
+        # closes `@events`), so raise the same terminal error the
+        # `@terminal_signal` branch below would raise, instead of letting
+        # a raw `receive` surface `Channel::ClosedError` here.
+        frame || raise_terminal!
       when @terminal_signal.receive?
         raise_terminal!
       end
