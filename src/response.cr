@@ -8,7 +8,11 @@ module HTTP2
 
   # Shared placeholder for responses that never received a 1xx
   # informational response, avoiding a per-response array allocation for
-  # that common case.
+  # that common case. Shared across all responses with no informational
+  # responses — MUST never be mutated; `Response#informational_responses`
+  # aliases this same array directly to every such response, so any
+  # caller that pushes/clears/sorts/etc. into the returned array would
+  # silently corrupt it process-wide for every other response sharing it.
   EMPTY_INFORMATIONAL = [] of InformationalResponse
 
   # A streaming HTTP response. Consume or close `body` before waiting for
@@ -16,6 +20,11 @@ module HTTP2
   class Response
     getter status : Int32
     getter headers : Headers
+
+    # The 1xx informational responses seen before the final status, in
+    # order. The returned array must be treated as read-only: when a
+    # response received none, this may be the shared `EMPTY_INFORMATIONAL`
+    # constant rather than a fresh allocation.
     getter informational_responses : Array(InformationalResponse)
     getter body : IO
     getter stream_id : UInt32

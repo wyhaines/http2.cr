@@ -2520,6 +2520,10 @@ module HTTP2
       @done = Atomic(Bool).new(false)
 
       def complete : Nil
+        # A bare `set` (no compare-and-swap) is safe only because every
+        # call site is structurally mutually exclusive for a given
+        # instance (see `Client#await_response`/`#spawn_upload`); adding
+        # a second concurrent writer requires revisiting this.
         @done.set(true)
       end
 
