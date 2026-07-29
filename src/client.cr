@@ -336,6 +336,12 @@ module HTTP2
         additional_never_indexed_fields.map(&.downcase).to_set
       uri = origin.is_a?(URI) ? origin : URI.parse(origin)
       @origin = parse_origin(uri, require_origin_only: true)
+      # `:authority` is fixed for the life of this client (every non-CONNECT
+      # request sends this exact value -- see `#request_target`), so it is
+      # validated here, once, instead of on every `#request` call. CONNECT
+      # is unaffected: its `:authority` is the caller's per-request target,
+      # not `@origin.authority`, and stays validated in `#prepare`.
+      validate_pseudo_value!(":authority", @origin.authority)
       @supplied_connection_value = connection
       @supplied_connection = !connection.nil?
       if connection && pool_configuration
@@ -430,11 +436,16 @@ module HTTP2
         raise RequestCanceledError.new("HTTP/2 request was canceled")
       end
 
+      # `prepare` validates and builds the wire fields exactly once per
+      # `#request` call -- nothing it computes varies across a replay or
+      # pre-request retry of the SAME `request` (see `#perform_request`,
+      # which refreshes only the body per attempt).
+      prepared = prepare(request)
       replay_attempts = 0
       pre_request_retries = 0
       loop do
         begin
-          return perform_request(request, cancellation)
+          return perform_request(request, prepared, cancellation)
         rescue error : Connection::DrainingError
           pre_request_retries += 1
           raise error if @supplied_connection || pre_request_retries > 1
@@ -461,14 +472,20 @@ module HTTP2
 
     private def perform_request(
       request : Request,
+      prepared : PreparedRequest,
       cancellation : Cancellation?,
     ) : Response
-      prepared = prepare(request)
+      # Only the body is attempt-dependent (a replay needs a fresh read of
+      # an owned String/Bytes body, from the start -- see
+      # `Request#body_for_attempt`); everything else `prepare` computed is
+      # reused verbatim via `copy_with`, which is a cheap struct copy, not
+      # a rebuild.
+      attempt = prepared.copy_with(body: request.body_for_attempt)
       check_cancellation!(cancellation)
-      has_content = !prepared.body.nil? || !prepared.trailers.empty?
+      has_content = !attempt.body.nil? || !attempt.trailers.empty?
       stream = open_request_stream(
         request.method,
-        prepared.fields,
+        attempt.fields,
         end_stream: !has_content,
         cancellation: cancellation
       )
@@ -476,10 +493,10 @@ module HTTP2
 
       begin
         if has_content
-          unless prepared.connect
+          unless attempt.connect
             spawn_upload(
               stream,
-              prepared,
+              attempt,
               upload,
               cancellation
             )
@@ -490,7 +507,7 @@ module HTTP2
 
         await_response(
           stream,
-          prepared,
+          attempt,
           upload,
           cancellation
         )
@@ -1594,16 +1611,22 @@ module HTTP2
 
     private def prepare(request : Request) : PreparedRequest
       validate_method!(request.method)
-      headers = request.headers.dup
-      validate_request_fields!(headers, trailer: false)
+      validate_request_fields!(request.headers, trailer: false)
       validate_request_fields!(request.trailers, trailer: true)
 
       path, authority = request_target(request.method, request.target)
-      validate_pseudo_value!(":authority", authority)
-      validate_pseudo_value!(":path", path) unless request.method == "CONNECT"
-      validate_host!(headers, authority)
-      content_length = HTTPSemantics.parse_request_content_length(headers)
       connect = request.method == "CONNECT"
+      if connect
+        # CONNECT's `:authority` is the caller's own per-request target
+        # (not the fixed `@origin.authority` every other method sends --
+        # see `#request_target`), so it cannot be validated once at
+        # construction and stays checked here, per request.
+        validate_pseudo_value!(":authority", authority)
+      else
+        validate_pseudo_value!(":path", path)
+      end
+      validate_host!(request.headers, authority)
+      content_length = HTTPSemantics.parse_request_content_length(request.headers)
       if connect
         unless request.trailers.empty?
           raise InvalidRequestError.new(
@@ -1617,6 +1640,7 @@ module HTTP2
         end
       end
 
+      synthesized_length : Int64? = nil
       if !connect && (known_length = request.body_length)
         if content_length
           unless content_length == known_length
@@ -1626,17 +1650,41 @@ module HTTP2
             )
           end
         elsif request.body
-          headers.add("content-length", known_length.to_s)
+          synthesized_length = known_length
           content_length = known_length
         end
       end
 
-      pseudo_fields = [HeaderField.new(":method", request.method)]
-      if request.method == "CONNECT"
-        pseudo_fields << HeaderField.new(":authority", authority)
+      PreparedRequest.new(
+        build_request_fields(request, connect, authority, path, synthesized_length),
+        request.trailers.to_header_fields(@additional_never_indexed_fields),
+        request.body_for_attempt,
+        request.body_length,
+        content_length,
+        connect
+      )
+    end
+
+    # One array, built once: pseudo-fields, then the caller's regular
+    # fields (mapped in place, no `Headers#dup`), then a synthesized
+    # content-length last -- replacing the old headers.dup +
+    # to_header_fields + concat, which copied the field list three times
+    # per request. Split out of `#prepare` to keep that method's
+    # cyclomatic complexity under the linter's threshold.
+    private def build_request_fields(
+      request : Request,
+      connect : Bool,
+      authority : String,
+      path : String,
+      synthesized_length : Int64?,
+    ) : Array(HeaderField)
+      fields = Array(HeaderField).new(5 + request.headers.size)
+      fields << HeaderField.new(":method", request.method)
+      if connect
+        fields << HeaderField.new(":authority", authority)
       else
-        pseudo_fields << HeaderField.new(":scheme", @origin.scheme)
-        pseudo_fields << HeaderField.new(":authority", authority)
+        fields << HeaderField.new(":scheme", @origin.scheme)
+        fields << HeaderField.new(":authority", authority)
         # Deliberately left at the default Indexing::None (Task 9 review).
         # Unlike :method/:scheme (a handful of static-table values, so
         # incremental indexing would be a no-op either way), :path is
@@ -1645,18 +1693,37 @@ module HTTP2
         # values into the connection's dynamic table -- and a query
         # string can carry secrets (tokens, API keys). Do not "optimize"
         # this without a deliberate, separately reviewed decision.
-        pseudo_fields << HeaderField.new(":path", path)
+        fields << HeaderField.new(":path", path)
       end
-      pseudo_fields.concat(headers.to_header_fields(@additional_never_indexed_fields))
+      request.headers.each do |field|
+        name = field.name
+        # `validate_request_fields!` (in `#prepare`) already rejected any
+        # uppercase byte in a field name, so this never actually triggers
+        # in practice -- it is a defensive normalization, not a
+        # load-bearing one, and stays cheap (no allocation) in the common
+        # case it guards.
+        name = name.downcase if ascii_upper?(name)
+        fields << HeaderField.new(name, field.value, indexing_for(name))
+      end
+      if synthesized_length
+        fields << HeaderField.new("content-length", synthesized_length.to_s)
+      end
+      fields
+    end
 
-      PreparedRequest.new(
-        pseudo_fields,
-        request.trailers.to_header_fields(@additional_never_indexed_fields),
-        request.body_for_attempt,
-        request.body_length,
-        content_length,
-        connect
-      )
+    # Slice#any? is a non-allocating loop; String#each_byte without a block
+    # would allocate an iterator.
+    private def ascii_upper?(name : String) : Bool
+      name.to_slice.any? { |b| 0x41_u8 <= b <= 0x5a_u8 }
+    end
+
+    # Delegates to `Headers.indexing_for` so the HPACK never-index
+    # confidentiality boundary (Task 9) has exactly one implementation,
+    # shared with `Headers#to_header_fields` (still used directly here for
+    # trailers, and by callers that build fields from a bare `Headers`
+    # without going through `Client`).
+    private def indexing_for(name : String) : HeaderField::Indexing
+      Headers.indexing_for(name, @additional_never_indexed_fields)
     end
 
     private def validate_method!(method : String) : Nil
@@ -1733,6 +1800,22 @@ module HTTP2
         end
         return {"*", @origin.authority}
       end
+      # Origin-form fast path: the overwhelming majority of requests. The
+      # only thing the general path below extracts from `URI.parse` for a
+      # target already known to start with `/` is the fragment rejection
+      # -- `uri.absolute?` is always false for it, and the eventual return
+      # value is the raw `target` string, not anything reconstructed from
+      # `uri` (see the fallback `{target, @origin.authority}` below, which
+      # this mirrors exactly). Skipping the parse avoids it entirely for
+      # this path.
+      if target.starts_with?('/')
+        if target.includes?('#')
+          raise InvalidRequestError.new(
+            "request targets cannot contain fragments"
+          )
+        end
+        return {target, @origin.authority}
+      end
 
       uri = URI.parse(target)
       if uri.fragment
@@ -1749,12 +1832,11 @@ module HTTP2
         end
         return {uri.request_target, @origin.authority}
       end
-      unless target.starts_with?('/')
-        raise InvalidRequestError.new(
-          "request target must be absolute-form or start with /"
-        )
-      end
-      {target, @origin.authority}
+      # A target starting with `/` already returned above, so reaching
+      # here means it is neither absolute-form nor origin-form.
+      raise InvalidRequestError.new(
+        "request target must be absolute-form or start with /"
+      )
     rescue error : URI::Error | ArgumentError
       raise InvalidRequestError.new("invalid request target: #{error.message}")
     end

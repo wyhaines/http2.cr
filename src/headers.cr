@@ -140,7 +140,15 @@ module HTTP2
     # method does not rely on, and must not come to rely on, anything
     # upstream already being lowercase. It is correct regardless of how
     # the field reached `@fields` (including a caller-supplied mixed-case
-    # name, via any construction path).
+    # name, via any construction path). The downcase itself is guarded by
+    # `#ascii_upper?` (a non-allocating byte scan): a name with no ASCII
+    # uppercase byte skips `String#downcase`'s allocation entirely, which
+    # is the common case for any caller that went through `Client`'s own
+    # request validation (it already rejects uppercase field names before
+    # this ever runs). The emitted field's *name* stays exactly as the
+    # caller supplied it either way — only the comparison below is
+    # normalized; see `spec/request_spec.cr` for why that split matters
+    # (Task 9 review, Finding 1).
     #
     # *extra_never_indexed*, by contrast, is trusted pre-downcased: the
     # caller (in practice, `Client#initialize` — see
@@ -154,14 +162,38 @@ module HTTP2
       extra_never_indexed : Set(String) = Set(String).new,
     ) : Array(HeaderField)
       @fields.map do |field|
-        name = field.name.downcase
-        indexing = if SENSITIVE_FIELD_NAMES.includes?(name) || extra_never_indexed.includes?(name)
-                     HeaderField::Indexing::Never
-                   else
-                     HeaderField::Indexing::Incremental
-                   end
-        HeaderField.new(field.name, field.value, indexing: indexing)
+        name = field.name
+        name = name.downcase if ascii_upper?(name)
+        HeaderField.new(
+          field.name,
+          field.value,
+          indexing: self.class.indexing_for(name, extra_never_indexed)
+        )
       end
+    end
+
+    # :nodoc:
+    #
+    # The HPACK indexing decision for one already-lowercase field *name*,
+    # shared by `#to_header_fields` and `Client`'s single-pass request
+    # field builder (Task 18) so the confidentiality boundary documented
+    # above has exactly one implementation instead of two that could
+    # silently drift apart.
+    def self.indexing_for(
+      name : String,
+      extra_never_indexed : Set(String) = Set(String).new,
+    ) : HeaderField::Indexing
+      if SENSITIVE_FIELD_NAMES.includes?(name) || extra_never_indexed.includes?(name)
+        HeaderField::Indexing::Never
+      else
+        HeaderField::Indexing::Incremental
+      end
+    end
+
+    # Slice#any? is a non-allocating loop; String#each_byte without a block
+    # would allocate an iterator.
+    private def ascii_upper?(name : String) : Bool
+      name.to_slice.any? { |b| 0x41_u8 <= b <= 0x5a_u8 }
     end
 
     # :nodoc:
