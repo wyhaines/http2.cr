@@ -15,6 +15,21 @@ module HTTP2
   # silently corrupt it process-wide for every other response sharing it.
   EMPTY_INFORMATIONAL = [] of InformationalResponse
 
+  # A channel that never becomes ready: `receive?` on an open, empty,
+  # never-sent channel blocks forever, so substituting it for an absent
+  # optional signal (a dial attempt, a cancellation, a caller-supplied
+  # wait) lets one `select` shape serve every combination of present and
+  # absent optional waits, instead of hand-enumerating each combination
+  # as its own `select` (see `Client#wait_for_pool` and
+  # `ResponseMetadata#wait_for_completion`).
+  #
+  # Shared by every such wait, so it must never be sent to or closed:
+  # a send would wake every parked waiter across the process spuriously,
+  # and a close would make every `receive?` on it resolve immediately
+  # (nil), turning it from "never ready" into "always ready" and
+  # defeating the substitution above.
+  NEVER_READY = Channel(Nil).new
+
   # A streaming HTTP response. Consume or close `body` before waiting for
   # trailers so flow control can continue.
   class Response
@@ -251,28 +266,22 @@ module HTTP2
       duration : Time::Span?,
       cancellation : Channel(Nil)?,
     ) : Nil
-      if duration && cancellation
+      cancel = cancellation || NEVER_READY
+
+      if duration
         select
         when @signal.receive?
-        when cancellation.receive?
+        when cancel.receive?
           raise WaitCanceledError.new
         when timeout(duration)
           raise WaitTimeoutError.new
-        end
-      elsif duration
-        select
-        when @signal.receive?
-        when timeout(duration)
-          raise WaitTimeoutError.new
-        end
-      elsif cancellation
-        select
-        when @signal.receive?
-        when cancellation.receive?
-          raise WaitCanceledError.new
         end
       else
-        @signal.receive?
+        select
+        when @signal.receive?
+        when cancel.receive?
+          raise WaitCanceledError.new
+        end
       end
     end
   end

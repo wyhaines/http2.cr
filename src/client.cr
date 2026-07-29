@@ -1210,8 +1210,17 @@ module HTTP2
       @mutex.synchronize { @pool_parked -= 1 }
     end
 
-    # The explicit select matrix avoids helper fibers and covers every valid
-    # combination of dial, deadline, and cancellation signals.
+    # `signal` is always live; `attempt` and `cancellation` are each
+    # optional. Substituting the shared `NEVER_READY` sentinel (see
+    # `response.cr`) for either one when absent means a single `select`
+    # shape — with or without a deadline — covers every combination,
+    # instead of hand-enumerating all eight. `NEVER_READY` is never sent
+    # to or closed, so a substituted arm can never win a `select`: the
+    # only way it resolves is via `signal`, `attempt.signal`, or
+    # `cancel`'s own close/send, exactly as before. Arm order is
+    # unaffected too — `select` only picks among arms that are actually
+    # ready, so an arm that can never become ready never changes which
+    # of the remaining, genuinely-live arms is chosen.
     # ameba:disable Metrics/CyclomaticComplexity
     private def wait_for_pool(
       signal : Channel(Nil),
@@ -1222,76 +1231,30 @@ module HTTP2
       remaining = deadline.try { |value| value - Time.instant }
       return PoolWaitResult::TimedOut if remaining &&
                                          remaining <= Time::Span.zero
-      canceled = cancellation.try(&.signal)
 
-      if attempt
-        if canceled
-          if remaining
-            select
-            when signal.receive?
-              PoolWaitResult::PoolChanged
-            when attempt.signal.receive?
-              PoolWaitResult::DialCompleted
-            when canceled.receive?
-              PoolWaitResult::Canceled
-            when timeout(remaining)
-              PoolWaitResult::TimedOut
-            end
-          else
-            select
-            when signal.receive?
-              PoolWaitResult::PoolChanged
-            when attempt.signal.receive?
-              PoolWaitResult::DialCompleted
-            when canceled.receive?
-              PoolWaitResult::Canceled
-            end
-          end
-        elsif remaining
-          select
-          when signal.receive?
-            PoolWaitResult::PoolChanged
-          when attempt.signal.receive?
-            PoolWaitResult::DialCompleted
-          when timeout(remaining)
-            PoolWaitResult::TimedOut
-          end
-        else
-          select
-          when signal.receive?
-            PoolWaitResult::PoolChanged
-          when attempt.signal.receive?
-            PoolWaitResult::DialCompleted
-          end
-        end
-      elsif canceled
-        if remaining
-          select
-          when signal.receive?
-            PoolWaitResult::PoolChanged
-          when canceled.receive?
-            PoolWaitResult::Canceled
-          when timeout(remaining)
-            PoolWaitResult::TimedOut
-          end
-        else
-          select
-          when signal.receive?
-            PoolWaitResult::PoolChanged
-          when canceled.receive?
-            PoolWaitResult::Canceled
-          end
-        end
-      elsif remaining
+      dial_signal = attempt.try(&.signal) || NEVER_READY
+      cancel = cancellation.try(&.signal) || NEVER_READY
+
+      if remaining
         select
         when signal.receive?
           PoolWaitResult::PoolChanged
+        when dial_signal.receive?
+          PoolWaitResult::DialCompleted
+        when cancel.receive?
+          PoolWaitResult::Canceled
         when timeout(remaining)
           PoolWaitResult::TimedOut
         end
       else
-        signal.receive?
-        PoolWaitResult::PoolChanged
+        select
+        when signal.receive?
+          PoolWaitResult::PoolChanged
+        when dial_signal.receive?
+          PoolWaitResult::DialCompleted
+        when cancel.receive?
+          PoolWaitResult::Canceled
+        end
       end
     end
 

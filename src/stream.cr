@@ -378,19 +378,7 @@ module HTTP2
       cancellation : Channel(Nil)? = nil,
       timeout : Time::Span? = nil,
     ) : StreamEvent?
-      if @body.completed?
-        select
-        when event = @events.receive?
-          # See `#raise_terminal!` for why nil falls through below
-          # instead of raising past this select.
-          return event if event
-          return if @body.finished?
-          raise_terminal!
-        else
-          return if @body.finished?
-          raise_terminal!
-        end
-      end
+      return receive_after_body_completion if @body.completed?
 
       if timeout && cancellation
         receive_until_remote_end_with_timeout_and_cancellation(
@@ -601,129 +589,68 @@ module HTTP2
       end
     end
 
-    private def receive_until_remote_end_with_timeout_and_cancellation(
-      duration : Time::Span,
-      cancellation : Channel(Nil),
-    ) : StreamEvent?
-      select
-      when event = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        event || raise_terminal!
-      when @body.completion_signal.receive?
-        receive_after_body_completion
-      when @terminal_signal.receive?
-        raise_terminal!
-      when cancellation.receive?
-        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
-      when timeout(duration)
-        raise Connection::TimeoutError.new(
-          "waiting for stream #{id} response metadata timed out"
-        )
+    # The `{% for %}` block below generates the four timeout×cancellation
+    # variants (all four, one, the other, or neither optional wait) that
+    # `#receive` and `#receive_until_remote_end` dispatch to above, for
+    # both method families in one pass. Crystal's `select` is resolved at
+    # compile time, so each combination must exist as its own method with
+    # its own fixed set of `when` arms — the macro writes the eight bodies
+    # instead of hand-maintaining them, but the generated arms are exactly
+    # the ones that used to be typed out here.
+    {% for combo in [
+                      {name: "with_timeout_and_cancellation", timeout: true, cancellation: true},
+                      {name: "with_timeout", timeout: true, cancellation: false},
+                      {name: "with_cancellation", timeout: false, cancellation: true},
+                      {name: "without_deadline", timeout: false, cancellation: false},
+                    ] %}
+      private def receive_until_remote_end_{{ combo[:name].id }}(
+        {% if combo[:timeout] %}duration : Time::Span,{% end %}
+        {% if combo[:cancellation] %}cancellation : Channel(Nil),{% end %}
+      ) : StreamEvent?
+        select
+        when event = @events.receive?
+          # See `#raise_terminal!` for why nil routes here.
+          event || raise_terminal!
+        when @body.completion_signal.receive?
+          receive_after_body_completion
+        when @terminal_signal.receive?
+          raise_terminal!
+        {% if combo[:cancellation] %}
+        when cancellation.receive?
+          raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+        {% end %}
+        {% if combo[:timeout] %}
+        when timeout(duration)
+          raise Connection::TimeoutError.new(
+            "waiting for stream #{id} response metadata timed out"
+          )
+        {% end %}
+        end
       end
-    end
 
-    private def receive_until_remote_end_with_timeout(
-      duration : Time::Span,
-    ) : StreamEvent?
-      select
-      when event = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        event || raise_terminal!
-      when @body.completion_signal.receive?
-        receive_after_body_completion
-      when @terminal_signal.receive?
-        raise_terminal!
-      when timeout(duration)
-        raise Connection::TimeoutError.new(
-          "waiting for stream #{id} response metadata timed out"
-        )
+      private def receive_{{ combo[:name].id }}(
+        {% if combo[:timeout] %}duration : Time::Span,{% end %}
+        {% if combo[:cancellation] %}cancellation : Channel(Nil),{% end %}
+      ) : StreamEvent
+        select
+        when frame = @events.receive?
+          # See `#raise_terminal!` for why nil routes here.
+          frame || raise_terminal!
+        when @terminal_signal.receive?
+          raise_terminal!
+        {% if combo[:cancellation] %}
+        when cancellation.receive?
+          raise WaitCanceledError.new("waiting for stream #{id} was canceled")
+        {% end %}
+        {% if combo[:timeout] %}
+        when timeout(duration)
+          raise Connection::TimeoutError.new(
+            "waiting for stream #{id} timed out"
+          )
+        {% end %}
+        end
       end
-    end
-
-    private def receive_until_remote_end_with_cancellation(
-      cancellation : Channel(Nil),
-    ) : StreamEvent?
-      select
-      when event = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        event || raise_terminal!
-      when @body.completion_signal.receive?
-        receive_after_body_completion
-      when @terminal_signal.receive?
-        raise_terminal!
-      when cancellation.receive?
-        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
-      end
-    end
-
-    private def receive_until_remote_end_without_deadline : StreamEvent?
-      select
-      when event = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        event || raise_terminal!
-      when @body.completion_signal.receive?
-        receive_after_body_completion
-      when @terminal_signal.receive?
-        raise_terminal!
-      end
-    end
-
-    private def receive_with_timeout_and_cancellation(
-      duration : Time::Span,
-      cancellation : Channel(Nil),
-    ) : StreamEvent
-      select
-      when frame = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        frame || raise_terminal!
-      when @terminal_signal.receive?
-        raise_terminal!
-      when cancellation.receive?
-        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
-      when timeout(duration)
-        raise Connection::TimeoutError.new(
-          "waiting for stream #{id} timed out"
-        )
-      end
-    end
-
-    private def receive_with_timeout(duration : Time::Span) : StreamEvent
-      select
-      when frame = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        frame || raise_terminal!
-      when @terminal_signal.receive?
-        raise_terminal!
-      when timeout(duration)
-        raise Connection::TimeoutError.new(
-          "waiting for stream #{id} timed out"
-        )
-      end
-    end
-
-    private def receive_with_cancellation(
-      cancellation : Channel(Nil),
-    ) : StreamEvent
-      select
-      when frame = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        frame || raise_terminal!
-      when @terminal_signal.receive?
-        raise_terminal!
-      when cancellation.receive?
-        raise WaitCanceledError.new("waiting for stream #{id} was canceled")
-      end
-    end
-
-    private def receive_without_deadline : StreamEvent
-      select
-      when frame = @events.receive?
-        # See `#raise_terminal!` for why nil routes here.
-        frame || raise_terminal!
-      when @terminal_signal.receive?
-        raise_terminal!
-      end
-    end
+    {% end %}
 
     # :nodoc:
     class WaitCanceledError < Exception
