@@ -58,6 +58,31 @@ module HTTP2
     getter id : UInt32
     getter body : StreamBody
 
+    # `@state`, `@send_window`, and `@receive_window` are `Atomic`, not
+    # mutex-guarded: every mutator (`#transition_to`, `#adjust_send_window`,
+    # `#adjust_receive_window`, `#send_window=`, `#receive_window=`) is
+    # called only from `Connection`, and every one of those call sites runs
+    # inside `Connection#@mutex.synchronize` — which already serializes the
+    # compound read-then-write sequences (read old state/window, decide,
+    # write new state/window) these methods take part in. The atomics let a
+    # single read or write skip a lock of its own; they do not replace that
+    # connection-level serialization, so a new mutator must be added only
+    # under the connection lock too.
+    #
+    # Call-site categories, all under `Connection#@mutex`:
+    #   - inbound frame dispatch (`accept_inbound_data`,
+    #     `transition_and_deliver`, `handle_inbound_reset`, `handle_goaway`)
+    #   - outbound DATA planning (`plan_scheduled_data_frame`,
+    #     `prepare_outbound` and its `*_unlocked` helpers)
+    #   - WINDOW_UPDATE / SETTINGS window handling (`handle_window_update`,
+    #     `apply_peer_initial_window_size_unlocked`,
+    #     `apply_local_initial_window_size_unlocked`)
+    #
+    # The one exception: `#terminate` can run *without* the connection lock
+    # held (`Connection#handle_inbound_reset` calls `stream.terminate` after
+    # its own `@mutex.synchronize` block has already returned), so its
+    # `@terminal_error` check-and-set — and the `@state` write folded into
+    # it — stays under this `Stream`'s own `@mutex` instead.
     @events : Channel(StreamEvent)
     @state : Atomic(State) = Atomic.new(State::Idle)
     @send_window : Atomic(Int64)
@@ -446,13 +471,9 @@ module HTTP2
 
     # :nodoc:
     #
-    # Not internally synchronized: every caller mutates a stream's state or
-    # windows only while holding the connection's own `@mutex` (see the
-    # invariant audit in `Stream`'s class comment / task-15 report), which
-    # already serializes the read-then-write sequences these four methods
-    # participate in. The one exception, `#terminate`, keeps its own
-    # `@mutex` around the compound `@terminal_error` check-and-set and folds
-    # this `@state` write into that same critical section.
+    # Not internally synchronized — see the comment above the `@state`/
+    # `@send_window`/`@receive_window` declarations for the invariant this
+    # relies on and its one exception.
     def transition_to(next_state : State) : Nil
       @state.set(next_state)
     end
