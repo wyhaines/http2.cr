@@ -119,6 +119,28 @@ paired micro-verification during review, not an end-to-end benchmark.
   now has its own opening lock, so a blocked connection does not delay request
   opening on another connection.
 
+### Removed
+
+These seven public symbols were dropped as dead frame-layer API (zero call
+sites outside their own definitions) in the commit that shipped in
+`1.0.0-rc.1`; they were never called out individually at the time, so
+they're recorded here.
+
+- `Frame.from_io` — unused alias for `Frame.read`; call `Frame.read` instead.
+- `Frame#stream` — unused alias for `Frame#stream_id`; use `#stream_id`.
+- `Settings#parameters` (instance method) — this was itself a documented
+  migration alias for `#entries`, kept temporarily "while callers migrate
+  from the old hash API"; use `#entries` instead.
+- `Settings#ack` (instance method) — unused; `Settings.ack` (class method)
+  and `Ping#ack` are unaffected and remain available.
+- `Frame::Data.new(flags, stream_id, payload : IO)` — unused in `src/`;
+  read the `IO` and pass the resulting `Bytes` to the existing
+  `Frame::Data.new(flags, stream_id, payload : Bytes)` constructor instead.
+- `Stream::Event#inbound?` — unused; no direct replacement, check the
+  specific event kind instead.
+- `Frame#to_slice` did not get removed but became `:nodoc:` in the same
+  commit; it remains callable, just undocumented.
+
 ## 1.0.0-rc.1 — 2026-07-26
 
 This release candidate replaces the original frame-codec spike with an
