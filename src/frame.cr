@@ -16,26 +16,39 @@ module HTTP2
     end
 
     macro inherited
-      def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes)
-        @type_code = TypeCode
-        @flags &= AllowedFlags
-        finish_initialize
-      end
+      # Deferred to `finished` (rather than checked here directly): the
+      # `inherited` hook fires as soon as `< Frame` is parsed, before this
+      # subtype's own body (including its `TypeCode` constant) exists, so
+      # `@type.has_constant?` would always see "not yet defined" here. A
+      # nested `finished` hook runs after the whole subtype body is parsed,
+      # when the check is actually meaningful. `Frame::Unknown` has no
+      # `TypeCode`/`AllowedFlags` (its type code is a runtime value read off
+      # the wire, not a per-type constant), so it skips this block entirely
+      # and provides its own `initialize`.
+      macro finished
+        \{% if @type.has_constant?("TypeCode") %}
+        def initialize(@flags : UInt8, @stream_id : UInt32, @payload : Bytes)
+          @type_code = TypeCode
+          @flags &= AllowedFlags
+          finish_initialize
+        end
 
-      def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes)
-        initialize(flags.to_u8, @stream_id, @payload)
-      end
+        def initialize(flags : Flags, @stream_id : UInt32, @payload : Bytes)
+          initialize(flags.to_u8, @stream_id, @payload)
+        end
 
-      def initialize(flags : Flags, @stream_id : UInt32, payload : String)
-        initialize(flags.to_u8, @stream_id, payload.to_slice.dup)
-      end
+        def initialize(flags : Flags, @stream_id : UInt32, payload : String)
+          initialize(flags.to_u8, @stream_id, payload.to_slice.dup)
+        end
 
-      def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
-        initialize(@flags, @stream_id, payload.to_slice.dup)
-      end
+        def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
+          initialize(@flags, @stream_id, payload.to_slice.dup)
+        end
 
-      def flags
-        Flags.new(@flags)
+        def flags
+          Flags.new(@flags)
+        end
+        \{% end %}
       end
     end
 
@@ -184,12 +197,13 @@ module HTTP2
   end
 
   # An extension frame unknown to this implementation. The connection layer
-  # must ignore it while still consuming its complete payload.
-  struct Frame::Unknown
-    getter type_code : UInt8
+  # must ignore it while still consuming its complete payload. It has no
+  # `TypeCode`/`AllowedFlags` constants — its type code is a runtime value
+  # read off the wire — so `macro inherited` above contributes nothing and
+  # every other behavior (`data`, `header`, `write`, `to_slice`,
+  # `finish_initialize`'s validations) comes straight from `Frame`.
+  struct Frame::Unknown < Frame
     getter flags : UInt8
-    getter stream_id : UInt32
-    getter payload : Bytes
 
     def initialize(
       @type_code : UInt8,
@@ -197,38 +211,7 @@ module HTTP2
       @stream_id : UInt32,
       @payload : Bytes = Bytes.empty,
     )
-      if stream_id > FrameHeader::MAX_STREAM_ID
-        raise ArgumentError.new("stream ID must be a 31-bit unsigned integer")
-      end
-
-      if payload.size > FrameHeader::MAX_PAYLOAD
-        raise ArgumentError.new(
-          "frame payload length #{payload.size} exceeds #{FrameHeader::MAX_PAYLOAD}"
-        )
-      end
-    end
-
-    def stream
-      stream_id
-    end
-
-    def data
-      payload
-    end
-
-    def header
-      FrameHeader.new(payload.size.to_i32, type_code, flags, stream_id)
-    end
-
-    def write(io : IO) : Nil
-      header.write(io)
-      io.write(payload)
-    end
-
-    def to_slice : Bytes
-      io = IO::Memory.new(FrameHeader::SIZE + payload.size)
-      write(io)
-      io.to_slice
+      finish_initialize
     end
   end
 end
