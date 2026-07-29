@@ -39,7 +39,15 @@ module HTTP2
       end
     end
 
-    getter entries : Array(Setting) = [] of Setting
+    # Lazily parsed and cached on first access rather than eagerly in
+    # `validate!`: most SETTINGS frames built from a payload are only
+    # inspected for a handful of identifiers (or not at all, e.g. an ACK),
+    # so an unconditional `Array(Setting)` allocation on every construction
+    # -- immediately discarded for ACKs and never read by callers that only
+    # check `ack?` -- would be wasted work. `validate!` still eagerly
+    # checks payload shape (divisible by 6 octets); only the per-entry
+    # decode is deferred.
+    @entries : Array(Setting)?
 
     def initialize(entries : Enumerable(Setting), flags : Flags = Flags::None)
       materialized = entries.to_a
@@ -82,15 +90,22 @@ module HTTP2
       unless payload.size.divisible_by?(6)
         frame_size_error!("SETTINGS frame payload must be a multiple of 6 octets")
       end
+    end
 
-      @entries = Array(Setting).new(payload.size // 6)
+    def entries : Array(Setting)
+      @entries ||= parse_entries
+    end
+
+    private def parse_entries : Array(Setting)
+      parsed = Array(Setting).new(payload.size // 6)
       offset = 0
       while offset < payload.size
         identifier = IO::ByteFormat::BigEndian.decode(UInt16, payload[offset, 2])
         value = IO::ByteFormat::BigEndian.decode(UInt32, payload[offset + 2, 4])
-        @entries << Setting.new(identifier, value)
+        parsed << Setting.new(identifier, value)
         offset += 6
       end
+      parsed
     end
   end
 end
