@@ -16,13 +16,20 @@ module HTTP2
     @chunk_offset = 0
     @buffered_bytes = 0
     @consumed_bytes = 0_i64
-    @finished = false
-    @closed = false
+    @finished = Atomic(Bool).new(false)
+    @closed = Atomic(Bool).new(false)
     @terminal_error : Exception?
     @mutex = Mutex.new
     @read_mutex = Mutex.new
     @wakeup = Channel(Nil).new(1)
     @completion_signal = Channel(Nil).new
+
+    # Set (under `@mutex`) by the reader's read-check the moment it finds
+    # nothing to do and is about to park on `@wakeup`; cleared (under
+    # `@mutex`) once it stops parking. `#notify` skips the channel op
+    # entirely unless this is `true`, so producers that run while no
+    # reader is parked pay only a mutex check instead of a channel send.
+    @waiting = false
 
     getter capacity : Int32
 
@@ -53,22 +60,27 @@ module HTTP2
       @read_mutex.synchronize do
         loop do
           count, error, wait = @mutex.synchronize do
-            if chunk = @chunks.first?
+            filled = 0
+            while filled < slice.size && (chunk = @chunks.first?)
               available = chunk.size - @chunk_offset
-              count = Math.min(slice.size, available)
-              slice[0, count].copy_from(chunk[@chunk_offset, count])
-              @chunk_offset += count
-              @buffered_bytes -= count
-              @consumed_bytes += count
+              n = Math.min(slice.size - filled, available)
+              (slice + filled).copy_from(chunk.to_unsafe + @chunk_offset, n)
+              @chunk_offset += n
+              filled += n
+              @buffered_bytes -= n
+              @consumed_bytes += n
 
               if @chunk_offset == chunk.size
                 @chunks.shift
                 @chunk_offset = 0
               end
-              {count, nil, false}
+            end
+
+            if filled > 0
+              {filled, nil, false}
             elsif error = @terminal_error
               {0, error, false}
-            elsif @closed
+            elsif @closed.get
               # A caller-initiated `#close` is distinct from reaching a
               # natural end of stream (`@finished`, still a plain 0-byte
               # EOF below): once closed, any further read must not be
@@ -78,9 +90,16 @@ module HTTP2
               # existing terminal error always takes precedence over this
               # generic closed signal.
               {0, IO::Error.new("Closed stream"), false}
-            elsif @finished
+            elsif @finished.get
               {0, nil, false}
             else
+              # `@waiting` is armed in this same critical section, not in
+              # `#wait_for_data`, so it and the "nothing to read" verdict
+              # it records are atomic with respect to `#enqueue` (and
+              # `#close`/`#finish`/`#terminate`), which all mutate state
+              # under this same `@mutex`. See `#notify` for why that
+              # matters.
+              @waiting = true
               {0, nil, true}
             end
           end
@@ -103,12 +122,12 @@ module HTTP2
 
     def close : Nil
       discarded, cancel = @mutex.synchronize do
-        if @closed
+        if @closed.get
           {0, false}
         else
-          @closed = true
+          @closed.set(true)
           discarded = discard_unlocked
-          {discarded, !@finished && @terminal_error.nil?}
+          {discarded, !@finished.get && @terminal_error.nil?}
         end
       end
 
@@ -118,16 +137,28 @@ module HTTP2
       @on_cancel.call if cancel
     end
 
+    # Lock-free: `@closed` is an `Atomic(Bool)`, and every write site
+    # (`#close`) publishes through the same atomic, so a plain `#get` here
+    # never tears — it can only be a snapshot that is momentarily stale
+    # under concurrent mutation, exactly as a mutex-guarded read would
+    # also have been the instant after releasing the lock.
     def closed? : Bool
-      @mutex.synchronize { @closed }
+      @closed.get
     end
 
+    # Lock-free; see `#closed?`.
     def finished? : Bool
-      @mutex.synchronize { @finished }
+      @finished.get
     end
 
+    # Lock-free; see `#closed?`. `@terminal_error` is only ever assigned
+    # once (under `@mutex`, in `#terminate`) and never cleared, so reading
+    # the reference here without the mutex is safe: reference reads/writes
+    # are atomic (no torn pointer), and the only possible staleness is
+    # "not yet visible," the same benign race a mutex-guarded read would
+    # have had the instant after releasing the lock.
     def completed? : Bool
-      @mutex.synchronize { @finished || @closed || !@terminal_error.nil? }
+      @finished.get || @closed.get || !@terminal_error.nil?
     end
 
     # :nodoc:
@@ -158,7 +189,7 @@ module HTTP2
       return true if data.empty?
 
       accepted = @mutex.synchronize do
-        next false if @closed || @finished || @terminal_error
+        next false if @closed.get || @finished.get || @terminal_error
         next false if data.size > @capacity - @buffered_bytes
 
         @chunks << data
@@ -172,10 +203,10 @@ module HTTP2
     # :nodoc:
     def finish : Nil
       changed = @mutex.synchronize do
-        if @finished || @terminal_error
+        if @finished.get || @terminal_error
           false
         else
-          @finished = true
+          @finished.set(true)
           true
         end
       end
@@ -194,7 +225,7 @@ module HTTP2
     # :nodoc:
     def terminate(error : Exception) : Int32
       discarded, changed = @mutex.synchronize do
-        if @terminal_error || @closed || @finished
+        if @terminal_error || @closed.get || @finished.get
           {0, false}
         else
           @terminal_error = error
@@ -216,7 +247,19 @@ module HTTP2
       discarded
     end
 
+    # Skips the channel op entirely unless a reader is actually parked.
+    # `@waiting` is armed in `#read_with_timeout`'s own `@mutex` critical
+    # section (the same one that decides there is nothing to read), not
+    # here or in `#wait_for_data` — see that method for why the ordering
+    # this buys is what keeps a concurrent `#enqueue` (or `#close`/
+    # `#finish`/`#terminate`) from ever dropping a wakeup the reader
+    # needed. Called with `@mutex` released (matching every existing call
+    # site: `#enqueue`, `#close`, `#finish`, `#terminate` all call this
+    # after their own mutex-guarded mutation returns), so it takes the
+    # mutex itself just to read the flag.
     private def notify : Nil
+      return unless @mutex.synchronize { @waiting }
+
       select
       when @wakeup.send(nil)
       else
@@ -231,6 +274,12 @@ module HTTP2
       # Completion is idempotent across finish, reset, and close races.
     end
 
+    # Parks until `#notify` wakes it (or a timeout/cancellation fires).
+    # `@waiting` is already `true` by the time this runs — the caller's
+    # `@mutex` critical section sets it as part of the same verdict that
+    # decided to call this method — so this only ever needs to clear it
+    # again, which it does unconditionally on the way out (normal wakeup,
+    # timeout, or cancellation alike) via `ensure`.
     private def wait_for_data(
       duration : Time::Span?,
       cancellation : Channel(Nil)?,
@@ -258,6 +307,8 @@ module HTTP2
       else
         @wakeup.receive?
       end
+    ensure
+      @mutex.synchronize { @waiting = false }
     end
   end
 end

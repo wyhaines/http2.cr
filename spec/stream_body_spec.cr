@@ -133,4 +133,19 @@ describe HTTP2::StreamBody do
     body.read(buffer).should eq(5)
     body.read(buffer).should eq(0)
   end
+
+  it "drains multiple buffered chunks in a single read" do
+    consumed = 0
+    body = HTTP2::StreamBody.new(
+      8,
+      ->(amount : Int32) { consumed += amount; nil },
+      -> { }
+    )
+    body.enqueue("aaaa".to_slice).should be_true
+    body.enqueue("bbbb".to_slice).should be_true
+    buffer = Bytes.new(8)
+    body.read(buffer).should eq(8)
+    String.new(buffer).should eq("aaaabbbb")
+    consumed.should eq(8)
+  end
 end
