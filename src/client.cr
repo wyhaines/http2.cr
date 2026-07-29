@@ -1378,6 +1378,24 @@ module HTTP2
         # acquisition's own ensure block, or the idle-maintenance timer —
         # still advances the generation whenever anyone, deadline or not,
         # is asleep on it right now, so this change cannot strand one.
+        #
+        # Known narrow gap, not fixed here (ledgered alongside the
+        # `PoolSaturatedError` TOCTOU in `#acquire_request_slot` — one fix
+        # likely covers both): an acquirer that just failed to reserve a
+        # slot (`#reserve_from_pool_entries`/`#reserve_from_current_pool`
+        # returning `nil`) hasn't incremented `@pool_parked` yet — that
+        # happens inside `#wait_for_pool_parked`, right before it actually
+        # parks. If this loop wakes and runs its reconcile/gate check in
+        # that window — reconciling to `changed == false` and reading
+        # `@pool_parked == 0` because this particular acquirer isn't
+        # counted in it yet — the event that woke it is spent with no
+        # generation advance to show for it. The acquirer still isn't
+        # stuck: it's bounded by its own deadline (if any), a dial-attempt
+        # signal, or simply the next event to reach this loop (by which
+        # point it *is* parked and counted). This window can only degrade
+        # a wakeup into spurious saturation — waiting longer than
+        # strictly necessary, possibly past a configured deadline — never
+        # an unbounded hang.
         changed = reconcile_pool
         @mutex.synchronize do
           advance_pool_generation_unlocked if !@closed &&
