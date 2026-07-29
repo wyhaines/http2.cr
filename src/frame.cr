@@ -7,6 +7,12 @@ module HTTP2
   abstract struct Frame
     getter type_code : UInt8 = 0_u8
     getter stream_id : UInt32 = 0_u32
+    # `payload` is borrowed, not owned: constructing a frame from a `String`
+    # takes `String#to_slice` as-is (a view over the string's own immutable
+    # backing storage -- Crystal strings are never mutated in place, so no
+    # defensive copy is needed), and constructing one from `Bytes` has never
+    # copied either. Callers that hand a frame a mutable buffer must not
+    # mutate it afterward.
     getter payload : Bytes = Bytes.empty
     @flags : UInt8 = 0_u8
 
@@ -38,11 +44,11 @@ module HTTP2
         end
 
         def initialize(flags : Flags, @stream_id : UInt32, payload : String)
-          initialize(flags.to_u8, @stream_id, payload.to_slice.dup)
+          initialize(flags.to_u8, @stream_id, payload.to_slice)
         end
 
         def initialize(@flags : UInt8, @stream_id : UInt32, payload : String)
-          initialize(@flags, @stream_id, payload.to_slice.dup)
+          initialize(@flags, @stream_id, payload.to_slice)
         end
 
         def flags

@@ -32,7 +32,10 @@ module HTTP2
       error_code : UInt32,
       debug_data : String,
     )
-      initialize(last_stream_id, error_code, debug_data.to_slice.dup)
+      # `String#to_slice` is a view over the string's own immutable backing
+      # storage -- no defensive copy is needed here, the same as the
+      # `String` overloads in `Frame`'s generated initializers.
+      initialize(last_stream_id, error_code, debug_data.to_slice)
     end
 
     def last_stream_id
