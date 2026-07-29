@@ -78,9 +78,18 @@ module HTTP2
     @transport_closer_started = false
     @settings_timer_started = false
     @drain_started = false
-    @keepalive_started = false
+    @keepalive_started = Atomic(Bool).new(false)
     @drain_deadline : Time::Instant?
-    @last_inbound_activity = Time.instant
+    # Monotonic nanoseconds (`Time.monotonic.total_nanoseconds.to_i64`), not
+    # `Time.instant` -- read lock-free from the per-frame path
+    # (`observe_inbound_frame`) with no mutex, unlike the rest of this
+    # connection's timing state. `Time.instant` and `Time.monotonic` share
+    # the same underlying clock reading (both delegate to
+    # `Crystal::System::Time.monotonic`), so ns arithmetic here stays
+    # comparable with `Time.instant`-based deadlines elsewhere.
+    @last_inbound_activity_ns = Atomic(Int64).new(
+      Time.monotonic.total_nanoseconds.to_i64
+    )
     @keepalive_sequence = 0_u32
     # Counts PUSH_PROMISE frames accepted while our own ENABLE_PUSH=0
     # SETTINGS has not yet been acknowledged (see `validate_push_promise!`).
@@ -108,8 +117,12 @@ module HTTP2
     @encoder : HPack::Encoder
     @decoder : HPack::Decoder
     @diagnostics : Channel(Diagnostic)
-    @diagnostic_mutex = Mutex.new
-    @dropped_diagnostic_count = 0_u64
+    # Set true the first time `#diagnostics` is called; gates `emit_frame`
+    # and `emit_diagnostic` off the frame/error/lifecycle paths so a
+    # connection with no diagnostics consumer never allocates a
+    # `Diagnostic` or touches `@diagnostics`/`@dropped_diagnostic_count`.
+    @diagnostics_enabled = Atomic(Bool).new(false)
+    @dropped_diagnostic_count = Atomic(UInt64).new(0_u64)
     @pool_state_subscription_mutex = Mutex.new
     @pool_state_subscriptions = {} of UInt64 => Proc(Nil)
     @next_pool_state_subscription_id = 0_u64
@@ -611,12 +624,20 @@ module HTTP2
 
     # A bounded stream of structured connection events. Producers never block;
     # inspect `#dropped_diagnostic_count` to detect a slow consumer.
+    #
+    # Diagnostic emission is gated off the frame path and only turns on the
+    # first time this accessor is called (`@diagnostics_enabled`) -- frames,
+    # errors, and lifecycle events observed before that first call are
+    # deliberately never captured. Call this (even without receiving from
+    # the returned channel right away) before driving any traffic whose
+    # diagnostics you need to see.
     def diagnostics : Channel(Diagnostic)
+      @diagnostics_enabled.set(true)
       @diagnostics
     end
 
     def dropped_diagnostic_count : UInt64
-      @diagnostic_mutex.synchronize { @dropped_diagnostic_count }
+      @dropped_diagnostic_count.get
     end
 
     def stream?(id : UInt32) : Stream?
@@ -3312,7 +3333,7 @@ module HTTP2
             @transport_closer_started,
             @settings_timer_started,
             @drain_started,
-            @keepalive_started,
+            @keepalive_started.get,
           }
         end
 
@@ -3473,7 +3494,7 @@ module HTTP2
               @state.closed?,
               @streams.count { |_, stream| stream.state.active? },
               !@last_goaway.nil?,
-              @last_inbound_activity + DrainQuietPeriod - now,
+              remaining_since_last_activity(DrainQuietPeriod),
               deadline - now,
             }
           end
@@ -3566,10 +3587,10 @@ module HTTP2
       return unless interval
 
       start = @mutex.synchronize do
-        if @state.closed? || @keepalive_started
+        if @state.closed? || @keepalive_started.get
           false
         else
-          @keepalive_started = true
+          @keepalive_started.set(true)
           true
         end
       end
@@ -3583,7 +3604,7 @@ module HTTP2
         closed, remaining = @mutex.synchronize do
           {
             @state.closed?,
-            @last_inbound_activity + interval - Time.instant,
+            remaining_since_last_activity(interval),
           }
         end
         break if closed
@@ -3656,15 +3677,27 @@ module HTTP2
       payload
     end
 
+    # Returns the time remaining until `window` has elapsed since the last
+    # inbound frame (`@last_inbound_activity_ns`), possibly negative if it
+    # has already elapsed. This is a periodic poll from the drain monitor
+    # and keepalive loops, not the per-frame write path, so an ordinary
+    # `Time.monotonic` read here costs nothing that matters -- unlike
+    # `observe_inbound_frame`'s `.set`, which runs on every inbound frame
+    # and stays lock-free.
+    private def remaining_since_last_activity(window : Time::Span) : Time::Span
+      now_ns = Time.monotonic.total_nanoseconds.to_i64
+      Time::Span.new(
+        nanoseconds: @last_inbound_activity_ns.get + window.total_nanoseconds.to_i64 - now_ns
+      )
+    end
+
     private def observe_inbound_frame(
       frame : Frames,
       *,
       rate_limit : Bool = true,
     ) : Nil
-      @mutex.synchronize do
-        @last_inbound_activity = Time.instant
-      end
-      notify_keepalive_activity
+      @last_inbound_activity_ns.set(Time.monotonic.total_nanoseconds.to_i64)
+      notify_keepalive_activity if @keepalive_started.get
       emit_frame(frame, Diagnostic::Direction::Inbound)
       @inbound_frame_rate_limiter.check(frame) if rate_limit
     end
@@ -3682,6 +3715,8 @@ module HTTP2
       frame : Frames,
       direction : Diagnostic::Direction,
     ) : Nil
+      return unless @diagnostics_enabled.get
+
       header = frame.header
       settings = frame.as?(Frame::Settings).try(&.entries.dup)
       error_code = case frame
@@ -3743,12 +3778,12 @@ module HTTP2
     end
 
     private def emit_diagnostic(diagnostic : Diagnostic) : Nil
+      return unless @diagnostics_enabled.get
+
       select
       when @diagnostics.send(diagnostic)
       else
-        @diagnostic_mutex.synchronize do
-          @dropped_diagnostic_count += 1
-        end
+        @dropped_diagnostic_count.add(1)
       end
     rescue Channel::ClosedError
       # Diagnostics are best-effort and bounded.

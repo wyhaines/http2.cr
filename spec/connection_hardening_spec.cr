@@ -569,6 +569,10 @@ describe HTTP2::Connection do
         max_control_frames_per_window: 1
       )
       connection = HTTP2::Connection.start(client, configuration)
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before the peer
+      # drives the frames that trip the limiter below.
+      connection.diagnostics
       connection.wait_until_active(1.second)
       connection.wait_closed(1.second)
       connection.terminal_error.should be_a(
@@ -1134,6 +1138,10 @@ describe HTTP2::Connection do
       end
 
       connection = HTTP2::Connection.start(client)
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before the
+      # handshake's SETTINGS and the scripted PING exchange below fire.
+      connection.diagnostics
       connection.wait_until_active(1.second)
       wait_for_peer(peer_result)
 
@@ -1177,6 +1185,11 @@ describe HTTP2::Connection do
         diagnostic_queue_capacity: 1
       )
       connection = HTTP2::Connection.start(client, configuration)
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before the
+      # handshake's SETTINGS and the scripted PING below overflow the
+      # single-slot queue.
+      connection.diagnostics
       connection.wait_until_active(1.second)
       wait_for_peer(peer_result)
       connection.dropped_diagnostic_count.should be > 0_u64
@@ -1312,6 +1325,10 @@ describe HTTP2::Connection do
       # healthy (see the GOAWAY-flood spec's comment for the full
       # explanation of that race).
       connection = HTTP2::Connection.start(client)
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before the peer's
+      # GOAWAY and PING below fire.
+      connection.diagnostics
       connection.wait_until_active(1.second)
       stream = connection.new_stream
       open_client_stream(stream)

@@ -121,6 +121,11 @@ if NGHTTP2_INTEROP_ENABLED
         read_timeout: 5.seconds,
         write_timeout: 5.seconds
       )
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before any
+      # request traffic -- `wait_for_outbound_frame` below needs the
+      # CONTINUATION frame this request emits to have been captured.
+      connection.diagnostics
       client = HTTP2::Client.new(
         cleartext_origin,
         connection: connection,
@@ -195,6 +200,11 @@ if NGHTTP2_INTEROP_ENABLED
         read_timeout: 5.seconds,
         write_timeout: 5.seconds
       )
+      # Diagnostic emission is gated off until `#diagnostics` is first
+      # called (see `Connection#diagnostics`), so arm it before any
+      # request traffic -- `wait_for_outbound_frame` below needs the
+      # RST_STREAM frame `response.cancel` triggers to have been captured.
+      connection.diagnostics
       client = HTTP2::Client.new(
         cleartext_origin,
         connection: connection,
