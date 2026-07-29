@@ -252,7 +252,24 @@ module HTTP2
     @pool_events = Channel(Nil).new(1)
     @pool_coordinator_done = Channel(Nil).new
     @pool_coordinator_started = false
+    # `@pool_waiters` counts acquisitions with a `stream_slot` deadline, for
+    # the whole time each is in flight (incremented at `#acquire_request_slot`
+    # entry, decremented in its `ensure`) — coarser than "currently blocked",
+    # but that's fine for its two consumers (`#protected_entry?` and
+    # `#reconcile_pool`'s zero-capacity-sentinel retention), which want "an
+    # acquisition that might still need this entry exists", not "is asleep
+    # in a `select` this instant". `@pool_parked` is the narrower, precise
+    # counterpart: every acquisition genuinely parked in `#wait_for_pool`
+    # right now, deadline or not (see `#wait_for_pool_parked`). The pool
+    # coordinator loop needs that precision — gating its generation advance
+    # on "an acquisition exists" (`@pool_acquirers`, or a hypothetically
+    # deadline-widened `@pool_waiters`) would be true almost continuously
+    # under any real load, reintroducing the every-wakeup churn this task
+    # removed; gating on "someone is asleep on the generation channel right
+    # now" is the actually-rare condition that still catches every
+    # deadline-less waiter `@pool_waiters` alone would miss.
     @pool_waiters = 0
+    @pool_parked = 0
     @pool_acquirers = 0
     @unlimited_zero_capacity = false
     @zero_capacity_entry : PoolEntry?
@@ -755,6 +772,12 @@ module HTTP2
         @pool_waiters += 1 if deadline
       end
 
+      # Only the direct `reconcile_pool` call below sets this — the dial-
+      # attempt paths (`claim_dial_attempt`, `cancel_unstarted_dial`,
+      # `publish_pool_connection`, `fail_dial_attempt`) each already
+      # advance the generation directly and unconditionally from inside
+      # their own critical sections, regardless of this fiber's outcome,
+      # so they don't need to feed this flag too.
       changed_pool = false
 
       begin
@@ -791,7 +814,7 @@ module HTTP2
 
           if @supplied_connection &&
              entries.any?(&.connection.state.handshaking?)
-            result = wait_for_pool(
+            result = wait_for_pool_parked(
               signal,
               nil,
               supplied_ready_deadline,
@@ -823,7 +846,7 @@ module HTTP2
           end
 
           if attempt
-            result = wait_for_pool(
+            result = wait_for_pool_parked(
               signal,
               attempt,
               deadline,
@@ -859,7 +882,7 @@ module HTTP2
           end
 
           if deadline
-            result = wait_for_pool(signal, nil, deadline, cancellation)
+            result = wait_for_pool_parked(signal, nil, deadline, cancellation)
             case result
             when .canceled?
               check_cancellation!(cancellation)
@@ -877,7 +900,7 @@ module HTTP2
           @pool_acquirers -= 1
           @pool_waiters -= 1 if deadline
           @acquisition_retained_entries.clear if @pool_acquirers.zero?
-          changed_pool || @pool_waiters > 0
+          changed_pool || @pool_parked > 0
         end
         signal_pool_event if should_signal
       end
@@ -1140,6 +1163,26 @@ module HTTP2
       raise ClosedError.new("HTTP/2 client is closed")
     end
 
+    # `#wait_for_pool` wrapped with `@pool_parked` accounting. Every one of
+    # `#acquire_request_slot`'s three call sites (handshaking wait,
+    # dial-attempt wait, final indefinite wait) is a fiber genuinely
+    # blocked in the `select` below, deadline or not — the pool
+    # coordinator's gate reads `@pool_parked` to know whether *anyone* is
+    # asleep on the generation channel and needs a wakeup even on a wake
+    # where reconciliation finds nothing changed. Kept separate from
+    # `#wait_for_pool` itself so that method stays a pure select matrix.
+    private def wait_for_pool_parked(
+      signal : Channel(Nil),
+      attempt : DialAttempt?,
+      deadline : Time::Instant?,
+      cancellation : Cancellation?,
+    ) : PoolWaitResult
+      @mutex.synchronize { @pool_parked += 1 }
+      wait_for_pool(signal, attempt, deadline, cancellation)
+    ensure
+      @mutex.synchronize { @pool_parked -= 1 }
+    end
+
     # The explicit select matrix avoids helper fibers and covers every valid
     # combination of dial, deadline, and cancellation signals.
     # ameba:disable Metrics/CyclomaticComplexity
@@ -1238,25 +1281,8 @@ module HTTP2
         @next_pool_sequence += 1_u64
       end
       entry = PoolEntry.new(connection, sequence)
-      entry.subscribe { notify_pool_capacity_changed }
+      entry.subscribe { signal_pool_event }
       entry
-    end
-
-    # A connection's own pool-state notifications (a stream completed and
-    # freed a slot, the peer raised `max_concurrent_streams` off zero, the
-    # connection started draining or died, ...) always advance the
-    # generation directly and unconditionally, unlike the coordinator's
-    # idle-maintenance pass below. This can't be gated on `reconcile_pool`'s
-    # `changed` (which only tracks the coarser closed/retired/fully-idle
-    # transitions) or on `@pool_waiters` (only incremented for acquisitions
-    # with a `stream_slot` deadline — nil by default): a busy connection can
-    # go straight from "at its concurrent-stream limit" to "one slot free"
-    # without ever reporting empty, and a deadline-less acquirer parked on
-    # that would count toward neither signal. Gating this path would strand
-    # exactly that waiter.
-    private def notify_pool_capacity_changed : Nil
-      @mutex.synchronize { advance_pool_generation_unlocked unless @closed }
-      signal_pool_event
     end
 
     private def signal_pool_event : Nil
@@ -1305,17 +1331,24 @@ module HTTP2
         # thundering herd (a fresh `Channel` allocated and closed for
         # every acquisition, whether or not anything changed). Reconciling
         # first and gating the advance on its result removes that churn
-        # for the common case where nothing did. `@pool_waiters > 0` is
-        # the safety net for the deadline-bearing waiters this loop itself
-        # is responsible for: any of them still gets a generation advance
-        # on every wakeup even when reconciliation found nothing to do, so
-        # this change cannot strand one. (Deadline-less waiters rely on
-        # `#notify_pool_capacity_changed` and the dial-attempt methods
-        # advancing directly instead — see their comments.)
+        # for the common case where nothing did. `@pool_parked > 0` is the
+        # safety net, and deliberately not `@pool_waiters` (which only
+        # counts deadline-bearing acquisitions, in flight rather than
+        # actually parked): a connection can go from "at its concurrent-
+        # stream limit" straight to "one slot free" without ever reporting
+        # empty, which `reconcile_pool` has no other way to notice, and a
+        # deadline-less acquirer (the default — `Timeouts#stream_slot` is
+        # `nil` unless configured) parked on exactly that connection would
+        # count toward neither `changed` nor `@pool_waiters`. `@pool_parked`
+        # catches it: every wakeup this loop processes — whether triggered
+        # by a capacity-changed notification via `signal_pool_event`, an
+        # acquisition's own ensure block, or the idle-maintenance timer —
+        # still advances the generation whenever anyone, deadline or not,
+        # is asleep on it right now, so this change cannot strand one.
         changed = reconcile_pool
         @mutex.synchronize do
           advance_pool_generation_unlocked if !@closed &&
-                                              (changed || @pool_waiters > 0)
+                                              (changed || @pool_parked > 0)
         end
       end
     rescue Channel::ClosedError
@@ -1489,6 +1522,14 @@ module HTTP2
       unsubscribe.uniq!.each(&.unsubscribe)
       force_close.uniq!.each(&.connection.close)
       idle_close.uniq!.each do |entry|
+        # Deliberately re-checked per entry here rather than snapshotted
+        # once before this loop (as the array-returning
+        # `protected_idle_entries_unlocked` this replaced required, to
+        # avoid re-deriving it on every `#includes?`): protection can
+        # legitimately appear between one entry's close and the next's —
+        # e.g. a new acquirer starts selecting mid-loop — and a single
+        # stale snapshot taken before the first `#close_if_idle` call
+        # would miss that and close an entry that just became protected.
         next if @mutex.synchronize { protected_entry?(entry) }
 
         if entry.connection.close_if_idle
