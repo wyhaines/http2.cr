@@ -213,8 +213,15 @@ module HTTP2
       # is safe only because every staged byte is memcpy'd into
       # `@transport`'s own buffer (`#stage_write_command`, `#stage_frames`,
       # `#stage_scheduled_data`) before the writer fiber can next block
-      # waiting for work, and `#flush_batch` flushes the whole batch — and
-      # completes every command in it — before that park; see the
+      # waiting for work, and `#flush_batch` unconditionally flushes
+      # *every* byte staged since the last flush — not just bytes that
+      # happen to belong to a `WriteCommand` — before that park.
+      # WINDOW_UPDATE frames (`#stage_frames`) and a DATA chunk written
+      # mid-block (`#stage_scheduled_data`, before its command's
+      # `block.complete?`) both stage real bytes with no owning command
+      # and no pool-capacity change; `#flush_batch` flushes them anyway,
+      # every time, precisely because it does not gate the flush on
+      # whether anything is waiting to be completed or notified. See the
       # zero-copy tripwire on `#stage_scheduled_data` for the full
       # argument, and the flush audit in the P1.8 task report for the
       # original single-command-per-flush version of this property.
@@ -1657,15 +1664,19 @@ module HTTP2
       idle : Bool,
     ) : Bool
       if completions.size >= MAX_BATCH || idle
-        # A fatal write error already failed and cleared `completions`
-        # (see `#stage_write_command`/`#stage_frames`/
-        # `#stage_scheduled_data`) and called `#terminate`, which itself
-        # unconditionally notifies pool-state subscribers — skip the
-        # redundant flush attempt in that case. If `completions` is
-        # non-empty despite `terminal_error` (another fiber terminated
-        # the connection mid-batch), still attempt the flush: those bytes
-        # are already staged and may still be deliverable.
-        flush_batch(completions, capacity_changed) unless completions.empty? && terminal_error
+        # Always call `#flush_batch` here, unconditionally — do NOT
+        # gate this on `completions.empty?`/`capacity_changed` (a
+        # tempting-looking "nothing happened" optimization this method
+        # used to apply, and got wrong): `#stage_frames`
+        # (WINDOW_UPDATE frames, which have no owning `WriteCommand`)
+        # and a `#stage_scheduled_data` call that wrote a DATA chunk
+        # without yet completing its block (`block.complete?` still
+        # false) both write real bytes into `@transport`'s buffer
+        # without adding anything to `completions` or changing pool
+        # capacity. `#flush_batch` itself is the only thing that knows
+        # whether those bytes exist, so it must always run at every
+        # batch boundary — see its own comment.
+        flush_batch(completions, capacity_changed)
         capacity_changed = false
       end
 
@@ -1790,18 +1801,35 @@ module HTTP2
     end
 
     # The only place a batch's staged bytes are flushed and its commands
-    # completed. A no-op if nothing was staged and no command changed pool
-    # capacity (nothing to flush, nothing to notify). On flush failure,
-    # every staged command completes with that error instead of success —
-    # their bytes reached `@transport`'s buffer but never the peer — and
-    # the connection terminates, identical to a single-command flush
-    # failure before batching.
+    # completed — called unconditionally at every batch boundary
+    # (`#flush_and_park_if_idle`), never gated on `completions`/
+    # `capacity_changed`. Those two only track command-owned state
+    # (completions to deliver, pool-capacity changes to notify); they
+    # say nothing about whether *bytes* are sitting in `@transport`'s
+    # buffer, because `#stage_frames` (WINDOW_UPDATE frames) and a
+    # `#stage_scheduled_data` call mid-DATA-block both write real bytes
+    # without touching either. A version of this method that
+    # early-returned on `completions.empty? && !capacity_changed` (an
+    # earlier draft of this method did exactly that) skipped the actual
+    # `@transport.flush` call whenever a batch's only content was one of
+    # those two — stranding already-written WINDOW_UPDATE or DATA-chunk
+    # bytes in the transport's buffer indefinitely once the writer went
+    # idle and parked, since nothing else would ever prompt a flush on
+    # its own. Calling `@transport.flush` unconditionally costs nothing
+    # extra in the common truly-idle case: `IO::Buffered#flush` only
+    # calls `#unbuffered_write` when its internal buffer is non-empty,
+    # and `Socket#unbuffered_flush` (the terminus for both the cleartext
+    # transport and, transitively, `OpenSSL::SSL::Socket`'s) does
+    # nothing — no syscall, just a few cheap empty method calls.
+    #
+    # On flush failure, every staged command completes with that error
+    # instead of success — their bytes reached `@transport`'s buffer but
+    # never the peer — and the connection terminates, identical to a
+    # single-command flush failure before batching.
     private def flush_batch(
       completions : Array(WriteCommand),
       capacity_changed : Bool,
     ) : Nil
-      return if completions.empty? && !capacity_changed
-
       begin
         @transport.flush
       rescue error
