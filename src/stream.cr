@@ -453,6 +453,7 @@ module HTTP2
     end
 
     # :nodoc:
+    # The slice is owned by the body from this call on.
     def deliver_data(data : Bytes) : Bool
       @body.enqueue(data)
     end

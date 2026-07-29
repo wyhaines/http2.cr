@@ -2283,7 +2283,11 @@ module HTTP2
           return
         end
 
-        data = frame.data.dup
+        # Unpadded DATA (the overwhelmingly common case): frame.data IS the whole
+        # freshly-allocated payload from Frame.read and has no other owner — hand
+        # it to the body without copying. Padded frames are duped so the buffer
+        # doesn't pin the padding bytes.
+        data = frame.padded? ? frame.data.dup : frame.data
         unless stream.deliver_data(data)
           # This frame's own flow-controlled bytes were charged against
           # the connection window in `accept_inbound_data` above but never
