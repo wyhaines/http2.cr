@@ -1658,7 +1658,12 @@ module HTTP2
       PreparedRequest.new(
         build_request_fields(request, connect, authority, path, synthesized_length),
         request.trailers.to_header_fields(@additional_never_indexed_fields),
-        request.body_for_attempt,
+        # `body` is left `nil` here, not `request.body_for_attempt`:
+        # `#perform_request` always calls `copy_with(body: ...)` on every
+        # attempt, including the first, before this `PreparedRequest` is
+        # ever read -- so computing a body here would just be discarded
+        # unread, wasting an `IO::Memory` allocation per bodied request.
+        nil,
         request.body_length,
         content_length,
         connect
@@ -1696,25 +1701,21 @@ module HTTP2
         fields << HeaderField.new(":path", path)
       end
       request.headers.each do |field|
-        name = field.name
         # `validate_request_fields!` (in `#prepare`) already rejected any
-        # uppercase byte in a field name, so this never actually triggers
-        # in practice -- it is a defensive normalization, not a
-        # load-bearing one, and stays cheap (no allocation) in the common
-        # case it guards.
-        name = name.downcase if ascii_upper?(name)
-        fields << HeaderField.new(name, field.value, indexing_for(name))
+        # uppercase byte in a field name, so `name` below never actually
+        # diverges from `field.name` in practice -- it exists purely for
+        # the indexing lookup. The emitted field's own name always stays
+        # `field.name`, unchanged, mirroring the same load-bearing split
+        # `Headers#to_header_fields` documents: normalize only the
+        # comparison, never the wire value.
+        name = field.name
+        name = name.downcase if Headers.ascii_upper?(name)
+        fields << HeaderField.new(field.name, field.value, indexing_for(name))
       end
       if synthesized_length
         fields << HeaderField.new("content-length", synthesized_length.to_s)
       end
       fields
-    end
-
-    # Slice#any? is a non-allocating loop; String#each_byte without a block
-    # would allocate an iterator.
-    private def ascii_upper?(name : String) : Bool
-      name.to_slice.any? { |b| 0x41_u8 <= b <= 0x5a_u8 }
     end
 
     # Delegates to `Headers.indexing_for` so the HPACK never-index

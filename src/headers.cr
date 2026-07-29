@@ -141,7 +141,7 @@ module HTTP2
     # upstream already being lowercase. It is correct regardless of how
     # the field reached `@fields` (including a caller-supplied mixed-case
     # name, via any construction path). The downcase itself is guarded by
-    # `#ascii_upper?` (a non-allocating byte scan): a name with no ASCII
+    # `.ascii_upper?` (a non-allocating byte scan): a name with no ASCII
     # uppercase byte skips `String#downcase`'s allocation entirely, which
     # is the common case for any caller that went through `Client`'s own
     # request validation (it already rejects uppercase field names before
@@ -163,7 +163,7 @@ module HTTP2
     ) : Array(HeaderField)
       @fields.map do |field|
         name = field.name
-        name = name.downcase if ascii_upper?(name)
+        name = name.downcase if self.class.ascii_upper?(name)
         HeaderField.new(
           field.name,
           field.value,
@@ -190,9 +190,14 @@ module HTTP2
       end
     end
 
-    # Slice#any? is a non-allocating loop; String#each_byte without a block
-    # would allocate an iterator.
-    private def ascii_upper?(name : String) : Bool
+    # :nodoc:
+    #
+    # Slice#any? is a non-allocating loop; String#each_byte without a
+    # block would allocate an iterator. Shared by `#to_header_fields` and
+    # `Client`'s single-pass request field builder (Task 18) so there is
+    # exactly one implementation of this scan, not two copies to keep in
+    # sync.
+    def self.ascii_upper?(name : String) : Bool
       name.to_slice.any? { |b| 0x41_u8 <= b <= 0x5a_u8 }
     end
 
