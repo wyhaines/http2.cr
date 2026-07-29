@@ -57,7 +57,7 @@ module HTTP2
         )
       end
 
-      payload = Bytes.new(header.length)
+      payload = uncleared_bytes(header.length)
       io.read_fully(payload)
       build(header, payload)
     end
@@ -141,6 +141,13 @@ module HTTP2
         ErrorScope::Stream,
         stream_id
       )
+    end
+
+    # GC.malloc_atomic: uncleared, pointer-free allocation — read_fully
+    # overwrites every byte before the slice escapes this method.
+    private def self.uncleared_bytes(size : Int32) : Bytes
+      return Bytes.empty if size.zero?
+      Bytes.new(GC.malloc_atomic(size).as(UInt8*), size)
     end
 
     private def self.build(header : FrameHeader, payload : Bytes) : Frames

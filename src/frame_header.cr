@@ -28,7 +28,8 @@ module HTTP2
     end
 
     def self.read(io : IO) : self
-      bytes = Bytes.new(SIZE)
+      buffer = uninitialized UInt8[SIZE]
+      bytes = buffer.to_slice
       io.read_fully(bytes)
 
       length = ((bytes[0].to_i32 << 16) |
