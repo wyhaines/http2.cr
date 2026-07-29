@@ -262,6 +262,25 @@ module HTTP2
     # need to retain several zero-capacity probes until it reaches its bound.
     @acquisition_retained_entries = Set(PoolEntry).new
 
+    # `#reconcile_pool` scratch space, reused across calls instead of
+    # allocating a fresh handful of collections every reconciliation pass.
+    # There is more than one legal caller — the pool coordinator fiber's
+    # loop, and an acquiring fiber taking the opportunistic reconcile path
+    # inside `#acquire_request_slot` — so these ivars are only ever touched
+    # while holding `@reconcile_mutex`, which serializes those callers
+    # against each other and makes reuse safe despite having more than one
+    # of them. `@reconcile_mutex` is distinct from `@mutex` on purpose:
+    # reconciliation deliberately performs connection closes outside the
+    # pool's own mutex, and folding it into `@mutex` would either force
+    # those closes back under the lock or require re-entrant locking.
+    @reconcile_mutex = Mutex.new
+    @reconcile_entries = [] of PoolEntry
+    @reconcile_activity_generations = {} of PoolEntry => UInt64
+    @reconcile_capacities = {} of PoolEntry => Connection::RequestCapacity
+    @reconcile_unsubscribe = [] of PoolEntry
+    @reconcile_force_close = [] of PoolEntry
+    @reconcile_idle_close = [] of PoolEntry
+
     # Creates a client bound to one `http` or `https` origin. Owned
     # connections are dialed lazily and scale under `pool_configuration`.
     # A supplied connection is used as-is, is owned by this client, and
@@ -563,12 +582,10 @@ module HTTP2
     # Returns a value-only snapshot of the current pool.
     def pool_state : PoolState
       @mutex.synchronize do
-        retained_entries = protected_idle_entries_unlocked
         PoolState.new(
           @pool_entries.size,
           @pool_entries.count do |entry|
-            !entry.idle_since.nil? &&
-              !retained_entries.includes?(entry)
+            !entry.idle_since.nil? && !protected_entry?(entry)
           end,
           @pool_retired_entries.size,
           !@dial_attempt.nil?,
@@ -738,6 +755,8 @@ module HTTP2
         @pool_waiters += 1 if deadline
       end
 
+      changed_pool = false
+
       begin
         loop do
           check_cancellation!(cancellation)
@@ -752,6 +771,13 @@ module HTTP2
           end
 
           if reconcile_pool
+            changed_pool = true
+            # `reconcile_pool` no longer advances the generation itself
+            # (see its doc comment) — do it here so any other fiber
+            # parked on the pool signal wakes for the change this fiber
+            # just observed, exactly as it would have before that moved
+            # out of `reconcile_pool`.
+            @mutex.synchronize { advance_pool_generation_unlocked unless @closed }
             next
           end
 
@@ -847,12 +873,13 @@ module HTTP2
           raise_pool_saturated
         end
       ensure
-        @mutex.synchronize do
+        should_signal = @mutex.synchronize do
           @pool_acquirers -= 1
           @pool_waiters -= 1 if deadline
           @acquisition_retained_entries.clear if @pool_acquirers.zero?
+          changed_pool || @pool_waiters > 0
         end
-        signal_pool_event
+        signal_pool_event if should_signal
       end
     end
 
@@ -1211,8 +1238,25 @@ module HTTP2
         @next_pool_sequence += 1_u64
       end
       entry = PoolEntry.new(connection, sequence)
-      entry.subscribe { signal_pool_event }
+      entry.subscribe { notify_pool_capacity_changed }
       entry
+    end
+
+    # A connection's own pool-state notifications (a stream completed and
+    # freed a slot, the peer raised `max_concurrent_streams` off zero, the
+    # connection started draining or died, ...) always advance the
+    # generation directly and unconditionally, unlike the coordinator's
+    # idle-maintenance pass below. This can't be gated on `reconcile_pool`'s
+    # `changed` (which only tracks the coarser closed/retired/fully-idle
+    # transitions) or on `@pool_waiters` (only incremented for acquisitions
+    # with a `stream_slot` deadline — nil by default): a busy connection can
+    # go straight from "at its concurrent-stream limit" to "one slot free"
+    # without ever reporting empty, and a deadline-less acquirer parked on
+    # that would count toward neither signal. Gating this path would strand
+    # exactly that waiter.
+    private def notify_pool_capacity_changed : Nil
+      @mutex.synchronize { advance_pool_generation_unlocked unless @closed }
+      signal_pool_event
     end
 
     private def signal_pool_event : Nil
@@ -1256,10 +1300,23 @@ module HTTP2
         end
         break if @pool_events.closed?
 
+        # Reconcile first, then wake: advancing the generation on every
+        # wakeup regardless of outcome is what turned this loop into a
+        # thundering herd (a fresh `Channel` allocated and closed for
+        # every acquisition, whether or not anything changed). Reconciling
+        # first and gating the advance on its result removes that churn
+        # for the common case where nothing did. `@pool_waiters > 0` is
+        # the safety net for the deadline-bearing waiters this loop itself
+        # is responsible for: any of them still gets a generation advance
+        # on every wakeup even when reconciliation found nothing to do, so
+        # this change cannot strand one. (Deadline-less waiters rely on
+        # `#notify_pool_capacity_changed` and the dial-attempt methods
+        # advancing directly instead — see their comments.)
+        changed = reconcile_pool
         @mutex.synchronize do
-          advance_pool_generation_unlocked unless @closed
+          advance_pool_generation_unlocked if !@closed &&
+                                              (changed || @pool_waiters > 0)
         end
-        reconcile_pool
       end
     rescue Channel::ClosedError
       # Client teardown closes the control channel.
@@ -1272,8 +1329,7 @@ module HTTP2
       return unless timeout
 
       deadline = @mutex.synchronize do
-        retained_entries = protected_idle_entries_unlocked
-        @pool_entries.reject { |entry| retained_entries.includes?(entry) }
+        @pool_entries.reject { |entry| protected_entry?(entry) }
           .compact_map(&.idle_since)
           .min?
           .try { |idle_since| idle_since + timeout }
@@ -1286,28 +1342,51 @@ module HTTP2
 
     # Reconciliation applies one authoritative capacity snapshot across the
     # eligible, retired, and idle policies before performing closes outside
-    # the client mutex.
-    # ameba:disable Metrics/CyclomaticComplexity
+    # the client mutex. Returns `true` iff it closed, retired, or otherwise
+    # changed pool shape — callers use that to decide whether the change is
+    # worth advancing the generation for; `reconcile_pool` itself no longer
+    # does so (contrast with the previous version, which unconditionally
+    # advanced from inside its own mutex block). Moving that decision out
+    # lets the pool coordinator loop skip the advance — and the fresh
+    # `Channel` allocation and thundering-herd wakeup that comes with it —
+    # on the common call where reconciliation finds nothing to do.
     private def reconcile_pool : Bool
-      entries, retired, activity_generations = @mutex.synchronize do
+      @reconcile_mutex.synchronize { reconcile_pool_unsafe }
+    end
+
+    # Only ever runs while `@reconcile_mutex` is held — see the ivar doc
+    # comment by `@reconcile_entries` and friends for why more than one
+    # fiber can legally call in here, and why that's still safe.
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def reconcile_pool_unsafe : Bool
+      @reconcile_entries.clear
+      @reconcile_activity_generations.clear
+      @reconcile_capacities.clear
+      @reconcile_unsubscribe.clear
+      @reconcile_force_close.clear
+      @reconcile_idle_close.clear
+
+      entries = @reconcile_entries
+      activity_generations = @reconcile_activity_generations
+      capacities = @reconcile_capacities
+      unsubscribe = @reconcile_unsubscribe
+      force_close = @reconcile_force_close
+      idle_close = @reconcile_idle_close
+
+      retired = @mutex.synchronize do
         return false if @closed
 
-        entries = @pool_entries.dup
-        generations = {} of PoolEntry => UInt64
+        entries.concat(@pool_entries)
         entries.each do |entry|
-          generations[entry] = entry.activity_generation
+          activity_generations[entry] = entry.activity_generation
         end
-        {entries, @pool_retired_entries.dup, generations}
+        @pool_retired_entries.dup
       end
-      capacities = {} of PoolEntry => Connection::RequestCapacity
       (entries + retired).each do |entry|
         capacities[entry] = entry.connection.request_capacity
       end
 
       now = Time.instant
-      unsubscribe = [] of PoolEntry
-      force_close = [] of PoolEntry
-      idle_close = [] of PoolEntry
       changed = false
 
       @mutex.synchronize do
@@ -1371,10 +1450,9 @@ module HTTP2
           changed = true
         end
 
-        retained_entries = protected_idle_entries_unlocked
         all_idle_entries = @pool_entries.select(&.idle_since)
         idle_entries = all_idle_entries.reject do |entry|
-          retained_entries.includes?(entry)
+          protected_entry?(entry)
         end
         idle_entries.sort_by! { |entry| entry.idle_since || now }
         excess = all_idle_entries.size -
@@ -1406,17 +1484,12 @@ module HTTP2
             changed = true
           end
         end
-
-        advance_pool_generation_unlocked if changed
       end
 
       unsubscribe.uniq!.each(&.unsubscribe)
       force_close.uniq!.each(&.connection.close)
-      retained_entries = @mutex.synchronize do
-        protected_idle_entries_unlocked
-      end
       idle_close.uniq!.each do |entry|
-        next if retained_entries.includes?(entry)
+        next if @mutex.synchronize { protected_entry?(entry) }
 
         if entry.connection.close_if_idle
           changed = true
@@ -1429,19 +1502,13 @@ module HTTP2
 
     # ameba:enable Metrics/CyclomaticComplexity
 
-    private def protected_idle_entries_unlocked : Array(PoolEntry)
-      retained_entries = [] of PoolEntry
-      if @pool_waiters > 0
-        if sentinel = @zero_capacity_entry
-          retained_entries << sentinel
-        end
-      end
-      if @pool_acquirers > 0
-        @acquisition_retained_entries.each do |entry|
-          retained_entries << entry unless retained_entries.includes?(entry)
-        end
-      end
-      retained_entries
+    # Truth-equivalent to the array-materializing predicate this replaced
+    # (`protected_idle_entries_unlocked.includes?(entry)`), called inline in
+    # each caller's loop instead of building and re-scanning a throwaway
+    # array. Must be called with `@mutex` held.
+    private def protected_entry?(entry : PoolEntry) : Bool
+      (@pool_waiters > 0 && entry.same?(@zero_capacity_entry)) ||
+        (@pool_acquirers > 0 && @acquisition_retained_entries.includes?(entry))
     end
 
     # Dials a new connection. Neither branch passes `read_timeout:`: a
