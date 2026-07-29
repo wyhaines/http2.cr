@@ -17,9 +17,83 @@ All notable changes are recorded here. This project follows
 - Added bounded GOAWAY and stream-ID-exhaustion retirement, idle contraction,
   and concurrent multi-connection graceful shutdown under one shared
   deadline.
+- Added `Client#put`, `#patch`, and `#delete`/`#options` convenience
+  wrappers alongside the existing `#get`/`#head`/`#post`, each a thin
+  wrapper over `#request`.
+
+### Performance
+
+This pass removes redundant payload copies and per-frame lock/allocation
+overhead from the connection hot paths, and cuts per-request client
+overhead, without changing wire behavior or public API semantics. No
+benchmark harness exists in this repo, so these are described
+qualitatively rather than with throughput numbers (the companion `hpack`
+shard's own plan has measured figures); verification here was per-change
+paired micro-verification during review, not an end-to-end benchmark.
+
+- Eliminated copies on both the inbound and outbound DATA path: an
+  unpadded inbound DATA frame's payload is handed to the stream body
+  without duplicating it (padded frames are still duped so the buffer
+  doesn't pin padding bytes), and an outbound DATA write no longer dups
+  the caller's bytes before framing them — except under `-Dpreview_mt`,
+  where a private copy is still taken at the chunk-submit site because
+  the zero-copy path is only proven safe against a pinned, single-threaded
+  runtime. HPACK field-block assembly and per-frame header/payload
+  construction also lost a heap allocation and a copy each.
+- Batched writer flushes so a WINDOW_UPDATE-only or mid-block DATA write
+  can no longer sit unflushed behind a buffered transport; added a
+  dedicated buffered-transport spec class (none of the existing specs use
+  a genuinely buffered socket) that reproduces the starvation this fixes.
+- Reduced per-frame lock and allocation overhead: diagnostics capture and
+  keepalive bookkeeping are now gated off the hot frame path until first
+  used, several per-stream and per-connection fields moved from
+  mutex-guarded state to atomics (stream state, flow-control windows,
+  write-completion flags), and DATA frame planning now takes one lock
+  instead of several (closing a real TOCTOU in the process).
+- Reduced per-request client overhead: the connection pool now
+  reconciles only on an actual capacity change (tracking parked waiters
+  precisely) instead of on every acquisition; response headers and
+  trailers are parsed once instead of twice; a request is prepared in a
+  single pass; owned request bodies (`String`/`Bytes`) are carried
+  zero-copy end to end instead of being wrapped in a fresh `IO::Memory`;
+  and the client's request-opening critical section is narrower.
+
+### Fixed
+
+- `Response#trailers` (with no explicit timeout argument) no longer
+  aborts a request whose response body is still being actively, if
+  slowly, consumed — it now re-arms the same way the body-side idle
+  timeout already did, instead of unconditionally resetting the stream
+  once the idle timeout elapsed. An explicit `trailers(timeout)` call is
+  unchanged: it still waits that exact deadline with no re-arming.
+- Closed a `StreamBody#terminate`/finish race that could discard already
+  buffered response data: a late `terminate` (for example a reset that
+  arrives just after the body finished) now preserves data delivered
+  before it finished instead of racily dropping it.
+- A terminated stream's buffered inbound event queue is now drained and
+  closed as part of `#terminate`, instead of merely being closed, so it
+  can no longer pin queued frames in memory after the stream is done.
+- Restored rejection of a bodyless request that carries a lying, non-zero
+  `content-length` header. An earlier point in this branch's own history
+  had dropped that check while reworking body-length tracking around a
+  nilable `body_length`; it's caught here, net unchanged versus this
+  shard's pre-existing behavior.
+- A `CONNECT` request whose tunnel body is an owned `String`/`Bytes`
+  value (rather than a caller-supplied `IO`) now actually uploads that
+  body; the zero-copy owned-body change above had an intermediate state
+  where it silently skipped the upload for this combination.
 
 ### Changed
 
+- `Request#body_length` is now `nil` (rather than a stale or synthesized
+  value) whenever the request has no body.
+- `Connection#write_batch`'s validation now raises on the first invalid
+  frame in array order. Previously, a batch containing more than one
+  kind of invalid frame always raised in a fixed category-priority order
+  regardless of where each frame appeared; no shipped caller constructs
+  a batch mixing invalid-frame categories, so this is not expected to be
+  observable in practice, but it is documented as the batch's real
+  contract now.
 - `Timeouts#stream_slot` now covers pool-wide acquisition, including shared
   expansion dialing and SETTINGS capacity changes. Saturation at the pool
   boundary raises `Client::PoolSaturatedError`.
