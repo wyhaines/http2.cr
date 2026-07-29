@@ -485,7 +485,7 @@ module HTTP2
       end
       return 0 unless terminated
 
-      discarded = @body.finished? ? 0 : @body.terminate(error)
+      discarded = @body.terminate(error)
       @terminal_signal.close
       discarded
     end

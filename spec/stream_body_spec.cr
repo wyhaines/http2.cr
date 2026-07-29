@@ -103,7 +103,7 @@ describe HTTP2::StreamBody do
     end
   end
 
-  it "discards unread bytes when a finished body later becomes terminal" do
+  it "does not discard unread bytes when a finished body later becomes terminal" do
     body = HTTP2::StreamBody.new(
       8,
       ->(_amount : Int32) { },
@@ -113,10 +113,24 @@ describe HTTP2::StreamBody do
     body.finish
 
     error = IO::Error.new("late reset")
-    body.terminate(error).should eq(4)
-    body.buffered_bytes.should eq(0)
-    expect_raises(IO::Error, /late reset/) do
-      body.read(Bytes.new(1))
-    end
+    body.terminate(error).should eq(0)
+    body.buffered_bytes.should eq(4)
+    buffer = Bytes.new(8)
+    body.read(buffer).should eq(4)
+    buffer[0, 4].should eq("body".to_slice)
+  end
+
+  it "terminate after finish preserves buffered data through to EOF" do
+    body = HTTP2::StreamBody.new(
+      6,
+      ->(_amount : Int32) { },
+      -> { }
+    )
+    body.enqueue("hello".to_slice).should be_true
+    body.finish
+    body.terminate(IO::Error.new("late reset")).should eq(0)
+    buffer = Bytes.new(16)
+    body.read(buffer).should eq(5)
+    body.read(buffer).should eq(0)
   end
 end

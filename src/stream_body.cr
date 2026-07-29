@@ -191,7 +191,7 @@ module HTTP2
     # :nodoc:
     def terminate(error : Exception) : Int32
       discarded, changed = @mutex.synchronize do
-        if @terminal_error || @closed
+        if @terminal_error || @closed || @finished
           {0, false}
         else
           @terminal_error = error
