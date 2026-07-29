@@ -2113,6 +2113,91 @@ describe HTTP2::Client do
     end
   end
 
+  it "does not abort an actively-read body when trailers is awaited early" do
+    UNIXSocket.pair do |client_io, peer|
+      chunk_count = 5
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}]
+        )
+        io.flush
+
+        chunk_count.times do |i|
+          last = i == chunk_count - 1
+          flags = last ? HTTP2::Frame::Data::Flags::END_STREAM : HTTP2::Frame::Data::Flags::None
+          HTTP2::Frame::Data.new(flags, request[:stream_id], "x").write(io)
+          io.flush
+
+          unless last
+            pause = Channel(Nil).new
+            select
+            when pause.receive
+            when timeout(100.milliseconds)
+            end
+          end
+        end
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection,
+        timeouts: HTTP2::Client::Timeouts.new(idle: 200.milliseconds)
+      )
+      begin
+        response = http.get("/")
+        response.status.should eq(200)
+
+        # A fiber awaits trailers before the first body chunk lands. The
+        # response streams for ~400ms (five 100ms-spaced chunks) against
+        # a 200ms idle timeout -- if `#trailers` does not re-arm on body
+        # progress the same way `#monitor_response` does, it aborts the
+        # request around the 200ms mark even though the main fiber below
+        # is actively (if slowly) draining the body the whole time.
+        trailers_headers = Channel(HTTP2::Headers).new(1)
+        trailers_error = Channel(Exception).new(1)
+        spawn do
+          begin
+            trailers_headers.send(response.trailers)
+          rescue error
+            trailers_error.send(error)
+          end
+        end
+        Fiber.yield
+
+        buffer = Bytes.new(1)
+        read = IO::Memory.new
+        chunk_count.times do
+          count = response.body.read(buffer)
+          count.should eq(1)
+          read.write(buffer[0, count])
+        end
+        read.to_s.should eq("x" * chunk_count)
+
+        select
+        when headers = trailers_headers.receive
+          headers.should be_empty
+        when error = trailers_error.receive
+          fail(
+            "response.trailers raised #{error.class}: #{error.message} " \
+            "while the body was still being actively consumed"
+          )
+        when timeout(2.seconds)
+          fail("response.trailers never returned")
+        end
+
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   # `Connection::KeepaliveTimeoutError` and `Connection::DrainTimeoutError`
   # (see the graceful_close spec above) share one ancestor,
   # `Connection::TimeoutError`, and so share the exact same rescue branch

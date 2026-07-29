@@ -38,29 +38,56 @@ module HTTP2
       )
     end
 
-    # Waits for the response trailer section. An empty collection means that
-    # the response ended without trailers.
-    def trailers(timeout : Time::Span? = @idle_timeout) : Headers
-      @metadata.wait(timeout, @cancellation.try(&.signal))
-    rescue ResponseMetadata::WaitTimeoutError
-      request_error = RequestTimeoutError.new(
-        "waiting for response trailers timed out"
-      )
-      abort_request(request_error)
-      raise request_error
-    rescue error : IO::TimeoutError
-      request_error = RequestTimeoutError.new(
-        "network read timed out while waiting for response trailers",
-        error
-      )
-      abort_request(request_error)
-      raise request_error
-    rescue ResponseMetadata::WaitCanceledError
-      request_error = RequestCanceledError.new(
-        "waiting for response trailers was canceled"
-      )
-      abort_request(request_error)
-      raise request_error
+    # Waits for the response trailer section using the client's
+    # configured idle timeout. Each time that timeout elapses, if the
+    # body has consumed additional bytes since the previous check, the
+    # wait simply re-arms instead of aborting -- mirroring
+    # `Client#monitor_response`'s own consumed-bytes check -- so a
+    # caller who awaits trailers before draining a large, actively
+    # flowing body is not destroyed out from under it (see
+    # `Client::Timeouts#idle`'s "a slow-but-active reader is never
+    # killed" contract). An empty collection means that the response
+    # ended without trailers.
+    def trailers : Headers
+      wait_for_trailers(@idle_timeout, rearm: true)
+    end
+
+    # Waits for the response trailer section, aborting the request as
+    # soon as `timeout` elapses with none received -- regardless of any
+    # body-read progress made in the meantime. An empty collection means
+    # that the response ended without trailers.
+    def trailers(timeout : Time::Span?) : Headers
+      wait_for_trailers(timeout, rearm: false)
+    end
+
+    private def wait_for_trailers(timeout : Time::Span?, *, rearm : Bool) : Headers
+      loop do
+        consumed_before = @stream.body.consumed_bytes
+        begin
+          return @metadata.wait(timeout, @cancellation.try(&.signal))
+        rescue ResponseMetadata::WaitTimeoutError
+          next if rearm && @stream.body.consumed_bytes > consumed_before
+
+          request_error = RequestTimeoutError.new(
+            "waiting for response trailers timed out"
+          )
+          abort_request(request_error)
+          raise request_error
+        rescue error : IO::TimeoutError
+          request_error = RequestTimeoutError.new(
+            "network read timed out while waiting for response trailers",
+            error
+          )
+          abort_request(request_error)
+          raise request_error
+        rescue ResponseMetadata::WaitCanceledError
+          request_error = RequestCanceledError.new(
+            "waiting for response trailers was canceled"
+          )
+          abort_request(request_error)
+          raise request_error
+        end
+      end
     end
 
     # Stops consuming the response without attaching a request-specific
