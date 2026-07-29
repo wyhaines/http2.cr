@@ -206,9 +206,21 @@ module HTTP2
       # (`process_write_command`, `write_scheduled_frames`,
       # `write_scheduled_data`) calls `@transport.flush` immediately
       # afterward, before the writer fiber can next block waiting for work —
-      # see the flush audit in the P1.8 task report. The TLS path is left
-      # untouched: `OpenSSL::SSL::Socket` already buffers internally.
+      # see the flush audit in the P1.8 task report.
+      #
+      # `IO::Buffered`'s default buffer is not guaranteed to hold a full
+      # frame: if it's smaller than `header + payload` for the largest
+      # frame this side sends, the buffered header flushes as its own tiny
+      # `send(2)` and the payload bypasses the buffer as a second syscall,
+      # silently defeating the coalescing above for exactly the frames
+      # that matter. Size it explicitly so header+payload always fit in
+      # one buffer. The TLS path (`start_tls`, below) needs the identical
+      # fix: `OpenSSL::SSL::Socket` also includes `IO::Buffered` with the
+      # same default and is not exempt from this.
       transport.sync = false
+      transport.buffer_size = Math.pw2ceil(
+        configuration.outbound_data_chunk_size + FrameHeader::SIZE
+      )
 
       begin
         new(transport, configuration).start
@@ -382,6 +394,19 @@ module HTTP2
           # those propagate through instead, unchanged.
           raise TLSVerificationError.new(server_name, error)
         end
+
+        # `OpenSSL::SSL::Socket` includes `IO::Buffered` with the same
+        # default buffer as cleartext (see the sizing rationale in
+        # `connect_prior_knowledge`, above) — too small to hold a full
+        # frame's header and payload together, which would flush the
+        # header as its own tiny `send(2)` and push the payload through
+        # unbuffered as a second one. Must be set here, right after
+        # construction and before this method's first write to `tls`
+        # (the preface, in `Connection#start` below): `buffer_size=`
+        # raises once a read or write has allocated the buffer.
+        tls.buffer_size = Math.pw2ceil(
+          configuration.outbound_data_chunk_size + FrameHeader::SIZE
+        )
 
         unless tls.alpn_protocol == "h2"
           tls.close
