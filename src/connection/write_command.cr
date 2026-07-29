@@ -10,8 +10,16 @@ module HTTP2
       getter stream_closure_error : Exception?
 
       @completion = Channel(Exception?).new(1)
-      @completion_mutex = Mutex.new
-      @completed = false
+      # Monotonic one-way ratchet guarding the exactly-once send below:
+      # `#swap` atomically reads the prior value and sets `true`, so the
+      # caller whose `swap` returns `false` is guaranteed to be the only
+      # one that ever reaches `@completion.send` -- lock-free, no
+      # `Mutex`. Every deliberate double-`#complete` race in this class
+      # (a batch write error racing the writer's terminal-error drain,
+      # `#wait`'s stream-closed branch racing a late frame completion,
+      # etc.) already relies on first-wins idempotence here; this
+      # preserves that exactly, it just no longer takes a lock to do it.
+      @completed = Atomic(Bool).new(false)
 
       record HeaderBlock,
         stream_id : UInt32,
@@ -118,15 +126,9 @@ module HTTP2
       end
 
       def complete(error : Exception? = nil) : Nil
-        first = @completion_mutex.synchronize do
-          if @completed
-            false
-          else
-            @completed = true
-            true
-          end
-        end
-        @completion.send(error) if first
+        return if @completed.swap(true)
+
+        @completion.send(error)
       end
 
       def wait : Nil

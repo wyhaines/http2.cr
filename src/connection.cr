@@ -67,6 +67,26 @@ module HTTP2
     @highest_peer_stream_id = 0_u32
     @last_processed_peer_stream_id = 0_u32
     @mutex = Mutex.new
+    # Lock-free mirrors of `@state`'s two boundary transitions that
+    # `#check_enqueueable!` needs on every call -- and it is called on
+    # every single write submission (`#enqueue`/`#enqueue_bounded`/
+    # `#enqueue_data`), the hottest, most contended per-write check in
+    # the class. Both are monotonic one-way ratchets, each flipped
+    # exactly once, inside the one `@mutex.synchronize` block that
+    # performs the corresponding `@state` transition:
+    #   - `@started_flag`: set in `#start`, at the same point `@state`
+    #     leaves `New` (the only place that happens).
+    #   - `@closed_flag`: set in `#terminate`, at the same (and only)
+    #     point `@state` becomes `Closed`.
+    # A `true` read of either is permanent and authoritative -- `@state`
+    # never reverses either transition, so there is nothing to race.
+    # A `false` read only means "not yet, as of some recent instant"; it
+    # is never treated as proof the connection is enqueueable, only as
+    # "nothing to reject yet". `@mutex`-guarded `@state` remains the
+    # sole source of truth these are derived from; nothing else reads or
+    # writes `@state` itself without holding `@mutex`.
+    @started_flag = Atomic(Bool).new(false)
+    @closed_flag = Atomic(Bool).new(false)
     @submission_mutex = Mutex.new
     @write_queue : Channel(WriteCommand)
     @data_queue : Channel(WriteCommand)
@@ -500,6 +520,7 @@ module HTTP2
         @write_queue.send(initial_command)
         @pending_settings << initial_acknowledgement
         @state = State::Handshaking
+        @started_flag.set(true)
         @writer_started = true
         @transport_closer_started = true
         spawn_transport_fiber("http2-writer") { writer_loop }
@@ -1522,12 +1543,35 @@ module HTTP2
       end
     end
 
+    # Lock-free fast path: `@closed_flag`/`@started_flag` are monotonic
+    # ratchets (see their declaration comment above `@mutex`), so reading
+    # them here needs no `@mutex.synchronize` at all -- this used to be a
+    # single lock/unlock pair around a `@state` read on every call,
+    # contending with `#terminate`/`#start` and every other `@mutex`
+    # user. This is exactly equivalent to the old `state.new?`/
+    # `state.closed?` check in every reachable case, including a
+    # connection `#close`d before ever being `#start`ed (`@state` jumps
+    # straight `New` -> `Closed`): `@closed_flag` is set either way, so
+    # the closed branch below fires first and "not started" is
+    # unreachable, matching the old single-read check (which would
+    # likewise observe `Closed`, never `New`, by then).
+    #
+    # A `#terminate` racing in right after this returns without raising
+    # does not lose the command: `#enqueue`'s subsequent
+    # `@write_queue.send` either raises `Channel::ClosedError` (queue
+    # already closed -- rescued, re-raised as the terminal error) or
+    # succeeds and buffers the command, in which case it is still
+    # completed: closing a `Channel` lets already-buffered sends keep
+    # being received afterward, and `#writer_loop`'s `ensure` block
+    # drains `@write_queue`/`@data_queue` to completion
+    # (`while command = @write_queue.receive? ... command.complete(error)`)
+    # on every exit from that loop, including this one.
     private def check_enqueueable! : Nil
-      current_state = state
-      if current_state.new?
-        raise InvalidStateError.new("connection has not been started")
-      end
-      raise_terminal_or_state! if current_state.closed?
+      raise_terminal_or_state! if @closed_flag.get
+
+      return if @started_flag.get
+
+      raise InvalidStateError.new("connection has not been started")
     end
 
     private def enqueue(command : WriteCommand) : Nil
@@ -1571,11 +1615,7 @@ module HTTP2
     end
 
     private def enqueue_data(command : WriteCommand, stream : Stream) : Nil
-      current_state = state
-      if current_state.new?
-        raise InvalidStateError.new("connection has not been started")
-      end
-      raise_terminal_or_state! if current_state.closed?
+      check_enqueueable!
 
       select
       when @data_queue.send(command)
@@ -3322,6 +3362,7 @@ module HTTP2
         else
           @terminal_error = error
           @state = State::Closed
+          @closed_flag.set(true)
           streams = @streams.values
           @streams.clear
           @request_reservations.clear
