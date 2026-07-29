@@ -81,17 +81,6 @@ module HTTP2
       build(header, payload)
     end
 
-    def self.from_io(
-      io : IO,
-      max_frame_size : Int = FrameHeader::DEFAULT_MAX_PAYLOAD,
-    ) : Frames
-      read(io, max_frame_size)
-    end
-
-    def stream
-      stream_id
-    end
-
     def data
       payload
     end
@@ -110,6 +99,7 @@ module HTTP2
       io.write(payload)
     end
 
+    # :nodoc:
     def to_slice : Bytes
       io = IO::Memory.new(FrameHeader::SIZE + payload.size)
       write(io)

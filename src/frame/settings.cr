@@ -71,15 +71,6 @@ module HTTP2
       flags.includes?(Flags::ACK)
     end
 
-    def ack
-      self.class.ack
-    end
-
-    # Kept as a readable alias while callers migrate from the old hash API.
-    def parameters
-      entries
-    end
-
     protected def validate!
       require_connection_stream!("SETTINGS")
 

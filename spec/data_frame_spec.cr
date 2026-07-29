@@ -28,11 +28,11 @@ describe HTTP2::Frame::Data do
     frame.data.should be_empty
   end
 
-  it "owns bytes consumed from an IO" do
+  it "keeps a caller-owned copy of bytes read from an IO independent of the source" do
     io = IO::Memory.new
     io << "body"
     io.rewind
-    frame = HTTP2::Frame::Data.new(0_u8, 1_u32, io)
+    frame = HTTP2::Frame::Data.new(0_u8, 1_u32, io.gets_to_end.to_slice.dup)
     io.clear
     frame.data.should eq("body".to_slice)
   end

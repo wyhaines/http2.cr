@@ -13,10 +13,6 @@ module HTTP2
       PADDED     = 0x08_u8
     end
 
-    def initialize(flags : UInt8, stream_id : UInt32, payload : IO)
-      initialize(flags, stream_id, payload.gets_to_end.to_slice.dup)
-    end
-
     def end_stream?
       flags.includes?(Flags::END_STREAM)
     end

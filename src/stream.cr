@@ -48,17 +48,6 @@ module HTTP2
       ReceiveWindowUpdate
       SendPushPromise
       ReceivePushPromise
-
-      def inbound?
-        receive_headers? ||
-          receive_headers_end_stream? ||
-          receive_data? ||
-          receive_data_end_stream? ||
-          receive_reset? ||
-          receive_priority? ||
-          receive_window_update? ||
-          receive_push_promise?
-      end
     end
 
     getter id : UInt32
