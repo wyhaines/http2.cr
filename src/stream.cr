@@ -59,9 +59,9 @@ module HTTP2
     getter body : StreamBody
 
     @events : Channel(StreamEvent)
-    @state : State = State::Idle
-    @send_window : Int64
-    @receive_window : Int64
+    @state : Atomic(State) = Atomic.new(State::Idle)
+    @send_window : Atomic(Int64)
+    @receive_window : Atomic(Int64)
     @terminal_signal = Channel(Nil).new
     @terminal_error : Exception?
     @inbound_validator : InboundValidator?
@@ -86,8 +86,8 @@ module HTTP2
         raise ArgumentError.new("stream event capacity must be positive")
       end
       @events = Channel(StreamEvent).new(event_capacity)
-      @send_window = send_window
-      @receive_window = receive_window
+      @send_window = Atomic.new(send_window)
+      @receive_window = Atomic.new(receive_window)
       @body = StreamBody.new(
         body_capacity,
         ->(amount : Int32) do
@@ -376,7 +376,7 @@ module HTTP2
     end
 
     def state : State
-      @mutex.synchronize { @state }
+      @state.get
     end
 
     def closed?
@@ -393,11 +393,11 @@ module HTTP2
     end
 
     def send_window : Int64
-      @mutex.synchronize { @send_window }
+      @send_window.get
     end
 
     def receive_window : Int64
-      @mutex.synchronize { @receive_window }
+      @receive_window.get
     end
 
     # Cancels an active stream with RST_STREAM(CANCEL). An idle stream has not
@@ -423,7 +423,7 @@ module HTTP2
     # :nodoc:
     def inbound_validator=(validator : InboundValidator) : Nil
       @mutex.synchronize do
-        unless @state.idle?
+        unless @state.get.idle?
           raise Connection::InvalidStateError.new(
             "an inbound validator must be installed before a stream opens"
           )
@@ -445,28 +445,42 @@ module HTTP2
     end
 
     # :nodoc:
+    #
+    # Not internally synchronized: every caller mutates a stream's state or
+    # windows only while holding the connection's own `@mutex` (see the
+    # invariant audit in `Stream`'s class comment / task-15 report), which
+    # already serializes the read-then-write sequences these four methods
+    # participate in. The one exception, `#terminate`, keeps its own
+    # `@mutex` around the compound `@terminal_error` check-and-set and folds
+    # this `@state` write into that same critical section.
     def transition_to(next_state : State) : Nil
-      @mutex.synchronize { @state = next_state }
+      @state.set(next_state)
     end
 
     # :nodoc:
+    #
+    # `Atomic#add` returns the OLD value, so the new (post-adjustment) value
+    # callers expect is the old value plus the delta just applied.
     def adjust_send_window(delta : Int64) : Int64
-      @mutex.synchronize { @send_window += delta }
+      @send_window.add(delta) + delta
     end
 
     # :nodoc:
     def send_window=(value : Int64) : Nil
-      @mutex.synchronize { @send_window = value }
+      @send_window.set(value)
     end
 
     # :nodoc:
+    #
+    # `Atomic#add` returns the OLD value, so the new (post-adjustment) value
+    # callers expect is the old value plus the delta just applied.
     def adjust_receive_window(delta : Int64) : Int64
-      @mutex.synchronize { @receive_window += delta }
+      @receive_window.add(delta) + delta
     end
 
     # :nodoc:
     def receive_window=(value : Int64) : Nil
-      @mutex.synchronize { @receive_window = value }
+      @receive_window.set(value)
     end
 
     # :nodoc:
@@ -506,7 +520,7 @@ module HTTP2
           false
         else
           @terminal_error = error
-          @state = State::Closed
+          @state.set(State::Closed)
           true
         end
       end
