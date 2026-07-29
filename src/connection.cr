@@ -848,6 +848,13 @@ module HTTP2
     end
 
     # Sends application data through the flow-control scheduler.
+    #
+    # `data` is sliced, not copied: `submit_data` (via `#command.wait`)
+    # blocks until each chunk's frame has been handed to the transport
+    # (successfully or not) before returning, so by the time this call
+    # returns, nothing internal to the connection still reads from `data`.
+    # The caller must leave `data` unmodified until this call returns; it
+    # is never retained afterward.
     def send_data(
       stream_id : UInt32,
       data : Bytes,
@@ -881,7 +888,7 @@ module HTTP2
           Frame::Data.new(
             flags,
             stream_id,
-            data[offset, size].dup
+            data[offset, size]
           )
         )
         offset += size
@@ -889,6 +896,14 @@ module HTTP2
     end
 
     # Streams DATA from the source's current position without rewinding it.
+    #
+    # Reads into two reusable buffers instead of allocating one per chunk.
+    # This is safe only because `#send_data(Bytes)` is synchronous: it
+    # blocks until the chunk it was given has been handed to the transport
+    # before returning, so a buffer is never refilled while a prior call
+    # might still be reading from it. `current` and `following` swap roles
+    # each iteration; the loop always reads into the buffer that was NOT
+    # just handed to `#send_data`.
     def send_data(
       stream_id : UInt32,
       source : IO,
@@ -897,7 +912,10 @@ module HTTP2
     ) : Nil
       ensure_registered_stream!(stream_id)
       chunk_size = @configuration.outbound_data_chunk_size
-      current = Bytes.new(chunk_size)
+      buffer_a = Bytes.new(chunk_size)
+      buffer_b = Bytes.new(chunk_size)
+      current = buffer_a
+      following = buffer_b
       current_size = source.read(current)
 
       if current_size.zero?
@@ -906,7 +924,6 @@ module HTTP2
       end
 
       loop do
-        following = Bytes.new(chunk_size)
         following_size = source.read(following)
         final = following_size.zero?
         send_data(
@@ -916,7 +933,7 @@ module HTTP2
         )
         break if final
 
-        current = following
+        current, following = following, current
         current_size = following_size
       end
     end
