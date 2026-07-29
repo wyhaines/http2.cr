@@ -886,6 +886,10 @@ module HTTP2
     end
 
     # Writes a frame batch without allowing another command to interleave.
+    # Validates every frame in array order and raises on the first one
+    # that's invalid to send this way; a batch containing more than one
+    # kind of invalid frame raises whichever category's error the first
+    # invalid frame belongs to, not a fixed category priority.
     def write_batch(frames : Array(Frames)) : Nil
       return if frames.empty?
 
@@ -3349,6 +3353,12 @@ module HTTP2
       state, closed = @mutex.synchronize do
         stream_state_and_closed_entry_unlocked(id)
       end
+      # Unlike the other four call sites of `stream_state_and_closed_entry_unlocked`,
+      # this `tolerates_late_frames?` check runs after `@mutex.synchronize`
+      # returns rather than inside it. Safe: `closed` is an immutable
+      # `ClosedStream` value copy (its `reason` never changes once
+      # retained), not a live reference into `@closed_streams`, so reading
+      # it outside the lock cannot race with another fiber's mutation.
       return if closed.try(&.tolerates_late_frames?)
 
       if state.active? || state.reserved_local? || state.reserved_remote?

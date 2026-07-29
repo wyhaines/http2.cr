@@ -441,4 +441,37 @@ describe HTTP2::Connection do
       end
     end
   end
+
+  it "raises the first invalid frame's error for a batch with more than one invalid frame" do
+    UNIXSocket.pair do |client, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+      end
+
+      connection = HTTP2::Connection.start(client)
+      begin
+        connection.wait_until_active(1.second)
+        wait_for_peer(peer_result)
+
+        # #write_batch validates in array order and raises on the first
+        # invalid frame it finds -- it does NOT check every frame against
+        # a fixed category priority (DATA before WINDOW_UPDATE, say) and
+        # raise whichever category comes first regardless of position.
+        # Putting the WINDOW_UPDATE frame before the DATA frame here must
+        # raise WINDOW_UPDATE's error; a fixed category priority would
+        # have raised DATA's error instead, since DATA used to be checked
+        # first regardless of where either frame sat in the array.
+        expect_raises(ArgumentError, /WINDOW_UPDATE/) do
+          connection.write_batch(
+            [
+              HTTP2::Frame::WindowUpdate.new(0_u32, 1024_u32),
+              HTTP2::Frame::Data.new(0_u8, 1_u32, "x"),
+            ] of HTTP2::Frames
+          )
+        end
+      ensure
+        connection.close
+      end
+    end
+  end
 end
