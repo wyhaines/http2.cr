@@ -10,6 +10,13 @@ module HTTP2
     Preface          = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_slice
     DrainQuietPeriod = 10.milliseconds
 
+    # Upper bound on how many `WriteCommand`s the writer fiber stages
+    # into the transport buffer before forcing a flush (`#writer_loop`,
+    # `#flush_batch`), even if more immediately-available work remains.
+    # Keeps a single flush's completion latency bounded under sustained
+    # load instead of growing unboundedly with queue depth.
+    MAX_BATCH = 64
+
     enum State
       New
       Handshaking
@@ -201,12 +208,16 @@ module HTTP2
 
       # Cleartext TCP defaults to `sync = true` (every write is its own
       # `send(2)`); buffering lets the writer coalesce a frame's header and
-      # payload, and multi-frame batches, into fewer syscalls. This is safe
-      # only because every writer code path that writes to `@transport`
-      # (`process_write_command`, `write_scheduled_frames`,
-      # `write_scheduled_data`) calls `@transport.flush` immediately
-      # afterward, before the writer fiber can next block waiting for work —
-      # see the flush audit in the P1.8 task report.
+      # payload, several commands, and several scheduled DATA frames, into
+      # a single `send(2)` per batch (`#writer_loop`/`#flush_batch`). This
+      # is safe only because every staged byte is memcpy'd into
+      # `@transport`'s own buffer (`#stage_write_command`, `#stage_frames`,
+      # `#stage_scheduled_data`) before the writer fiber can next block
+      # waiting for work, and `#flush_batch` flushes the whole batch — and
+      # completes every command in it — before that park; see the
+      # zero-copy tripwire on `#stage_scheduled_data` for the full
+      # argument, and the flush audit in the P1.8 task report for the
+      # original single-command-per-flush version of this property.
       #
       # `IO::Buffered`'s default buffer is not guaranteed to hold a full
       # frame: if it's smaller than `header + payload`, the buffered header
@@ -485,9 +496,9 @@ module HTTP2
       # check below — either a caller's own public, unguarded `#close`
       # (a thin wrapper around the private `#terminate`), or the writer
       # fiber spawned above reaching that same private `#terminate`
-      # itself, on its own, after a transport write failure (see
-      # `#process_write_command`/`#write_scheduled_frames`) — without the
-      # guard, either race could spawn a reader fiber on a connection
+      # itself, on its own, after a transport write or flush failure (see
+      # `#stage_write_command`/`#stage_frames`/`#flush_batch`) — without
+      # the guard, either race could spawn a reader fiber on a connection
       # that is already closed.
       delta = @configuration.connection_receive_window.to_i64 -
               SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
@@ -851,11 +862,11 @@ module HTTP2
     #
     # Under the default single-threaded runtime, `data` is sliced, not
     # copied: `submit_data` (via `#command.wait`) blocks until each
-    # chunk's frame has been handed to the transport (successfully or
-    # not) before returning, so by the time this call returns, nothing
-    # internal to the connection still reads from `data`. See
-    # `#write_scheduled_data`'s comment for the three invariants that
-    # guarantee this.
+    # chunk's frame has been memcpy'd into the transport buffer and its
+    # batch has either flushed or failed (see `#flush_batch`) before
+    # returning, so by the time this call returns, nothing internal to
+    # the connection still reads from `data`. See `#stage_scheduled_data`'s
+    # comment for the invariants that guarantee this.
     #
     # Under `-Dpreview_mt`, `#owned_for_write` takes a private copy of
     # each chunk instead: `#terminate` is reachable from fibers not
@@ -1229,7 +1240,7 @@ module HTTP2
     # fiber: a bare #submit_nowait would race the GOAWAY against the
     # reader's own #terminate on a HEALTHY connection — #terminate closes
     # @write_queue and the transport without flushing, and
-    # #process_write_command completes-with-error once a terminal error is
+    # #stage_write_command completes-with-error once a terminal error is
     # set, so a nowait-then-terminate sequence can drop the GOAWAY even
     # when the peer was reading fine, trading RFC 9113 5.4.1's "send
     # GOAWAY before closing" on the common path for a rare-path
@@ -1300,7 +1311,7 @@ module HTTP2
 
     # Returns a slice `#send_data(Bytes)` can hand to `#submit_data`
     # without further copying, under the default single-threaded
-    # runtime — a synchronous chunk transfer where `#write_scheduled_data`
+    # runtime — a synchronous chunk transfer where `#stage_scheduled_data`
     # (see its comment) guarantees the transport has already copied the
     # bytes elsewhere before this method's caller can regain control.
     #
@@ -1498,35 +1509,63 @@ module HTTP2
       raise_terminal_or_state!
     end
 
+    # Batches writer work instead of flushing after every command or every
+    # scheduled DATA frame: each pass through the loop stages as much
+    # immediately-available work as it can (up to `MAX_BATCH` commands,
+    # plus whatever pending flow-control credit and scheduled DATA
+    # `#no_immediate_work?` finds) into `@transport`'s buffer without
+    # flushing or completing anything, then `#flush_batch` issues one
+    # flush and completes every staged command together. This is also the
+    # fix for the WINDOW_UPDATE starvation valve the review flagged: credit
+    # (`#take_pending_window_updates`) and scheduled DATA are folded into
+    # *every* batch, between control-command bursts, instead of only being
+    # serviced when the command queue runs dry — a continuously-refilled
+    # `@write_queue` can no longer defer outbound credit indefinitely.
+    #
+    # Command completion still only ever happens after the bytes reaching
+    # it are actually flushed (batching moves completion later than the
+    # old per-command flush, never earlier): `#stage_write_command`,
+    # `#stage_frames`, and `#stage_scheduled_data` only write into the
+    # transport's buffer and (for commands) append to `completions`;
+    # `#flush_batch` is the only place completions are delivered. A
+    # materialization failure still completes its command with the error
+    # immediately, exactly as before — no bytes were staged for it, so
+    # there is nothing to defer.
+    #
+    # A write or flush error is fatal to the whole batch, matching today's
+    # per-command behavior: `#stage_write_command`, `#stage_frames`,
+    # `#stage_scheduled_data`, and `#flush_batch` each complete every
+    # command already staged in `completions` (plus their own command, if
+    # any) with that error and call `#terminate`, rather than only failing
+    # the one command that happened to trip the error. Once `terminal_error`
+    # is set this way, `completions` is always left empty by whichever of
+    # those four completed it — see `#no_immediate_work?` and the `ensure`
+    # below, which additionally fails anything `completions` might still
+    # hold (a `#terminate` triggered by another fiber mid-batch, e.g. the
+    # reader on a protocol violation, is the only way that can happen) so
+    # a batch in flight when the connection dies from the outside can never
+    # strand a submitter in `WriteCommand#wait`.
     private def writer_loop : Nil
+      completions = Array(WriteCommand).new(MAX_BATCH)
+      capacity_changed = false
       loop do
-        if command = poll_write_command
-          process_write_command(command)
-          next
+        while completions.size < MAX_BATCH && (command = poll_write_command)
+          capacity_changed |= stage_write_command(command, completions)
         end
-        break if terminal_error
+        break if terminal_error && completions.empty?
 
-        if frames = take_pending_window_updates
-          write_scheduled_frames(frames)
-          next
-        end
-
-        if command = poll_data_command
-          enqueue_pending_data(command)
-        end
-
-        if scheduled = next_scheduled_data_frame
-          command, frame = scheduled
-          if write_scheduled_data(command, frame)
-            finish_scheduled_data(command, frame)
-          end
-          next
-        end
-
-        wait_for_writer_work
+        idle = stage_available_flow_control_and_data(completions)
+        capacity_changed = flush_and_park_if_idle(completions, capacity_changed, idle)
       end
     ensure
       error = terminal_error || ClosedError.new("HTTP/2 writer stopped")
+      # `completions` is typed nilable here only because Crystal's `ensure`
+      # analysis can't prove its assignment above always runs before an
+      # exception; it always has — `#stage_write_command`/`#stage_frames`/
+      # `#stage_scheduled_data`/`#flush_batch` all handle their own write
+      # and flush errors internally and never raise out of the loop body.
+      # `#try` is defensive only.
+      completions.try(&.each(&.complete(error)))
       while command = @write_queue.receive?
         command.complete(error)
       end
@@ -1557,32 +1596,141 @@ module HTTP2
       command
     end
 
-    private def wait_for_writer_work : Nil
-      # Data commands are admitted unconditionally: each sender fiber blocks
-      # on its command, so parked commands are bounded by sending fibers,
-      # not by writer_queue_capacity. A window-0 stream therefore cannot
-      # starve streams that still have credit.
+    # Stages the non-control-command work `#writer_loop` folds into every
+    # batch — pending flow-control credit, one newly-arrived DATA command,
+    # and one ready scheduled DATA frame — and reports whether any of the
+    # three turned up anything (see `#no_immediate_work?`). Split out of
+    # `#writer_loop` itself purely to keep that method's branching
+    # shallow; the three steps below still run in the same order, once
+    # per outer-loop iteration, that the fairness argument in
+    # `#writer_loop`'s own comment depends on.
+    private def stage_available_flow_control_and_data(
+      completions : Array(WriteCommand),
+    ) : Bool
+      frames = take_pending_window_updates
+      stage_frames(frames, completions) if frames
+
+      data_command = poll_data_command
+      enqueue_pending_data(data_command) if data_command
+
+      scheduled = next_scheduled_data_frame
+      if scheduled
+        sched_command, frame = scheduled
+        stage_scheduled_data(sched_command, frame, completions)
+      end
+
+      no_immediate_work?(frames, data_command, scheduled)
+    end
+
+    # Whether this iteration of `#writer_loop` turned up any immediately
+    # available work: `frames`, `data_command`, and `scheduled` are exactly
+    # the results this iteration already fetched from
+    # `#take_pending_window_updates`, `#poll_data_command`, and
+    # `#next_scheduled_data_frame` — this method takes them as parameters
+    # instead of re-querying those sources itself because
+    # `#next_scheduled_data_frame` is not a safe thing to call twice: on a
+    # hit it reserves flow-control credit (`#plan_scheduled_data_frame`)
+    # as a side effect, and on a miss (schedule non-empty but every
+    # candidate blocked on flow control) calling it again immediately
+    # would just busy-spin instead of parking in `#wait_for_writer_work`
+    # until a `WINDOW_UPDATE` or new command actually arrives. Reusing this
+    # iteration's results keeps the check free of side effects while still
+    # being accurate.
+    private def no_immediate_work?(
+      frames : Array(Frames)?,
+      data_command : WriteCommand?,
+      scheduled : Tuple(WriteCommand, Frame::Data)?,
+    ) : Bool
+      frames.nil? && data_command.nil? && scheduled.nil?
+    end
+
+    # The batch-boundary decision `#writer_loop` makes every iteration:
+    # flush what's staged once the batch is full or nothing more is
+    # immediately available, then park for new work if the batch is now
+    # empty and still nothing is available. Returns the `capacity_changed`
+    # flag to carry into the next iteration (reset after a flush; folded
+    # with whatever `#wait_for_writer_work` staged, if it staged a write
+    # command while parked).
+    private def flush_and_park_if_idle(
+      completions : Array(WriteCommand),
+      capacity_changed : Bool,
+      idle : Bool,
+    ) : Bool
+      if completions.size >= MAX_BATCH || idle
+        # A fatal write error already failed and cleared `completions`
+        # (see `#stage_write_command`/`#stage_frames`/
+        # `#stage_scheduled_data`) and called `#terminate`, which itself
+        # unconditionally notifies pool-state subscribers — skip the
+        # redundant flush attempt in that case. If `completions` is
+        # non-empty despite `terminal_error` (another fiber terminated
+        # the connection mid-batch), still attempt the flush: those bytes
+        # are already staged and may still be deliverable.
+        flush_batch(completions, capacity_changed) unless completions.empty? && terminal_error
+        capacity_changed = false
+      end
+
+      if completions.empty? && idle
+        capacity_changed |= wait_for_writer_work(completions)
+      end
+
+      capacity_changed
+    end
+
+    # Parks until new work arrives, staging (but not flushing) whichever
+    # kind shows up so the next pass through `#writer_loop` folds it into
+    # a batch like anything else. Returns whether pool capacity changed,
+    # for the caller to fold into its running `capacity_changed` flag —
+    # mirrors `#stage_write_command`'s contract, since a write command can
+    # arrive on this path too.
+    #
+    # Data commands are admitted unconditionally: each sender fiber blocks
+    # on its command, so parked commands are bounded by sending fibers,
+    # not by writer_queue_capacity. A window-0 stream therefore cannot
+    # starve streams that still have credit.
+    private def wait_for_writer_work(completions : Array(WriteCommand)) : Bool
       select
       when command = @write_queue.receive?
-        process_write_command(command) if command
+        command ? stage_write_command(command, completions) : false
       when command = @data_queue.receive?
         enqueue_pending_data(command) if command
+        false
       when @flow_control_wakeup.receive?
+        false
       end
     end
 
-    private def process_write_command(command : WriteCommand) : Nil
+    # Stages one control command's frames into `@transport`'s buffer
+    # without flushing or completing it: on success the command is
+    # appended to `completions` for `#flush_batch` to complete once the
+    # batch's single flush succeeds. Returns whether this command changed
+    # pool capacity (a stream closed), for the caller to OR into the
+    # batch-wide flag `#flush_batch` uses to decide whether to call
+    # `#notify_pool_state`.
+    #
+    # A materialization failure (bad state, encoder error) staged no
+    # bytes, so that command completes immediately here, exactly as
+    # before batching. A failure while writing already-materialized
+    # frames into the transport buffer is different: other commands
+    # already in `completions` this batch may already have bytes sitting
+    # in the same (now possibly corrupted) buffer ahead of this one,
+    # unflushed — so this command's write error fails the entire batch
+    # (`completions.each(&.complete(error))`) and terminates the
+    # connection, matching `#flush_batch`'s own error handling.
+    private def stage_write_command(
+      command : WriteCommand,
+      completions : Array(WriteCommand),
+    ) : Bool
       if command.data_block
         if error = terminal_error
           command.complete(error)
         else
           enqueue_pending_data(command)
         end
-        return
+        return false
       end
       if error = terminal_error
         command.complete(error)
-        return
+        return false
       end
 
       begin
@@ -1593,7 +1741,7 @@ module HTTP2
         frames = materialize_frames(command)
       rescue error
         command.complete(error)
-        return
+        return false
       end
 
       begin
@@ -1602,26 +1750,71 @@ module HTTP2
           frame.write(@transport)
           emit_frame(frame, Diagnostic::Direction::Outbound)
         end
-        @transport.flush
-        command.complete
+        # Safe to mark the preface sent as soon as its bytes are queued
+        # (not once they're actually flushed): `@transport`'s buffer
+        # preserves write order, `#writer_loop` only ever considers
+        # window-update/scheduled-DATA frames for the *same* batch after
+        # this command has already been staged, and any later flush
+        # failure fails this command (and the whole batch) via the
+        # `rescue` below, exactly as it would have before batching.
         @mutex.synchronize { @preface_sent = true } if command.preface?
-        notify_pool_state if capacity_changed
-        wake_drain_monitor
+        completions << command
+        capacity_changed
       rescue error
+        completions.each(&.complete(error))
+        completions.clear
         command.complete(error)
         terminate(error)
+        false
       end
     end
 
-    private def write_scheduled_frames(frames : Array(Frames)) : Nil
+    # Stages already-computed WINDOW_UPDATE frames into the transport
+    # buffer. These have no owning `WriteCommand` (nothing waits on a
+    # WINDOW_UPDATE), so a write error here has nothing of its own to
+    # complete — it still fails every command already staged in
+    # `completions` this batch and terminates, matching every other
+    # writer error path.
+    private def stage_frames(
+      frames : Array(Frames),
+      completions : Array(WriteCommand),
+    ) : Nil
       frames.each do |frame|
         frame.write(@transport)
         emit_frame(frame, Diagnostic::Direction::Outbound)
       end
-      @transport.flush
-      wake_drain_monitor
     rescue error
+      completions.each(&.complete(error))
+      completions.clear
       terminate(error)
+    end
+
+    # The only place a batch's staged bytes are flushed and its commands
+    # completed. A no-op if nothing was staged and no command changed pool
+    # capacity (nothing to flush, nothing to notify). On flush failure,
+    # every staged command completes with that error instead of success —
+    # their bytes reached `@transport`'s buffer but never the peer — and
+    # the connection terminates, identical to a single-command flush
+    # failure before batching.
+    private def flush_batch(
+      completions : Array(WriteCommand),
+      capacity_changed : Bool,
+    ) : Nil
+      return if completions.empty? && !capacity_changed
+
+      begin
+        @transport.flush
+      rescue error
+        completions.each(&.complete(error))
+        completions.clear
+        terminate(error)
+        return
+      end
+
+      completions.each(&.complete)
+      completions.clear
+      notify_pool_state if capacity_changed
+      wake_drain_monitor
     end
 
     private def enqueue_pending_data(command : WriteCommand) : Nil
@@ -1772,11 +1965,17 @@ module HTTP2
     #       transport-closer fibers to one OS thread under
     #       `-Dpreview_mt` (irrelevant, but also harmless, when that
     #       flag is off, since there is only one thread regardless);
-    #   (b) every writer code path that touches `@transport`
-    #       (`#process_write_command`, `#write_scheduled_frames`, and
-    #       this method) calls `@transport.flush` immediately after
-    #       writing, before the writer fiber can next block waiting
-    #       for work;
+    #   (b) every staged byte is memcpy'd into `@transport`'s own
+    #       buffer before the writer fiber can next park in
+    #       `#wait_for_writer_work`: the memcpy happens right here, in
+    #       this method's `frame.write(@transport)` call, and
+    #       `#flush_batch` — the only place a batch's commands get
+    #       completed — always flushes and completes this command
+    #       strictly before that next park. Batching changed *when*
+    #       the flush happens (once per batch instead of once per
+    #       frame), not whether the memcpy precedes both the flush and
+    #       the completion the caller's `WriteCommand#wait` is blocked
+    #       on;
     #   (c) `@transport`'s `buffer_size` is sized (see `.connect` /
     #       `.start_tls`) to `>= outbound_data_chunk_size +
     #       FrameHeader::SIZE`, so `IO::Buffered#write` always takes
@@ -1787,25 +1986,34 @@ module HTTP2
     # `#owned_for_write` exists to close under `-Dpreview_mt`, and
     # would make the same race live under the default single-threaded
     # runtime too.
-    private def write_scheduled_data(
+    #
+    # HEADERS/CONTINUATION frames (`#materialize_frames`, sized by the
+    # peer's negotiated `SETTINGS_MAX_FRAME_SIZE`) can exceed
+    # `buffer_size` and fall through to a direct `unbuffered_write` of
+    # the slice being written — but that slice is this connection's
+    # own HPACK encoder output, never a caller-owned buffer, so (c)'s
+    # exemption there doesn't reopen the race for the DATA payloads
+    # this method exists to protect.
+    #
+    # Derived from the pre-batching `#write_scheduled_data` and
+    # `#finish_scheduled_data`, merged: the stream/window bookkeeping
+    # `#finish_scheduled_data` used to do (advancing the block's offset,
+    # shifting the per-stream queue, re-scheduling the stream) still
+    # runs unconditionally, per frame, before this method returns —
+    # only the user-visible `command.complete` moved, deferred to
+    # `completions` for `#flush_batch` to deliver once the whole batch
+    # flushes. That split matters: bookkeeping must stay synchronous
+    # with the write (the next call to `#next_scheduled_data_frame`
+    # needs `@pending_data`/`@data_schedule` already updated), while
+    # completion must wait for the flush, like every other command.
+    private def stage_scheduled_data(
       command : WriteCommand,
       frame : Frame::Data,
-    ) : Bool
+      completions : Array(WriteCommand),
+    ) : Nil
       frame.write(@transport)
       emit_frame(frame, Diagnostic::Direction::Outbound)
-      @transport.flush
-      wake_drain_monitor
-      true
-    rescue error
-      command.complete(error)
-      terminate(error)
-      false
-    end
 
-    private def finish_scheduled_data(
-      command : WriteCommand,
-      frame : Frame::Data,
-    ) : Nil
       block = command.data_block
       return unless block
 
@@ -1814,9 +2022,14 @@ module HTTP2
       queue = @pending_data[stream_id]
       if block.complete?
         queue.shift
-        command.complete
+        completions << command
       end
       retain_data_stream(stream_id, queue)
+    rescue error
+      completions.each(&.complete(error))
+      completions.clear
+      command.complete(error)
+      terminate(error)
     end
 
     private def retain_data_stream(
@@ -2647,8 +2860,8 @@ module HTTP2
       # would (correctly) no-op for a stream it can no longer find.
       #
       # Unlike the branch above, nothing gets written to the transport
-      # here (no RST is sent), so `process_write_command`'s own
-      # post-flush `wake_drain_monitor` call never fires for this
+      # here (no RST is sent), so `flush_batch`'s own post-flush
+      # `wake_drain_monitor` call never fires for this
       # closure — wake it explicitly so a graceful drain waiting on
       # exactly this stream (if it happened to be the last active one)
       # notices promptly instead of idling until the next unrelated
