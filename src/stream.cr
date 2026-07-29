@@ -495,7 +495,13 @@ module HTTP2
     end
 
     # :nodoc:
-    # The slice is owned by the body from this call on.
+    # The body takes ownership of the slice only when delivery succeeds
+    # (a `true` return, including the empty-slice case). On a `false`
+    # return (body already closed/finished/terminated, or over capacity),
+    # the body never stored the slice, so no ownership was taken — the
+    # caller still owns it and is responsible for it (see
+    # `Connection#handle_inbound_data`'s flow-control-credit release on
+    # the `false` branch).
     def deliver_data(data : Bytes) : Bool
       @body.enqueue(data)
     end
