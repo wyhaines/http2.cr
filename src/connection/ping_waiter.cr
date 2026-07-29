@@ -2,12 +2,12 @@ module HTTP2
   class Connection
     # :nodoc:
     class PingWaiter
-      getter key : String
+      getter key : UInt64
 
       @completion = Channel(Exception?).new(1)
 
       def initialize(payload : Bytes)
-        @key = String.new(payload)
+        @key = IO::ByteFormat::BigEndian.decode(UInt64, payload)
       end
 
       def complete(error : Exception? = nil) : Nil

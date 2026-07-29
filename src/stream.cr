@@ -645,4 +645,24 @@ module HTTP2
     class WaitCanceledError < Exception
     end
   end
+
+  # Aborts *stream* with *error*, swallowing the `Connection::InvalidStateError`
+  # `Stream#abort` raises when the stream already reached a terminal state
+  # before this call — the ordinary outcome of losing a race against the
+  # stream's own natural close, not a failure the caller needs to see.
+  # Any OTHER exception `#abort` raises is a genuine failure and still
+  # propagates. Shared by `Client` and `Response`, which both abort a
+  # stream from several different error-handling paths and previously
+  # each hand-rolled this same rescue.
+  #
+  # :nodoc:
+  def self.abort_stream_quietly(
+    stream : Stream,
+    error : Exception,
+    error_code : ErrorCode = ErrorCode::CANCEL,
+  ) : Nil
+    stream.abort(error, error_code)
+  rescue error : Connection::InvalidStateError
+    raise error unless stream.closed? || stream.terminal_error
+  end
 end

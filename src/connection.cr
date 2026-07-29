@@ -129,13 +129,13 @@ module HTTP2
     # per connection, immediately after `start`.
     @pre_ack_push_promise_count = 0
     @streams = {} of UInt32 => Stream
-    @request_reservations = {} of UInt64 => Bool
+    @request_reservations = Set(UInt64).new
     @next_request_reservation_id = 0_u64
     @closed_streams = {} of UInt32 => ClosedStream
     @closed_stream_order = [] of UInt32
     @stream_ids = StreamIDAllocator.new
     @pending_settings = [] of SettingsAcknowledgement
-    @pending_pings = {} of String => Array(PingWaiter)
+    @pending_pings = {} of UInt64 => Array(PingWaiter)
     @connection_send_window : Int64 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
     @connection_receive_window : Int64 = SettingsState::DEFAULT_INITIAL_WINDOW_SIZE.to_i64
     @pending_connection_window_update : Int64 = 0_i64
@@ -688,7 +688,7 @@ module HTTP2
 
         @next_request_reservation_id += 1_u64
         id = @next_request_reservation_id
-        @request_reservations[id] = true
+        @request_reservations << id
         RequestSlotReservation.new(self, id)
       end
     end
@@ -708,8 +708,8 @@ module HTTP2
 
       exhausted = false
       stream = @mutex.synchronize do
-        unless @request_reservations.has_key?(reservation.id)
-          raise InvalidStateError.new(
+        unless @request_reservations.includes?(reservation.id)
+          raise RetryableInvalidStateError.new(
             "request-slot reservation is no longer pending"
           )
         end
@@ -740,7 +740,7 @@ module HTTP2
       end
 
       released = @mutex.synchronize do
-        !@request_reservations.delete(reservation.id).nil?
+        @request_reservations.delete(reservation.id)
       end
       notify_pool_state if released
     end
@@ -888,31 +888,35 @@ module HTTP2
     # Writes a frame batch without allowing another command to interleave.
     def write_batch(frames : Array(Frames)) : Nil
       return if frames.empty?
-      if frames.any? { |frame| outbound_field_block_frame?(frame) }
-        raise ArgumentError.new(
-          "field blocks must be sent with #send_headers"
-        )
-      end
-      if frames.any?(Frame::Data)
-        raise ArgumentError.new(
-          "DATA frames must be sent individually or with #send_data"
-        )
-      end
-      if frames.any? { |frame| frame.is_a?(Frame::Settings) && !frame.ack? }
-        raise ArgumentError.new(
-          "non-ACK SETTINGS frames must be sent with #send_settings"
-        )
-      end
-      if frames.any?(Frame::WindowUpdate)
-        raise ArgumentError.new(
-          "WINDOW_UPDATE frames are managed by connection flow control; " \
-          "receive credit is returned by consuming stream bodies"
-        )
-      end
-      if frames.any? { |frame| frame.is_a?(Frame::Settings) && frame.ack? }
-        raise ArgumentError.new(
-          "SETTINGS acknowledgements are sent automatically by the connection"
-        )
+
+      frames.each do |frame|
+        case frame
+        when Frame::Data
+          raise ArgumentError.new(
+            "DATA frames must be sent individually or with #send_data"
+          )
+        when Frame::WindowUpdate
+          raise ArgumentError.new(
+            "WINDOW_UPDATE frames are managed by connection flow control; " \
+            "receive credit is returned by consuming stream bodies"
+          )
+        when Frame::Settings
+          if frame.ack?
+            raise ArgumentError.new(
+              "SETTINGS acknowledgements are sent automatically by the connection"
+            )
+          else
+            raise ArgumentError.new(
+              "non-ACK SETTINGS frames must be sent with #send_settings"
+            )
+          end
+        else
+          if outbound_field_block_frame?(frame)
+            raise ArgumentError.new(
+              "field blocks must be sent with #send_headers"
+            )
+          end
+        end
       end
 
       submit(WriteCommand.new(frames.dup))
@@ -1473,13 +1477,21 @@ module HTTP2
       false
     end
 
-    private def wake_flow_control : Nil
+    # Common body for the connection's fire-and-forget wakeup channels:
+    # a non-blocking send (a full channel means a wakeup is already
+    # pending, so there's nothing to do) that swallows `ClosedError`
+    # (connection shutdown already closed the channel and woke whatever
+    # was waiting on it).
+    private def try_signal(channel : Channel(Nil)) : Nil
       select
-      when @flow_control_wakeup.send(nil)
+      when channel.send(nil)
       else
       end
     rescue Channel::ClosedError
-      # Connection shutdown already woke the writer.
+    end
+
+    private def wake_flow_control : Nil
+      try_signal(@flow_control_wakeup)
     end
 
     private def send_reset(
@@ -1571,7 +1583,7 @@ module HTTP2
 
       return if @started_flag.get
 
-      raise InvalidStateError.new("connection has not been started")
+      raise RetryableInvalidStateError.new("connection has not been started")
     end
 
     private def enqueue(command : WriteCommand) : Nil
@@ -2516,8 +2528,7 @@ module HTTP2
       event : Stream::Event,
     ) : Nil
       @mutex.synchronize do
-        state = stream_state_unlocked(stream_id)
-        closed = @closed_streams[stream_id]?
+        state, closed = stream_state_and_closed_entry_unlocked(stream_id)
         return if closed.try(&.tolerates_late_frames?)
 
         if state.idle?
@@ -2565,8 +2576,7 @@ module HTTP2
           )
         end
 
-        parent_state = stream_state_unlocked(frame.stream_id)
-        closed = @closed_streams[frame.stream_id]?
+        parent_state, closed = stream_state_and_closed_entry_unlocked(frame.stream_id)
         unless closed.try(&.tolerates_late_frames?)
           transition = Stream::StateMachine.transition(
             parent_state,
@@ -3063,8 +3073,7 @@ module HTTP2
       stream_id : UInt32,
       event : Stream::Event,
     ) : Tuple(Stream::State, Stream::StateMachine::Transition)?
-      state = stream_state_unlocked(stream_id)
-      closed = @closed_streams[stream_id]?
+      state, closed = stream_state_and_closed_entry_unlocked(stream_id)
       return if closed.try(&.tolerates_late_frames?)
 
       transition = Stream::StateMachine.transition(state, event)
@@ -3094,8 +3103,7 @@ module HTTP2
 
     private def handle_inbound_reset(frame : Frame::ResetStream) : Nil
       stream, ignored = @mutex.synchronize do
-        state = stream_state_unlocked(frame.stream_id)
-        closed = @closed_streams[frame.stream_id]?
+        state, closed = stream_state_and_closed_entry_unlocked(frame.stream_id)
         if closed
           next {nil, true}
         end
@@ -3146,22 +3154,34 @@ module HTTP2
       wake_drain_monitor
     end
 
-    private def stream_state_unlocked(stream_id : UInt32) : Stream::State
+    # Single-lookup answer to the two questions every inbound
+    # frame-event handler asks together about a stream ID: its
+    # `Stream::State` for the state-machine transition, and — if it
+    # resolved via `@closed_streams` rather than a live `@streams`
+    # entry — the retained `ClosedStream` itself, which callers use to
+    # decide whether a late frame is tolerated (see
+    # `ClosedStream#tolerates_late_frames?`). Replaces what used to be
+    # a `stream_state_unlocked` call followed by a separate
+    # `@closed_streams[id]?` re-lookup at every call site.
+    private def stream_state_and_closed_entry_unlocked(
+      stream_id : UInt32,
+    ) : Tuple(Stream::State, ClosedStream?)
       if stream = @streams[stream_id]?
-        stream.state
-      elsif @closed_streams.has_key?(stream_id)
-        Stream::State::Closed
+        {stream.state, nil}
+      elsif closed = @closed_streams[stream_id]?
+        {Stream::State::Closed, closed}
       elsif stream_id.odd?
-        if stream_id <= @highest_local_opened_stream_id
-          Stream::State::Closed
-        else
-          Stream::State::Idle
-        end
+        state = stream_id <= @highest_local_opened_stream_id ? Stream::State::Closed : Stream::State::Idle
+        {state, nil}
       elsif stream_id <= @highest_peer_stream_id
-        Stream::State::Closed
+        {Stream::State::Closed, nil}
       else
-        Stream::State::Idle
+        {Stream::State::Idle, nil}
       end
+    end
+
+    private def stream_state_unlocked(stream_id : UInt32) : Stream::State
+      stream_state_and_closed_entry_unlocked(stream_id).first
     end
 
     private def handle_ping(frame : Frame::Ping) : Nil
@@ -3171,7 +3191,7 @@ module HTTP2
       end
 
       waiter = @mutex.synchronize do
-        key = String.new(frame.payload)
+        key = IO::ByteFormat::BigEndian.decode(UInt64, frame.payload)
         if waiters = @pending_pings[key]?
           matched = waiters.shift?
           @pending_pings.delete(key) if waiters.empty?
@@ -3326,11 +3346,10 @@ module HTTP2
         )
       end
 
-      state, tolerate = @mutex.synchronize do
-        closed = @closed_streams[id]?
-        {stream_state_unlocked(id), closed.try(&.tolerates_late_frames?) || false}
+      state, closed = @mutex.synchronize do
+        stream_state_and_closed_entry_unlocked(id)
       end
-      return if tolerate
+      return if closed.try(&.tolerates_late_frames?)
 
       if state.active? || state.reserved_local? || state.reserved_remote?
         handle_stream_violation(error)
@@ -3675,21 +3694,11 @@ module HTTP2
 
       return unless @drain_started
 
-      select
-      when @drain_wakeup.send(nil)
-      else
-      end
-    rescue Channel::ClosedError
-      # Connection shutdown already woke the monitor.
+      try_signal(@drain_wakeup)
     end
 
     private def wake_stream_slot_waiters : Nil
-      select
-      when @stream_slot_wakeup.send(nil)
-      else
-      end
-    rescue Channel::ClosedError
-      # Connection shutdown already woke any waiters.
+      try_signal(@stream_slot_wakeup)
     end
 
     private def start_keepalive : Nil
@@ -3813,12 +3822,7 @@ module HTTP2
     end
 
     private def notify_keepalive_activity : Nil
-      select
-      when @keepalive_wakeup.send(nil)
-      else
-      end
-    rescue Channel::ClosedError
-      # Connection shutdown already woke keepalive.
+      try_signal(@keepalive_wakeup)
     end
 
     private def emit_frame(
@@ -3974,12 +3978,7 @@ module HTTP2
     end
 
     private def wake_settings_timer : Nil
-      select
-      when @settings_timer_wakeup.send(nil)
-      else
-      end
-    rescue Channel::ClosedError
-      # Connection shutdown already woke the timer.
+      try_signal(@settings_timer_wakeup)
     end
 
     private def remove_pending_settings(
@@ -4244,7 +4243,7 @@ module HTTP2
       unless stream
         return {highest_local_id, plans} if event.send_priority?
 
-        raise InvalidStateError.new(
+        raise RetryableInvalidStateError.new(
           "stream #{stream_id} is not active on this connection"
         )
       end
@@ -4305,7 +4304,7 @@ module HTTP2
         )
       end
       if stream_id <= highest_local_id
-        raise InvalidStateError.new(
+        raise RetryableInvalidStateError.new(
           "stream #{stream_id} was skipped by a higher stream identifier"
         )
       end
@@ -4499,7 +4498,7 @@ module HTTP2
 
       @mutex.synchronize do
         unless @streams.has_key?(stream_id)
-          raise InvalidStateError.new(
+          raise RetryableInvalidStateError.new(
             "stream #{stream_id} is not registered on this connection"
           )
         end
@@ -4588,7 +4587,7 @@ module HTTP2
         )
       end
       unless @state.active?
-        raise InvalidStateError.new(
+        raise RetryableInvalidStateError.new(
           "request streams require an active connection"
         )
       end

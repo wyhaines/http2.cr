@@ -106,16 +106,20 @@ module HTTP2
         @idle : Time::Span? = 30.seconds,
         @stream_slot : Time::Span? = nil,
       )
-        {
-          "connect"     => @connect,
-          "read"        => @read,
-          "write"       => @write,
-          "idle"        => @idle,
-          "stream_slot" => @stream_slot,
-        }.each do |name, duration|
-          if duration && duration <= Time::Span.zero
-            raise ArgumentError.new("#{name} timeout must be positive")
-          end
+        if (duration = @connect) && duration <= Time::Span.zero
+          raise ArgumentError.new("connect timeout must be positive")
+        end
+        if (duration = @read) && duration <= Time::Span.zero
+          raise ArgumentError.new("read timeout must be positive")
+        end
+        if (duration = @write) && duration <= Time::Span.zero
+          raise ArgumentError.new("write timeout must be positive")
+        end
+        if (duration = @idle) && duration <= Time::Span.zero
+          raise ArgumentError.new("idle timeout must be positive")
+        end
+        if (duration = @stream_slot) && duration <= Time::Span.zero
+          raise ArgumentError.new("stream_slot timeout must be positive")
         end
       end
     end
@@ -207,6 +211,51 @@ module HTTP2
     end
 
     private class RetryPoolSelection < Exception
+    end
+
+    # `#open_request_stream`'s classification of an error interrupting
+    # stream materialization/opening on an already-selected pool
+    # connection: `Reselect` (retry immediately, uncounted), `ReselectCounted`
+    # (retry, but bounded by `terminal_reselections`/`@supplied_connection`
+    # the same way `DrainingError`/`ClosedError` always are), or `Fatal`
+    # (propagate as-is).
+    private enum RetryAction
+      Reselect
+      ReselectCounted
+      Fatal
+    end
+
+    # Single classification point for every error `#open_request_stream`
+    # treats as a safe pool reselection rather than a fatal failure.
+    # `stream_materialized` is whether a stream had already been
+    # materialized on the connection when `error` interrupted opening it:
+    # `Connection::DrainingError` raised while one is already in flight
+    # (racing the connection's own drain against this fiber's HEADERS
+    # submission) gets the same uncounted, immediate retry
+    # `Connection::ConcurrentStreamLimitError` always does; the identical
+    # error raised before any stream materialized (the pool offered an
+    # already-draining connection) instead counts against
+    # `terminal_reselections`, the same bound `Connection::ClosedError`
+    # always uses. `Connection::RetryableInvalidStateError` — the leaf
+    # type the handful of benign stream-open races in `Connection` raise
+    # (see its doc comment) — is always an uncounted retry; any OTHER
+    # `Connection::InvalidStateError` is fatal, replacing what used to be
+    # an `error.class == Connection::InvalidStateError` exact-class match
+    # against the base class with a plain `is_a?` on the leaf type.
+    private def retry_action(
+      error : Exception,
+      stream_materialized : Bool,
+    ) : RetryAction
+      case error
+      when Connection::ConcurrentStreamLimitError, Connection::RetryableInvalidStateError
+        RetryAction::Reselect
+      when Connection::DrainingError
+        stream_materialized ? RetryAction::Reselect : RetryAction::ReselectCounted
+      when Connection::ClosedError
+        RetryAction::ReselectCounted
+      else
+        RetryAction::Fatal
+      end
     end
 
     getter timeouts : Timeouts
@@ -366,49 +415,47 @@ module HTTP2
       end
     end
 
-    # Sends a GET request and waits for its final response fields.
-    def get(
-      target : String,
-      headers : Headers = Headers.new,
-      *,
-      cancellation : Cancellation? = nil,
-    ) : Response
-      request(
-        Request.new("GET", target, headers),
-        cancellation: cancellation
-      )
-    end
+    # The `{% for %}` blocks below generate the client's per-method
+    # convenience wrappers in two families — no-body verbs (GET, HEAD,
+    # DELETE, OPTIONS) and body-carrying verbs (POST, PUT, PATCH) — each
+    # one a thin wrapper that builds a `Request` and forwards it to
+    # `#request`. The two shapes mirror what used to be hand-typed out
+    # per method.
+    {% for verb in %w[get head delete options] %}
+      # Sends a {{ verb.upcase.id }} request and waits for its final response fields.
+      def {{ verb.id }}(
+        target : String,
+        headers : Headers = Headers.new,
+        *,
+        cancellation : Cancellation? = nil,
+      ) : Response
+        request(
+          Request.new({{ verb.upcase }}, target, headers),
+          cancellation: cancellation
+        )
+      end
+    {% end %}
 
-    # Sends a HEAD request and waits for its final response fields.
-    def head(
-      target : String,
-      headers : Headers = Headers.new,
-      *,
-      cancellation : Cancellation? = nil,
-    ) : Response
-      request(
-        Request.new("HEAD", target, headers),
-        cancellation: cancellation
-      )
-    end
-
-    # Sends a POST request. IO bodies stream from their current position.
-    # An IO body paired with an explicit `content-length` header must EOF
-    # exactly at that declared length — see `Request#initialize` for what
-    # happens, and the risk, if it does not.
-    def post(
-      target : String,
-      headers : Headers = Headers.new,
-      body : Request::Body = nil,
-      *,
-      trailers : Headers = Headers.new,
-      cancellation : Cancellation? = nil,
-    ) : Response
-      request(
-        Request.new("POST", target, headers, body, trailers),
-        cancellation: cancellation
-      )
-    end
+    {% for verb in %w[post put patch] %}
+      # Sends a {{ verb.upcase.id }} request. IO bodies stream from their
+      # current position. An IO body paired with an explicit
+      # `content-length` header must EOF exactly at that declared length —
+      # see `Request#initialize` for what happens, and the risk, if it
+      # does not.
+      def {{ verb.id }}(
+        target : String,
+        headers : Headers = Headers.new,
+        body : Request::Body = nil,
+        *,
+        trailers : Headers = Headers.new,
+        cancellation : Cancellation? = nil,
+      ) : Response
+        request(
+          Request.new({{ verb.upcase }}, target, headers, body, trailers),
+          cancellation: cancellation
+        )
+      end
+    {% end %}
 
     # Builds and sends a request for any HTTP method. See `Request#initialize`
     # for the EOF requirement on a sized IO `body`.
@@ -688,12 +735,12 @@ module HTTP2
           # buffer. If the argument above ever had a hole — or a future
           # change reintroduced one — that staging-time check is what
           # would actually catch a would-be out-of-order write: it fails
-          # *that one* `WriteCommand` with `InvalidStateError` (handled
-          # below, converting to a local retry) rather than letting
-          # mis-ordered bytes reach the peer. That downgrades any such
-          # bug from protocol-fatal (the peer sees stream IDs go backward
-          # and tears down the connection) to a single failed or retried
-          # local request.
+          # *that one* `WriteCommand` with `Connection::RetryableInvalidStateError`
+          # (handled below, via `#retry_action`, converting to a local
+          # retry) rather than letting mis-ordered bytes reach the peer.
+          # That downgrades any such bug from protocol-fatal (the peer
+          # sees stream IDs go backward and tears down the connection) to
+          # a single failed or retried local request.
           command = selected.entry.opening_mutex.synchronize do
             check_cancellation!(cancellation)
             stream = connection.materialize_request_stream(
@@ -708,31 +755,23 @@ module HTTP2
             begin
               current.submit_headers(fields, end_stream: end_stream)
             rescue error : Connection::InvalidStateError
-              if error.class == Connection::InvalidStateError
-                abort_stream(current, error) unless current.terminal_error
-                stream = nil
-                raise RetryPoolSelection.new(error.message, error)
-              end
-              raise error
+              raise error if retry_action(error, stream_materialized: true).fatal?
+
+              abort_stream(current, error) unless current.terminal_error
+              stream = nil
+              raise RetryPoolSelection.new(error.message, error)
             end
           end
           begin
             command.wait
-          rescue error : Connection::ConcurrentStreamLimitError | Connection::DrainingError
+          rescue error : Connection::ConcurrentStreamLimitError | Connection::InvalidStateError
+            raise error if retry_action(error, stream_materialized: true).fatal?
+
             if current = stream
               abort_stream(current, error) unless current.terminal_error
             end
             stream = nil
             raise RetryPoolSelection.new(error.message, error)
-          rescue error : Connection::InvalidStateError
-            if error.class == Connection::InvalidStateError
-              if current = stream
-                abort_stream(current, error) unless current.terminal_error
-              end
-              stream = nil
-              raise RetryPoolSelection.new(error.message, error)
-            end
-            raise error
           end
           check_cancellation!(cancellation)
           return stream ||
@@ -741,16 +780,20 @@ module HTTP2
           signal_pool_event
           next
         rescue error : Connection::DrainingError | Connection::ClosedError
-          terminal_reselections += 1
-          raise error if @supplied_connection || terminal_reselections > 1
+          case retry_action(error, stream_materialized: !stream.nil?)
+          when .fatal?
+            raise error
+          when .reselect_counted?
+            terminal_reselections += 1
+            raise error if @supplied_connection || terminal_reselections > 1
+          end
           signal_pool_event
           next
         rescue error : Connection::InvalidStateError
-          if stream.nil? && error.class == Connection::InvalidStateError
-            signal_pool_event
-            next
-          end
-          raise error
+          raise error if retry_action(error, stream_materialized: !stream.nil?).fatal?
+
+          signal_pool_event
+          next
         rescue RetryPoolSelection
           signal_pool_event
           next
@@ -1765,7 +1808,7 @@ module HTTP2
 
     private def validate_method!(method : String) : Nil
       if method.empty? || method.each_byte.any? do |byte|
-           !token_byte?(byte)
+           !HTTPSemantics.token_byte?(byte)
          end
         raise InvalidRequestError.new("request method is not a valid token")
       end
@@ -2453,29 +2496,7 @@ module HTTP2
       error : Exception,
       error_code : ErrorCode = ErrorCode::CANCEL,
     ) : Nil
-      stream.abort(error, error_code)
-    rescue error : Connection::InvalidStateError
-      raise error unless stream.closed? || stream.terminal_error
-    end
-
-    private def token_byte?(byte : UInt8) : Bool
-      byte.unsafe_chr.ascii_alphanumeric? || byte.in?(
-        '!'.ord.to_u8,
-        '#'.ord.to_u8,
-        '$'.ord.to_u8,
-        '%'.ord.to_u8,
-        '&'.ord.to_u8,
-        '\''.ord.to_u8,
-        '*'.ord.to_u8,
-        '+'.ord.to_u8,
-        '-'.ord.to_u8,
-        '.'.ord.to_u8,
-        '^'.ord.to_u8,
-        '_'.ord.to_u8,
-        '`'.ord.to_u8,
-        '|'.ord.to_u8,
-        '~'.ord.to_u8
-      )
+      HTTP2.abort_stream_quietly(stream, error, error_code)
     end
 
     # :nodoc:

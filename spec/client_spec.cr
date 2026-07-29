@@ -505,6 +505,178 @@ describe HTTP2::Client do
     end
   end
 
+  it "performs a DELETE" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_true
+        field_pairs(request[:fields]).should eq([
+          {":method", "DELETE"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/items/1"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.delete("/items/1")
+        response.status.should eq(204)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "performs an OPTIONS" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_true
+        field_pairs(request[:fields]).should eq([
+          {":method", "OPTIONS"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "*"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}, {"allow", "GET, POST"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.options("*")
+        response.status.should eq(204)
+        response.headers["allow"].should eq("GET, POST")
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "performs a PUT with a request body" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+        request = client_read_field_section(io, decoder)
+        request[:end_stream].should be_false
+        field_pairs(request[:fields]).should eq([
+          {":method", "PUT"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/items/1"},
+          {"content-length", "6"},
+        ])
+
+        data = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        data.data.should eq("order!".to_slice)
+        data.end_stream?.should be_true
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.put("/items/1", body: "order!")
+        response.status.should eq(200)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
+  it "performs a PATCH with a request body plus trailers" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        decoder = HPack::Decoder.new
+        request = client_read_field_section(io, decoder)
+        request[:end_stream].should be_false
+        field_pairs(request[:fields]).should eq([
+          {":method", "PATCH"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/items/1"},
+          {"content-length", "6"},
+        ])
+
+        data = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        data.data.should eq("order!".to_slice)
+        data.end_stream?.should be_false
+        request_trailers = client_read_field_section(io, decoder)
+        request_trailers[:stream_id].should eq(request[:stream_id])
+        request_trailers[:end_stream].should be_true
+        field_pairs(request_trailers[:fields]).should eq([
+          {"patch-checksum", "ok"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.patch(
+          "/items/1",
+          HTTP2::Headers{"content-length" => "6"},
+          IO::Memory.new("order!"),
+          trailers: HTTP2::Headers{"patch-checksum" => "ok"}
+        )
+        response.status.should eq(200)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "downcases interop header names converted from HTTP::Headers on the wire" do
     UNIXSocket.pair do |client_io, peer|
       peer_result = scripted_peer(peer) do |io|

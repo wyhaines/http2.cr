@@ -228,7 +228,10 @@ module HTTP2
       raise MalformedResponseError.new(message, stream_id)
     end
 
-    private def token_byte?(byte : UInt8) : Bool
+    # Whether *byte* is a valid RFC 9110 `tchar` — shared by field-name
+    # validation here and by `Client#validate_method!`'s request-method
+    # check.
+    def token_byte?(byte : UInt8) : Bool
       byte.unsafe_chr.ascii_alphanumeric? || byte.in?(
         '!'.ord.to_u8,
         '#'.ord.to_u8,

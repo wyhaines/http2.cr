@@ -8,6 +8,18 @@ module HTTP2
     class InvalidStateError < Error
     end
 
+    # A narrow, known-benign subset of `InvalidStateError`: a stream-open
+    # race the writer or connection state machine already re-verified and
+    # rejected (a request-slot reservation no longer pending, a stream no
+    # longer registered, or a monotonicity check failing at write-staging
+    # time), rather than some other invalid-state condition. `Client`
+    # reclassifies exactly this leaf type as a safe-to-retry pool
+    # reselection instead of a fatal error — a plain `is_a?` on this type
+    # replaces what used to be an `error.class == InvalidStateError` exact
+    # match against the base class.
+    class RetryableInvalidStateError < InvalidStateError
+    end
+
     class DrainingError < InvalidStateError
     end
 

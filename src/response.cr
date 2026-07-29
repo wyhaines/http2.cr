@@ -144,9 +144,7 @@ module HTTP2
     end
 
     private def abort_request(error : Exception) : Nil
-      @stream.abort(error)
-    rescue error : Connection::InvalidStateError
-      raise error unless @stream.closed? || @stream.terminal_error
+      HTTP2.abort_stream_quietly(@stream, error)
     end
   end
 
@@ -203,9 +201,7 @@ module HTTP2
     end
 
     private def abort_request(error : Exception) : Nil
-      @stream.abort(error)
-    rescue error : Connection::InvalidStateError
-      raise error unless @stream.closed? || @stream.terminal_error
+      HTTP2.abort_stream_quietly(@stream, error)
     end
   end
 
