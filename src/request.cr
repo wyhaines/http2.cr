@@ -97,6 +97,9 @@ module HTTP2
     # then memoizes it -- `Client`'s upload fast path never calls this;
     # it reads `@owned_body` directly, so a request whose body is never
     # inspected via this getter never allocates the wrapper at all.
+    # Unsynchronized, so two concurrent first accesses (-Dpreview_mt)
+    # could each build a wrapper and the later assignment wins -- benign,
+    # since both wrap the same bytes and only one is ever kept.
     def body : IO?
       @io_body || (@body_io ||= @owned_body.try { |b| IO::Memory.new(b) })
     end

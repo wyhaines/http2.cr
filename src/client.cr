@@ -1650,28 +1650,11 @@ module HTTP2
         end
       end
 
-      # `request.body_length` is `nil` for every bodyless request and
-      # non-nil (0 or more) for every actual String/Bytes body, including
-      # an empty one -- a uniform, unambiguous signal now that `Nil`
-      # bodies no longer report `0_i64` (their old value collided with a
-      # genuine empty owned body's length). That means a non-nil
-      # `known_length` here always means "there is a body", so unlike
-      # before this no longer needs a second guard on `request.body`
-      # just to tell those two zero-length cases apart.
-      synthesized_length : Int64? = nil
-      if !connect && (known_length = request.body_length)
-        if content_length
-          unless content_length == known_length
-            raise InvalidRequestError.new(
-              "request body length #{known_length} does not match " \
-              "content-length #{content_length}"
-            )
-          end
-        else
-          synthesized_length = known_length
-          content_length = known_length
-        end
-      end
+      synthesized_length, content_length = resolve_content_length(
+        request,
+        connect,
+        content_length
+      )
 
       PreparedRequest.new(
         build_request_fields(request, connect, authority, path, synthesized_length),
@@ -1692,6 +1675,72 @@ module HTTP2
         content_length,
         connect
       )
+    end
+
+    # Validates a caller-supplied `content-length` header against what's
+    # actually known about the body, and/or synthesizes one when the
+    # caller didn't supply one. Returns `{synthesized_length,
+    # content_length}` -- the former only set when a length was
+    # computed here rather than given by the caller (fed to
+    # `#build_request_fields` to add the header), the latter always the
+    # effective content-length (caller-given or synthesized, still `nil`
+    # for a real streamed IO body of unknown length). Split out of
+    # `#prepare` to keep that method's cyclomatic complexity under the
+    # linter's threshold.
+    #
+    # `request.body_length` is `nil` for every bodyless request and
+    # non-nil (0 or more) for every actual String/Bytes body, including
+    # an empty one -- a uniform, unambiguous signal now that `Nil`
+    # bodies no longer report `0_i64` (their old value collided with a
+    # genuine empty owned body's length). A non-nil `known_length` below
+    # always means "there is a body", so unlike before this no longer
+    # needs a second guard on `request.body` to tell an owned body
+    # apart from a bodyless request.
+    #
+    # A `nil` `request.body_length` is otherwise ambiguous, though: it
+    # also covers a caller-supplied IO body of unknown length, which
+    # gets no check here at all -- it's validated later, at send time,
+    # once its true length is actually known (see `#stream_sized_body`).
+    # A genuinely bodyless request has no such excuse: it can only ever
+    # send zero bytes, so it gets the same treatment an owned body's
+    # `known_length` gets above -- an explicit `content-length: 0`
+    # accepted (it matches the implicit empty body), anything else
+    # rejected as a proven lie. `request.body` tells the two `nil` cases
+    # apart for free: a `nil` `body_length` already rules out an owned
+    # body (which always reports one, even `0` -- see above), so
+    # `request.body` here is either a real `IO`, returned as-is with no
+    # wrap, or nothing at all, which short-circuits `#body` without ever
+    # building its memoized `IO::Memory` wrapper.
+    private def resolve_content_length(
+      request : Request,
+      connect : Bool,
+      content_length : Int64?,
+    ) : Tuple(Int64?, Int64?)
+      return {nil, content_length} if connect
+
+      if known_length = request.body_length
+        if content_length
+          unless content_length == known_length
+            raise InvalidRequestError.new(
+              "request body length #{known_length} does not match " \
+              "content-length #{content_length}"
+            )
+          end
+          {nil, content_length}
+        else
+          {known_length, known_length}
+        end
+      elsif content_length && request.body.nil?
+        unless content_length == 0
+          raise InvalidRequestError.new(
+            "request body length 0 does not match " \
+            "content-length #{content_length}"
+          )
+        end
+        {nil, content_length}
+      else
+        {nil, content_length}
+      end
     end
 
     # One array, built once: pseudo-fields, then the caller's regular

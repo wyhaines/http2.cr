@@ -1647,6 +1647,70 @@ describe HTTP2::Client do
     end
   end
 
+  it "starts CONNECT tunnel data only after a successful response, " \
+     "for an owned body" do
+    # Review fix-round regression coverage: `#start_connect_upload`'s
+    # gate used to be `request.connect && request.body` alone, which
+    # worked before this task only because an owned body always
+    # populated `request.body` too (an eagerly-built `IO::Memory`). Once
+    # an owned body stopped doing that (see `Request#owned_body`, the
+    # upload fast path), that gate would have silently skipped the
+    # tunnel upload entirely for a String/Bytes CONNECT body -- a defect
+    # this task's own redesign would have introduced, fixed in the same
+    # commit by also checking `request.owned_body`. This is the same
+    # scenario as "starts CONNECT tunnel data only after a successful
+    # response" above with `IO::Memory.new("outbound")` swapped for the
+    # owned String `"outbound"` -- the one line that exercises the fix.
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_false
+        field_pairs(request[:fields]).should eq([
+          {":method", "CONNECT"},
+          {":authority", "upstream.example:443"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "200"}, {"content-length", "999"}]
+        )
+        # An owned body's upload fast path (`#stream_owned_body`) has no
+        # trailers to wait on for a CONNECT tunnel, so it folds
+        # END_STREAM into the single data frame instead of the
+        # IO-streamed path's separate trailing empty frame above.
+        tunnel_data = HTTP2::Frame.read(io).as(HTTP2::Frame::Data)
+        tunnel_data.data.should eq("outbound".to_slice)
+        tunnel_data.end_stream?.should be_true
+        HTTP2::Frame::Data.new(
+          HTTP2::Frame::Data::Flags::END_STREAM,
+          request[:stream_id],
+          "inbound"
+        ).write(io)
+        io.flush
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://proxy.example",
+        connection: connection
+      )
+      begin
+        response = http.request(
+          "CONNECT",
+          "upstream.example:443",
+          body: "outbound"
+        )
+        response.body.gets_to_end.should eq("inbound")
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
+    end
+  end
+
   it "keeps a successful CONNECT upload open after the peer half-closes" do
     UNIXSocket.pair do |client_io, peer|
       release_upload = Channel(Nil).new(1)
@@ -1770,8 +1834,57 @@ describe HTTP2::Client do
           "body"
         )
       end
+      # Review fix-round regression: a genuinely bodyless request can
+      # only ever send zero bytes, so an explicit non-zero
+      # `content-length` on one is already a provable lie -- caught here,
+      # before any connection work, exactly like a mismatched owned-body
+      # `content-length` above. `request.body_length` reporting `nil`
+      # instead of `0_i64` for a nil body (so it stops colliding with a
+      # genuine empty owned body's length) must not also silently drop
+      # this check.
+      expect_raises(HTTP2::InvalidRequestError, /does not match/) do
+        http.get("/", HTTP2::Headers{"content-length" => "5"})
+      end
     ensure
       http.close
+    end
+  end
+
+  it "accepts an explicit content-length: 0 on a bodyless request" do
+    UNIXSocket.pair do |client_io, peer|
+      peer_result = scripted_peer(peer) do |io|
+        complete_server_handshake(io)
+        request = client_read_field_section(io, HPack::Decoder.new)
+        request[:end_stream].should be_true
+        field_pairs(request[:fields]).should eq([
+          {":method", "GET"},
+          {":scheme", "http"},
+          {":authority", "example.test"},
+          {":path", "/"},
+          {"content-length", "0"},
+        ])
+
+        write_server_fields(
+          io,
+          HPack::Encoder.new,
+          request[:stream_id],
+          [{":status", "204"}],
+          end_stream: true
+        )
+      end
+
+      connection = HTTP2::Connection.start(client_io)
+      http = HTTP2::Client.new(
+        "http://example.test",
+        connection: connection
+      )
+      begin
+        response = http.get("/", HTTP2::Headers{"content-length" => "0"})
+        response.status.should eq(204)
+        wait_for_peer(peer_result)
+      ensure
+        http.close
+      end
     end
   end
 
