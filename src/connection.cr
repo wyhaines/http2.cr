@@ -402,10 +402,15 @@ module HTTP2
 
         # `OpenSSL::SSL::Socket` includes `IO::Buffered` with the same
         # default buffer as cleartext (see the sizing rationale in
-        # `connect_prior_knowledge`, above) — not guaranteed to hold a full
-        # frame's header and payload together, which would flush the
-        # header as its own tiny `send(2)` and push the payload through
-        # unbuffered as a second one. At today's stdlib default
+        # `connect_prior_knowledge`, above; same caveat as the cleartext
+        # site: frames bounded by the peer's negotiated
+        # `SETTINGS_MAX_FRAME_SIZE` — HEADERS/CONTINUATION sections and
+        # directly-submitted DATA — can still exceed this buffer, and
+        # negotiation hasn't happened yet at construction time) — not
+        # guaranteed to hold a full frame's header and payload together,
+        # which would flush the header as its own tiny `send(2)` and push
+        # the payload through unbuffered as a second one. At today's
+        # stdlib default
         # (`IO::DEFAULT_BUFFER_SIZE` has been 32768 since Crystal PR
         # #12507, comfortably above this shard's `>= 1.20.0` floor) this
         # is a defensive no-op for the default `outbound_data_chunk_size`;
