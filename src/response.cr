@@ -13,7 +13,7 @@ module HTTP2
   # aliases this same array directly to every such response, so any
   # caller that pushes/clears/sorts/etc. into the returned array would
   # silently corrupt it process-wide for every other response sharing it.
-  EMPTY_INFORMATIONAL = [] of InformationalResponse
+  private EMPTY_INFORMATIONAL = [] of InformationalResponse
 
   # A channel that never becomes ready: `receive?` on an open, empty,
   # never-sent channel blocks forever, so substituting it for an absent
@@ -28,7 +28,7 @@ module HTTP2
   # and a close would make every `receive?` on it resolve immediately
   # (nil), turning it from "never ready" into "always ready" and
   # defeating the substitution above.
-  NEVER_READY = Channel(Nil).new
+  private NEVER_READY = Channel(Nil).new
 
   # A streaming HTTP response. Consume or close `body` before waiting for
   # trailers so flow control can continue.
