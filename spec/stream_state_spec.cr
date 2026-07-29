@@ -183,12 +183,17 @@ end
 describe HTTP2::Stream do
   it "drains and closes the event mailbox on terminate" do
     make_stream do |stream|
-      stream.deliver(some_event(stream)).should be_true
+      # Buffer several events without ever consuming them, so the mailbox
+      # genuinely holds retained data — not just "was touched once" — for
+      # `#terminate` to release.
+      3.times { stream.deliver(some_event(stream)).should be_true }
       stream.test_only_events_closed?.should be_false
+      stream.test_only_events_queue_size.should eq(3)
 
       stream.terminate(reset_error(stream))
 
       stream.test_only_events_closed?.should be_true
+      stream.test_only_events_queue_size.should eq(0)
       stream.deliver(some_event(stream)).should be_false
     end
   end

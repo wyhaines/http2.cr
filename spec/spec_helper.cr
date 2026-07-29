@@ -8,10 +8,26 @@ class HTTP2::Connection
   end
 end
 
+# Crystal's `Channel` doesn't expose its buffered-item count publicly, so
+# this reopens it (the only way to reach the private `@queue` ivar) to
+# give the `Stream` test-only accessor below something non-destructive to
+# read.
+class Channel(T)
+  # :nodoc:
+  def test_only_queue_size : Int32
+    @queue.try(&.size) || 0
+  end
+end
+
 class HTTP2::Stream
   # :nodoc:
   def test_only_events_closed? : Bool
     @events.closed?
+  end
+
+  # :nodoc:
+  def test_only_events_queue_size : Int32
+    @events.test_only_queue_size
   end
 end
 
