@@ -209,14 +209,19 @@ module HTTP2
       # see the flush audit in the P1.8 task report.
       #
       # `IO::Buffered`'s default buffer is not guaranteed to hold a full
-      # frame: if it's smaller than `header + payload` for the largest
-      # frame this side sends, the buffered header flushes as its own tiny
-      # `send(2)` and the payload bypasses the buffer as a second syscall,
-      # silently defeating the coalescing above for exactly the frames
-      # that matter. Size it explicitly so header+payload always fit in
-      # one buffer. The TLS path (`start_tls`, below) needs the identical
-      # fix: `OpenSSL::SSL::Socket` also includes `IO::Buffered` with the
-      # same default and is not exempt from this.
+      # frame: if it's smaller than `header + payload`, the buffered header
+      # flushes as its own tiny `send(2)` and the payload bypasses the
+      # buffer as a second syscall, silently defeating the coalescing
+      # above. Sized here to fit header+payload of a DATA frame chunked to
+      # the configured `outbound_data_chunk_size`; HEADERS/CONTINUATION
+      # field sections and directly-submitted DATA frames are instead
+      # bounded by the peer's negotiated `SETTINGS_MAX_FRAME_SIZE`, which
+      # can exceed this buffer if negotiated above
+      # `outbound_data_chunk_size` — a gap that can't be closed here since
+      # negotiation hasn't happened yet at construction time. The TLS path
+      # (`start_tls`, below) needs the identical fix: `OpenSSL::SSL::Socket`
+      # also includes `IO::Buffered` with the same default and is not
+      # exempt from this.
       transport.sync = false
       transport.buffer_size = Math.pw2ceil(
         configuration.outbound_data_chunk_size + FrameHeader::SIZE
@@ -397,13 +402,18 @@ module HTTP2
 
         # `OpenSSL::SSL::Socket` includes `IO::Buffered` with the same
         # default buffer as cleartext (see the sizing rationale in
-        # `connect_prior_knowledge`, above) — too small to hold a full
+        # `connect_prior_knowledge`, above) — not guaranteed to hold a full
         # frame's header and payload together, which would flush the
         # header as its own tiny `send(2)` and push the payload through
-        # unbuffered as a second one. Must be set here, right after
-        # construction and before this method's first write to `tls`
-        # (the preface, in `Connection#start` below): `buffer_size=`
-        # raises once a read or write has allocated the buffer.
+        # unbuffered as a second one. At today's stdlib default
+        # (`IO::DEFAULT_BUFFER_SIZE` has been 32768 since Crystal PR
+        # #12507, comfortably above this shard's `>= 1.20.0` floor) this
+        # is a defensive no-op for the default `outbound_data_chunk_size`;
+        # it starts to matter as soon as `outbound_data_chunk_size` is
+        # configured higher. Must be set here, right after construction
+        # and before this method's first write to `tls` (the preface, in
+        # `Connection#start` below): `buffer_size=` raises once a read or
+        # write has allocated the buffer.
         tls.buffer_size = Math.pw2ceil(
           configuration.outbound_data_chunk_size + FrameHeader::SIZE
         )
