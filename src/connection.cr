@@ -49,6 +49,17 @@ module HTTP2
     @peer_settings : Frame::Settings?
     @local_settings_state : SettingsState
     @effective_local_settings_state = SettingsState.client_defaults
+    # Reader-fiber-only mirror of `@effective_local_settings_state.max_frame_size`,
+    # kept so `#read_frame`/`#read_server_preface` (the hottest per-frame call
+    # in the connection) never take `@mutex` just to read a value that only
+    # ever changes once per acknowledged local SETTINGS update. Written only
+    # by `#acknowledge_local_settings`, which runs exclusively on the reader
+    # fiber (see that method's comment); read only from `#read_frame`/
+    # `#read_server_preface`, also reader-fiber-only. Same initial value as
+    # `@effective_local_settings_state` above, for the same reason: the
+    # locally configured max frame size does not take effect until the peer
+    # ACKs our SETTINGS frame.
+    @reader_max_frame_size = SettingsState.client_defaults.max_frame_size
     @peer_settings_state = SettingsState.server_defaults
     @last_goaway : Frame::GoAway?
     @last_sent_goaway : Frame::GoAway?
@@ -1932,12 +1943,6 @@ module HTTP2
         queue = @pending_data[stream_id]
         command = queue.first
 
-        if error = data_command_error(command)
-          queue.shift.complete(error)
-          retain_data_stream(stream_id, queue)
-          next
-        end
-
         begin
           frame = plan_scheduled_data_frame(command)
         rescue error
@@ -1956,32 +1961,24 @@ module HTTP2
       nil
     end
 
-    private def data_command_error(command : WriteCommand) : Exception?
-      @mutex.synchronize do
-        if error = @terminal_error
-          error
-        elsif block = command.data_block
-          if error = block.stream.terminal_error
-            error
-          elsif current = @streams[block.stream_id]?
-            if current.same?(block.stream)
-              nil
-            else
-              ClosedError.new(
-                "HTTP/2 stream #{block.stream_id} is closed"
-              )
-            end
-          else
-            ClosedError.new(
-              "HTTP/2 stream #{block.stream_id} is closed"
-            )
-          end
-        else
-          InvalidStateError.new("DATA command has no DATA block")
-        end
-      end
-    end
-
+    # Combines the eligibility checks the pre-batching scheduler split
+    # across two separate `#data_command_error`/`#plan_scheduled_data_frame`
+    # calls (and therefore two separate `@mutex.synchronize` round-trips)
+    # into the single lock below. Two locks meant two chances for another
+    # fiber (`#terminate`, `#handle_goaway`, ...) to close or reset this
+    # stream in the gap between them — `#data_command_error` could see the
+    # stream still open, release the lock, and only then have
+    # `#plan_scheduled_data_frame` re-take it and find the stream gone.
+    # One lock closes that window: every check below and the transition it
+    # authorizes now happen atomically.
+    #
+    # A DATA frame also never opens or cascades onto a second stream (that
+    # only happens for a HEADERS command's `outbound_stream_opening?`
+    # branch in `#plan_outbound_stream_event_unlocked`, which a `SendData`/
+    # `SendDataEndStream` event never satisfies), so — unlike
+    # `#prepare_outbound`'s general command path — this method resolves and
+    # applies the one stream's `OutboundTransition` directly instead of
+    # allocating a one-entry `plans` Hash just to immediately iterate it.
     private def plan_scheduled_data_frame(
       command : WriteCommand,
     ) : Frame::Data?
@@ -1991,62 +1988,100 @@ module HTTP2
       end
 
       @mutex.synchronize do
-        raise_terminal_or_state_unlocked! if @state.closed?
-        stream = @streams[block.stream_id]?
-        unless stream
-          raise ClosedError.new(
-            "HTTP/2 stream #{block.stream_id} is closed"
-          )
-        end
-
-        max_frame_size = @peer_settings_state.max_frame_size.to_i64
-        flow_size = if block.padded?
-                      size = block.frame.payload.size.to_i64
-                      if size > max_frame_size
-                        raise ArgumentError.new(
-                          "padded DATA payload exceeds the peer maximum frame size"
-                        )
-                      end
-                      size
-                    else
-                      remaining = block.remaining.to_i64
-                      if remaining.zero?
-                        0_i64
-                      else
-                        available = [
-                          remaining,
-                          max_frame_size,
-                          @connection_send_window,
-                          stream.send_window,
-                        ].min
-                        next if available <= 0
-                        available
-                      end
-                    end
-
-        if flow_size > 0 &&
-           (@connection_send_window < flow_size ||
-           stream.send_window < flow_size)
-          next
-        end
+        stream = resolve_scheduled_data_stream_unlocked(block)
+        flow_size = scheduled_data_flow_size_unlocked(block, stream)
+        next unless flow_size
 
         frame = block.build_frame(
           block.padded? ? block.frame.data.size : flow_size.to_i32
         )
-        plans = {} of UInt32 => OutboundTransition
-        plan_outbound_data_unlocked(
-          plans,
-          frame,
-          @highest_local_opened_stream_id
+
+        event = frame.end_stream? ? Stream::Event::SendDataEndStream : Stream::Event::SendData
+        current_state = stream.state
+        transition = Stream::StateMachine.transition(current_state, event)
+        unless transition.action.allow?
+          raise InvalidStateError.new(
+            "cannot #{event.to_s.underscore} on stream #{block.stream_id} " \
+            "in state #{current_state}"
+          )
+        end
+        plan = build_outbound_transition(
+          nil,
+          stream,
+          transition.next_state || current_state,
+          event,
+          nil,
+          nil
         )
 
         @connection_send_window -= frame.payload.size.to_i64
         stream.adjust_send_window(-frame.payload.size.to_i64)
-        plans.each_value do |plan|
-          apply_outbound_transition_unlocked(plan)
-        end
+        apply_outbound_transition_unlocked(plan)
         frame
       end
+    end
+
+    # The stream-identity and terminal-state half of the eligibility check
+    # `#plan_scheduled_data_frame` used to run as `#data_command_error`'s
+    # own separate `@mutex.synchronize` — see that method's comment. Called
+    # only from inside `#plan_scheduled_data_frame`'s lock.
+    private def resolve_scheduled_data_stream_unlocked(
+      block : WriteCommand::DataBlock,
+    ) : Stream
+      if error = @terminal_error
+        raise error
+      end
+      if error = block.stream.terminal_error
+        raise error
+      end
+
+      stream = @streams[block.stream_id]?
+      unless stream && stream.same?(block.stream)
+        raise ClosedError.new(
+          "HTTP/2 stream #{block.stream_id} is closed"
+        )
+      end
+      raise_terminal_or_state_unlocked! if @state.closed?
+      stream
+    end
+
+    # How many bytes of `block` are eligible to go out right now: `nil`
+    # means blocked on flow control (retry once credit arrives), not an
+    # error. Called only from inside `#plan_scheduled_data_frame`'s lock.
+    private def scheduled_data_flow_size_unlocked(
+      block : WriteCommand::DataBlock,
+      stream : Stream,
+    ) : Int64?
+      max_frame_size = @peer_settings_state.max_frame_size.to_i64
+      flow_size = if block.padded?
+                    size = block.frame.payload.size.to_i64
+                    if size > max_frame_size
+                      raise ArgumentError.new(
+                        "padded DATA payload exceeds the peer maximum frame size"
+                      )
+                    end
+                    size
+                  else
+                    remaining = block.remaining.to_i64
+                    if remaining.zero?
+                      0_i64
+                    else
+                      available = {
+                        remaining,
+                        max_frame_size,
+                        @connection_send_window,
+                        stream.send_window,
+                      }.min
+                      return if available <= 0
+                      available
+                    end
+                  end
+
+      return if flow_size > 0 &&
+                (@connection_send_window < flow_size ||
+                stream.send_window < flow_size)
+
+      flow_size
     end
 
     # The single-threaded zero-copy argument documented on `#send_data`
@@ -2217,7 +2252,7 @@ module HTTP2
     private def read_server_preface : Frames
       Frame.read(
         @transport,
-        effective_local_settings_state.max_frame_size
+        @reader_max_frame_size
       )
     rescue error : ProtocolError
       raise ProtocolError.new(
@@ -2229,7 +2264,7 @@ module HTTP2
     private def read_frame : Frames?
       Frame.read(
         @transport,
-        effective_local_settings_state.max_frame_size
+        @reader_max_frame_size
       )
     rescue error : ProtocolError
       if @field_blocks.pending?
@@ -3115,6 +3150,17 @@ module HTTP2
       end
     end
 
+    # Reachable only via `#dispatch`'s `Frame::Settings#ack?` branch, which
+    # `#process_inbound_frame` calls, which only `#reader_loop` calls — and
+    # `#reader_loop` runs solely as the body of the single reader fiber
+    # `#start` spawns once via `#spawn_transport_fiber("http2-reader")`
+    # (guarded by `@state.new?`/`@reader_started`, so `start` — and this
+    # spawn — cannot run twice). That fiber is pinned to one OS thread under
+    # `-Dpreview_mt` (see `#spawn_transport_fiber`'s comment) and is the only
+    # caller of this method, so the plain-ivar write to
+    # `@reader_max_frame_size` below is safe without `@mutex`: nothing but
+    # this same fiber ever writes or reads it (`#read_frame`/
+    # `#read_server_preface`, also reader-fiber-only).
     private def acknowledge_local_settings : Nil
       previous, updated = @mutex.synchronize do
         pending = @pending_settings.shift?
@@ -3133,6 +3179,7 @@ module HTTP2
         @effective_local_settings_state = effective_settings
         {prior_settings, effective_settings}
       end
+      @reader_max_frame_size = updated.max_frame_size
 
       apply_effective_local_settings(previous, updated)
       wake_settings_timer
@@ -3959,23 +4006,34 @@ module HTTP2
       wake_settings_timer if marked
     end
 
+    # `plans` starts `nil` and stays that way for the common commands that
+    # never touch a stream at all (PING, SETTINGS, GOAWAY, an ack) — see
+    # `#planned_stream_state` and the `plans ||= {} of ...` in
+    # `#plan_outbound_stream_event_unlocked`/`#plan_skipped_local_streams_unlocked`,
+    # the only two places that ever write into it. Every helper below
+    # threads it through as part of its return value (the same pattern
+    # already used for `highest_local_id`) instead of taking a
+    # pre-allocated `Hash` — so a HEADERS command (which always opens or
+    # continues at least one stream) still ends up allocating exactly the
+    # Hash it needs, while PING/SETTINGS-ack/GOAWAY-only commands allocate
+    # nothing.
     private def prepare_outbound(command : WriteCommand) : Bool
       @mutex.synchronize do
         raise_terminal_or_state_unlocked! if @state.closed?
 
-        plans = {} of UInt32 => OutboundTransition
+        plans = nil
         next_highest_local_id = @highest_local_opened_stream_id
         previous_state = @state
 
         if header_block = command.header_block
-          next_highest_local_id = plan_outbound_header_block_unlocked(
+          next_highest_local_id, plans = plan_outbound_header_block_unlocked(
             plans,
             header_block,
             next_highest_local_id
           )
           planned_goaway = @last_sent_goaway
         else
-          planned_goaway = plan_outbound_frames_unlocked(
+          planned_goaway, plans = plan_outbound_frames_unlocked(
             command,
             plans,
             next_highest_local_id
@@ -3983,23 +4041,25 @@ module HTTP2
         end
 
         @highest_local_opened_stream_id = next_highest_local_id
-        plans.each_value do |plan|
-          apply_outbound_transition_unlocked(plan)
+        if plans
+          plans.each_value do |plan|
+            apply_outbound_transition_unlocked(plan)
+          end
         end
         apply_outbound_goaway_unlocked(planned_goaway)
 
         previous_state != @state ||
-          plans.any? do |id, plan|
-            id.odd? && plan.state.closed?
-          end
+          (plans.try do |existing_plans|
+            existing_plans.any? { |id, plan| id.odd? && plan.state.closed? }
+          end || false)
       end
     end
 
     private def plan_outbound_header_block_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       header_block : WriteCommand::HeaderBlock,
       highest_local_id : UInt32,
-    ) : UInt32
+    ) : Tuple(UInt32, Hash(UInt32, OutboundTransition)?)
       event = if header_block.end_stream
                 Stream::Event::SendHeadersEndStream
               else
@@ -4016,9 +4076,9 @@ module HTTP2
 
     private def plan_outbound_frames_unlocked(
       command : WriteCommand,
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       highest_local_id : UInt32,
-    ) : Frame::GoAway?
+    ) : Tuple(Frame::GoAway?, Hash(UInt32, OutboundTransition)?)
       planned_goaway = @last_sent_goaway
       command.frames.each do |frame|
         case frame
@@ -4026,9 +4086,9 @@ module HTTP2
           validate_outbound_goaway_unlocked(frame, planned_goaway)
           planned_goaway = frame
         when Frame::Data
-          plan_outbound_data_unlocked(plans, frame, highest_local_id)
+          plans = plan_outbound_data_unlocked(plans, frame, highest_local_id)
         when Frame::ResetStream
-          plan_outbound_stream_event_unlocked(
+          _, plans = plan_outbound_stream_event_unlocked(
             plans,
             frame.stream_id,
             Stream::Event::SendReset,
@@ -4038,7 +4098,7 @@ module HTTP2
             close_error: command.stream_closure_error
           )
         when Frame::Priority
-          plan_outbound_stream_event_unlocked(
+          _, plans = plan_outbound_stream_event_unlocked(
             plans,
             frame.stream_id,
             Stream::Event::SendPriority,
@@ -4046,7 +4106,7 @@ module HTTP2
             @state.draining?
           )
         when Frame::WindowUpdate
-          plan_outbound_window_update_unlocked(
+          plans = plan_outbound_window_update_unlocked(
             plans,
             frame,
             highest_local_id
@@ -4055,46 +4115,60 @@ module HTTP2
           # Connection frames and unknown extensions do not alter streams.
         end
       end
-      planned_goaway
+      {planned_goaway, plans}
     end
 
     private def plan_outbound_data_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       frame : Frame::Data,
       highest_local_id : UInt32,
-    ) : Nil
+    ) : Hash(UInt32, OutboundTransition)?
       event = if frame.end_stream?
                 Stream::Event::SendDataEndStream
               else
                 Stream::Event::SendData
               end
-      plan_outbound_stream_event_unlocked(
+      _, plans = plan_outbound_stream_event_unlocked(
         plans,
         frame.stream_id,
         event,
         highest_local_id,
         @state.draining?
       )
+      plans
     end
 
     private def plan_outbound_window_update_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       frame : Frame::WindowUpdate,
       highest_local_id : UInt32,
-    ) : Nil
-      return if frame.stream_id.zero?
+    ) : Hash(UInt32, OutboundTransition)?
+      return plans if frame.stream_id.zero?
 
-      plan_outbound_stream_event_unlocked(
+      _, plans = plan_outbound_stream_event_unlocked(
         plans,
         frame.stream_id,
         Stream::Event::SendWindowUpdate,
         highest_local_id,
         @state.draining?
       )
+      plans
+    end
+
+    # Reads `plans[stream_id]?`'s planned-but-not-yet-applied state for
+    # `stream_id`, falling back to the stream's own current state — reads
+    # through a `nil` `plans` exactly like an empty Hash would (`nil` just
+    # means "nothing planned yet").
+    private def planned_stream_state(
+      plans : Hash(UInt32, OutboundTransition)?,
+      stream_id : UInt32,
+      stream : Stream,
+    ) : Stream::State
+      plans.try { |existing_plans| existing_plans[stream_id]? }.try(&.state) || stream.state
     end
 
     private def plan_outbound_stream_event_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       stream_id : UInt32,
       event : Stream::Event,
       highest_local_id : UInt32,
@@ -4102,19 +4176,19 @@ module HTTP2
       *,
       reset_code : UInt32? = nil,
       close_error : Exception? = nil,
-    ) : UInt32
+    ) : Tuple(UInt32, Hash(UInt32, OutboundTransition)?)
       stream = @streams[stream_id]?
       unless stream
-        return highest_local_id if event.send_priority?
+        return {highest_local_id, plans} if event.send_priority?
 
         raise InvalidStateError.new(
           "stream #{stream_id} is not active on this connection"
         )
       end
 
-      current_state = plans[stream_id]?.try(&.state) || stream.state
+      current_state = planned_stream_state(plans, stream_id, stream)
       if outbound_stream_opening?(current_state, event)
-        highest_local_id = plan_local_stream_open_unlocked(
+        highest_local_id, plans = plan_local_stream_open_unlocked(
           plans,
           stream_id,
           highest_local_id,
@@ -4131,6 +4205,7 @@ module HTTP2
       end
 
       next_state = transition.next_state || current_state
+      plans ||= {} of UInt32 => OutboundTransition
       plans[stream_id] = build_outbound_transition(
         plans[stream_id]?,
         stream,
@@ -4139,7 +4214,7 @@ module HTTP2
         reset_code,
         close_error
       )
-      highest_local_id
+      {highest_local_id, plans}
     end
 
     private def outbound_stream_opening?(
@@ -4151,11 +4226,11 @@ module HTTP2
     end
 
     private def plan_local_stream_open_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       stream_id : UInt32,
       highest_local_id : UInt32,
       draining : Bool,
-    ) : UInt32
+    ) : Tuple(UInt32, Hash(UInt32, OutboundTransition)?)
       if draining
         raise DrainingError.new(
           "cannot open stream #{stream_id} on a draining connection"
@@ -4173,8 +4248,8 @@ module HTTP2
       end
 
       enforce_peer_concurrent_stream_limit_unlocked(plans)
-      plan_skipped_local_streams_unlocked(plans, stream_id)
-      stream_id
+      plans = plan_skipped_local_streams_unlocked(plans, stream_id)
+      {stream_id, plans}
     end
 
     private def build_outbound_transition(
@@ -4199,13 +4274,13 @@ module HTTP2
     end
 
     private def enforce_peer_concurrent_stream_limit_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
     ) : Nil
       limit = @peer_settings_state.max_concurrent_streams
       return unless limit
 
       active = @streams.count do |id, stream|
-        state = plans[id]?.try(&.state) || stream.state
+        state = planned_stream_state(plans, id, stream)
         id.odd? && state.active?
       end
       if active.to_u64 >= limit.to_u64
@@ -4214,16 +4289,16 @@ module HTTP2
     end
 
     private def plan_skipped_local_streams_unlocked(
-      plans : Hash(UInt32, OutboundTransition),
+      plans : Hash(UInt32, OutboundTransition)?,
       opening_stream_id : UInt32,
-    ) : Nil
+    ) : Hash(UInt32, OutboundTransition)?
       @streams.each do |id, stream|
         next unless id.odd? && id < opening_stream_id
 
-        state = plans[id]?.try(&.state) || stream.state
+        state = planned_stream_state(plans, id, stream)
         next unless state.idle?
 
-        plans[id] = OutboundTransition.new(
+        (plans ||= {} of UInt32 => OutboundTransition)[id] = OutboundTransition.new(
           stream,
           Stream::State::Closed,
           ClosedStream::Reason::Skipped,
@@ -4232,6 +4307,7 @@ module HTTP2
           )
         )
       end
+      plans
     end
 
     private def apply_outbound_transition_unlocked(
